@@ -1,10 +1,9 @@
 """
 LEWIS-style op application for SAE-LEWIS.
 
-The 6-class tagger predicts per-token ops over
-{KEEP, REPL, INS_L, INS_R, DEL, SWAP}. This module turns (token_ids, ops) into
-the editor's input sequence and tracks INS gaps so that template enumeration
-at inference can vary slot counts per gap.
+The 4-class tagger predicts per-token ops over {KEEP, REPL, INS, DEL}. This
+module turns (token_ids, ops) into the editor's input sequence and tracks INS
+gaps so that template enumeration at inference can vary slot counts per gap.
 
 `apply_ops_for_editor` is purely deterministic given (token_ids, ops); it does
 not need access to the editor or tagger. At training time the corruption
@@ -13,29 +12,19 @@ generator emits ops directly; at inference the tagger does.
 Op semantics (LEWIS-faithful, with [DEL] output marker for our bidirectional
 editor):
 
-    KEEP    : retain the original token in the editor input; expect identity
-              at the output.
-    REPL    : replace the original token by [MASK] in the editor input; the
-              editor predicts the replacement at the output.
-    DEL     : keep the original token in the editor input ("in-place"); the
-              editor predicts [DEL] at the output (dropped in post-processing).
-    INS_L   : a [INS] slot is inserted to the LEFT of the next KEEP/REPL/DEL
-              position. The editor predicts the inserted token.
-    INS_R   : a [INS] slot is inserted to the RIGHT of the previous
-              KEEP/REPL/DEL position.
-    SWAP    : swap this position's token with its right neighbor's. The
-              editor input is the *already swapped* pair, and the editor's
-              LM head copies it back (identity at both output positions —
-              no generation needed). The marker sits on the LEFT of the pair;
-              the right position's op is consumed (i.e., ignored).
+    KEEP : retain the original token in the editor input; expect identity
+           at the output.
+    REPL : replace the original token by [MASK] in the editor input; the
+           editor predicts the replacement at the output.
+    DEL  : keep the original token in the editor input ("in-place"); the
+           editor predicts [DEL] at the output (dropped in post-processing).
+    INS  : a [INS] slot is inserted to the LEFT of the next KEEP/REPL/DEL
+           position. The editor predicts the inserted token.
 
 Conventions:
-- INS_L / INS_R do not consume original tokens; they expand the sequence.
-- Consecutive INS_L (or INS_R) tags at training time mean a multi-token gap;
-  one [INS] token per gold INS tag.
-- SWAP at the last position has no right neighbor and degrades to KEEP for
-  safety. A SWAP at position i consumes ops[i+1] regardless of its value;
-  the tagger gold for that right position is conventionally KEEP.
+- INS does not consume an original token; it expands the sequence.
+- Consecutive INS tags at training time mean a multi-token gap; one [INS]
+  token per gold INS tag.
 """
 
 from __future__ import annotations
@@ -48,13 +37,11 @@ import numpy as np
 
 OP_KEEP = 0
 OP_REPL = 1
-OP_INS_L = 2
-OP_INS_R = 3
-OP_DEL = 4
-OP_SWAP = 5
-NUM_OPS = 6
+OP_INS = 2
+OP_DEL = 3
+NUM_OPS = 4
 
-OP_NAMES = ["KEEP", "REPL", "INS_L", "INS_R", "DEL", "SWAP"]
+OP_NAMES = ["KEEP", "REPL", "INS", "DEL"]
 
 
 def op_name(op: int) -> str:
@@ -75,8 +62,8 @@ class EditorInputs:
         The editor's input sequence — original tokens for KEEP/DEL, [MASK]
         for REPL, [INS] for INS slots.
     op_per_pos : np.ndarray (T_out,) int8
-        Op assigned to each output position. INS positions carry INS_L/INS_R
-        as is. KEEP/REPL/DEL positions correspond to original tokens.
+        Op assigned to each output position. INS positions carry OP_INS.
+        KEEP/REPL/DEL positions correspond to original tokens.
     source_pos : np.ndarray (T_out,) int32
         Index into the source `token_ids` for each output position; -1 for
         INS positions (no source token).
@@ -101,18 +88,13 @@ def apply_ops_for_editor(
 
     `ops` has the SAME LENGTH AS `token_ids`. Each source position carries one
     op; the source token at that position is implicitly preserved (KEEP) for
-    INS_L / INS_R, replaced with [MASK] for REPL, dropped at output for DEL.
+    INS, replaced with [MASK] for REPL, dropped at output for DEL.
 
     Semantics per op at source position i:
-      KEEP   : emit token_ids[i]
-      REPL   : emit [MASK] in place of token_ids[i]
-      DEL    : emit token_ids[i] in place; editor learns to output [DEL]
-      INS_L  : emit one [INS] slot, then emit token_ids[i] (implicit KEEP)
-      INS_R  : emit token_ids[i] (implicit KEEP), then emit one [INS] slot
-      SWAP   : emit token_ids[i+1] then token_ids[i] (pre-swapped); both
-               output positions are tagged OP_SWAP, and source position i+1
-               is consumed (its op is ignored). If i is the last position,
-               SWAP degrades to KEEP for safety.
+      KEEP : emit token_ids[i]
+      REPL : emit [MASK] in place of token_ids[i]
+      DEL  : emit token_ids[i] in place; editor learns to output [DEL]
+      INS  : emit one [INS] slot, then emit token_ids[i] (implicit KEEP)
 
     Multi-slot gaps are handled by `expand_ins_gap`, which is called by
     template enumeration at inference.
@@ -127,60 +109,28 @@ def apply_ops_for_editor(
     out_src: List[int] = []
     ins_gaps: List[Tuple[int, int]] = []
 
-    i = 0
-    T = len(token_ids)
-    while i < T:
+    for i in range(len(token_ids)):
         op = int(ops[i])
         if op == OP_KEEP:
             out_ids.append(int(token_ids[i]))
             out_ops.append(OP_KEEP)
             out_src.append(i)
-            i += 1
         elif op == OP_REPL:
             out_ids.append(mask_token_id)
             out_ops.append(OP_REPL)
             out_src.append(i)
-            i += 1
         elif op == OP_DEL:
             out_ids.append(int(token_ids[i]))
             out_ops.append(OP_DEL)
             out_src.append(i)
-            i += 1
-        elif op == OP_INS_L:
+        elif op == OP_INS:
             ins_gaps.append((len(out_ids), 1))
             out_ids.append(ins_token_id)
-            out_ops.append(OP_INS_L)
+            out_ops.append(OP_INS)
             out_src.append(-1)
             out_ids.append(int(token_ids[i]))
             out_ops.append(OP_KEEP)
             out_src.append(i)
-            i += 1
-        elif op == OP_INS_R:
-            out_ids.append(int(token_ids[i]))
-            out_ops.append(OP_KEEP)
-            out_src.append(i)
-            ins_gaps.append((len(out_ids), 1))
-            out_ids.append(ins_token_id)
-            out_ops.append(OP_INS_R)
-            out_src.append(-1)
-            i += 1
-        elif op == OP_SWAP:
-            if i + 1 >= T:
-                # No right neighbor — degrade to KEEP.
-                out_ids.append(int(token_ids[i]))
-                out_ops.append(OP_KEEP)
-                out_src.append(i)
-                i += 1
-            else:
-                # Emit pre-swapped pair; LM head will be asked for identity
-                # at both positions (no generation needed).
-                out_ids.append(int(token_ids[i + 1]))
-                out_ops.append(OP_SWAP)
-                out_src.append(i + 1)
-                out_ids.append(int(token_ids[i]))
-                out_ops.append(OP_SWAP)
-                out_src.append(i)
-                i += 2  # consume i+1 (its op is ignored)
         else:
             raise ValueError(f"unknown op id {op} at position {i}")
 
@@ -212,7 +162,7 @@ def expand_ins_gap(
     ])
     new_op_per_pos = np.concatenate([
         inputs.op_per_pos[:start],
-        np.full(new_slot_count, inputs.op_per_pos[start] if length else OP_INS_L, dtype=np.int8),
+        np.full(new_slot_count, OP_INS, dtype=np.int8),
         inputs.op_per_pos[start + length:],
     ])
     new_source_pos = np.concatenate([
@@ -248,12 +198,10 @@ def decode_with_op_mask(
     """Reduce editor (input_ids, argmax) using the op_per_pos op mask to a
     list of output tokens. Drops every position whose final token is [DEL].
 
-    KEEP    : output = input token (identity is enforced regardless of argmax)
-    REPL    : output = argmax (unless argmax == [DEL], in which case dropped)
-    DEL     : output = [DEL] (dropped)
-    INS_L/R : output = argmax (unless argmax == [DEL], in which case dropped)
-    SWAP    : output = input token (identity; the swap was applied at
-              `apply_ops_for_editor` time, so the LM head only needs to copy)
+    KEEP : output = input token (identity is enforced regardless of argmax)
+    REPL : output = argmax (unless argmax == [DEL], in which case dropped)
+    DEL  : output = [DEL] (dropped)
+    INS  : output = argmax (unless argmax == [DEL], in which case dropped)
 
     Per the README, any other position whose argmax is [DEL] is dropped too.
     """
@@ -266,9 +214,7 @@ def decode_with_op_mask(
             tok = int(argmax_ids[pos])
         elif op == OP_DEL:
             continue
-        elif op == OP_SWAP:
-            tok = int(input_ids[pos])
-        else:  # INS_L or INS_R
+        else:  # OP_INS
             tok = int(argmax_ids[pos])
         if tok == del_token_id:
             continue
@@ -277,14 +223,13 @@ def decode_with_op_mask(
 
 
 def stats_ins_run_lengths(ops: Sequence[int]) -> List[int]:
-    """Return a list of INS-run lengths (consecutive INS_L or INS_R) in `ops`."""
+    """Return a list of INS-run lengths (consecutive OP_INS) in `ops`."""
     out: List[int] = []
     i, n = 0, len(ops)
     while i < n:
-        if int(ops[i]) in (OP_INS_L, OP_INS_R):
-            cur = int(ops[i])
+        if int(ops[i]) == OP_INS:
             j = i
-            while j < n and int(ops[j]) == cur:
+            while j < n and int(ops[j]) == OP_INS:
                 j += 1
             out.append(j - i)
             i = j

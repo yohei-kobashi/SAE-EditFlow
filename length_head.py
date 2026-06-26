@@ -1,9 +1,9 @@
 """
 Length predictor head (ablation only).
 
-Reads encoder hidden states at INS_L / INS_R positions and predicts the slot
-count over {1..L_MAX}. Trained on INS samples whose gold span length is
-recorded by `corruption.py`.
+Reads encoder hidden states at OP_INS positions and predicts the slot count
+over {1..L_MAX}. Trained on INS samples whose gold span length is recorded
+by `corruption.py`.
 """
 
 from __future__ import annotations

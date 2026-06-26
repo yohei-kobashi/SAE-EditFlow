@@ -33,8 +33,7 @@ from transformers import AutoTokenizer
 from editor import load_editor_from_checkpoint
 from intervene import FeatureSpec, build_intervention_vectors
 from lewis_ops import (
-    OP_INS_L,
-    OP_INS_R,
+    OP_INS,
     EditorInputs,
     apply_ops_for_editor,
     decode_with_op_mask,
@@ -72,14 +71,14 @@ def parse_args():
 
 
 def find_ins_gaps(op_per_pos: np.ndarray) -> List[Tuple[int, int]]:
-    """Identify (start, length) of consecutive INS_L/INS_R runs."""
+    """Identify (start, length) of consecutive OP_INS runs."""
     gaps: List[Tuple[int, int]] = []
     n = len(op_per_pos)
     i = 0
     while i < n:
-        if int(op_per_pos[i]) in (OP_INS_L, OP_INS_R):
+        if int(op_per_pos[i]) == OP_INS:
             j = i
-            while j < n and int(op_per_pos[j]) in (OP_INS_L, OP_INS_R):
+            while j < n and int(op_per_pos[j]) == OP_INS:
                 j += 1
             gaps.append((i, j - i))
             i = j

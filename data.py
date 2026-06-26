@@ -293,18 +293,16 @@ class CorruptionDataset(IterableDataset):
         {
           "source_sent_id": str,
           "corruption_type": str,             # "repl" / "ins" / "del" /
-                                              # "swap" / "identity" / "mixed_..."
+                                              # "identity" / "mixed_..."
           "x_token_ids": [...],
           "x_prime_token_ids": [...],
           "editor_input_token_ids": [...],
           "editor_target_token_ids": [...],
-          "tagger_gold": [...],               # values in {KEEP, REPL, INS_L,
-                                              # INS_R, DEL, SWAP}
+          "tagger_gold": [...],               # values in {KEEP, REPL, INS, DEL}
           "z_X_topk": [{"f": int, "v": float}, ...],
           "z_X_prime_topk": [{"f": int, "v": float}, ...],
           "ins_span_length": int,
           "del_span_length": int,
-          "swap_token_positions": [int, int]  # only for SWAP records
           "filter_telemetry": {...}
         }
     """

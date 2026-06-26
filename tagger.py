@@ -1,5 +1,5 @@
 """
-SAE-conditioned 6-class tagger.
+SAE-conditioned 4-class tagger.
 
 Forward (see README §4.2):
 
@@ -9,12 +9,12 @@ Forward (see README §4.2):
                                                 │
                                          drop conditioning prefix
                                                 │
-                                    per-token 6-class MLP head
+                                    per-token 4-class MLP head
                                                 │
-                          op ∈ {KEEP, REPL, INS_L, INS_R, DEL, SWAP}
+                                 op ∈ {KEEP, REPL, INS, DEL}
 
 Trainable: Proj_A (shared signature with editor; trained jointly or
-independently), type_emb[0..2], a small 6-class head.
+independently), type_emb[0..2], a small 4-class head.
 
 The tagger does not need [INS] or [DEL] embedding deltas because its input
 is the user-provided (or corrupted) text and never contains those markers.

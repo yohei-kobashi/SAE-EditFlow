@@ -1,5 +1,5 @@
 """
-Train the SAE-LEWIS 6-class tagger on the corruption stream.
+Train the SAE-LEWIS 4-class tagger on the corruption stream.
 """
 
 from __future__ import annotations
@@ -113,9 +113,6 @@ def main():
         print(f"          {name:6s}  count={c:>8d}  freq={c/total_counted:.4f}")
     print(f"[tagger] class weights = "
           f"{ {n: round(float(weights[i]), 3) for i, n in enumerate(OP_NAMES)} }")
-    if counts_by_name.get("SWAP", 0) == 0:
-        print("[tagger] WARN: zero SWAP gold ops seen in warmup batches. "
-              "Check corruption.py --p-swap.")
     weights = weights.to(args.device)
 
     out_dir = Path(args.output_dir)

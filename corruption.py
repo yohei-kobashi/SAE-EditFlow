@@ -7,8 +7,6 @@ fluency-preserving, MLM-based corruption to sentence-segmented Dolma:
   REPL : substitute words with MLM-predicted alternatives
   INS  : delete words whose context can recover them
   DEL  : insert MLM-predicted words that the editor must drop
-  SWAP : swap two adjacent words (both must be single-Gemma-token); editor
-         input is the pre-swapped pair so the LM head only needs identity
 
 Corruption operates at the WORD / TEXT level. The MLM (any HF AutoModelFor-
 MaskedLM via `model.MLMProvider`) is decoupled from the downstream editor /
@@ -44,7 +42,7 @@ import torch
 from transformers import AutoTokenizer, set_seed
 
 from data import download_dolma_shards, iter_dolma_texts, iter_sentences
-from lewis_ops import OP_DEL, OP_INS_L, OP_KEEP, OP_REPL, OP_SWAP
+from lewis_ops import OP_DEL, OP_INS, OP_KEEP, OP_REPL
 from model import MLMProvider, SAEFeatureExtractor, load_causal_gemma
 
 
@@ -105,11 +103,6 @@ def parse_args():
     p.add_argument("--p-repl", type=float, default=0.30)
     p.add_argument("--p-ins", type=float, default=0.30)
     p.add_argument("--p-del", type=float, default=0.22)
-    p.add_argument("--p-swap", type=float, default=0.15,
-                   help="Probability weight for SWAP corruption (adjacent-word "
-                        "reorder). Set to 0 (or use --no-swap) to disable.")
-    p.add_argument("--no-swap", action="store_true",
-                   help="Disable SWAP corruption entirely (forces p_swap=0).")
     p.add_argument("--p-mixed-repl-ins", type=float, default=0.03)
     p.add_argument("--p-mixed-repl-del", type=float, default=0.03)
 
@@ -133,15 +126,6 @@ def parse_args():
                    help="Max # of consecutive words to insert per DEL sample.")
     p.add_argument("--del-mlm-topk", type=int, default=8)
     p.add_argument("--del-top1-prob", type=float, default=0.5)
-
-    p.add_argument("--swap-max-attempts", type=int, default=30,
-                   help="Maximum candidate adjacent pairs to try per SWAP sample.")
-    p.add_argument("--swap-min-word-chars", type=int, default=2,
-                   help="Reject swaps whose either word is shorter than this.")
-    p.add_argument("--swap-allow-multi-token", action="store_true",
-                   help="If set, drop the 'both words are single-Gemma-token' "
-                        "constraint. Off by default — multi-token swaps make "
-                        "the apply_ops_for_editor decomposition non-trivial.")
 
     p.add_argument("--sae-shift-threshold", type=float, default=0.3)
     p.add_argument("--ppl-max-ratio", type=float, default=2.0)
@@ -447,9 +431,9 @@ def make_ins_sample(
     # Construct training tuple
     tagger_gold = [OP_KEEP] * len(xp_ids)
     if gap_xp < len(tagger_gold):
-        tagger_gold[gap_xp] = OP_INS_L
+        tagger_gold[gap_xp] = OP_INS
     elif tagger_gold:
-        tagger_gold[-1] = OP_INS_L
+        tagger_gold[-1] = OP_INS
 
     editor_input = list(xp_ids[:gap_xp]) + [stage.ins_id] * ins_span_length + list(xp_ids[gap_xp:])
     editor_target = list(x_ids)
@@ -533,98 +517,6 @@ def make_del_sample(
     }
 
 
-def make_swap_sample(
-    stage: Stage, text: str, rng: random.Random,
-    *,
-    max_attempts: int = 30,
-    min_word_chars: int = 2,
-    require_single_token: bool = True,
-) -> Optional[Dict]:
-    """Swap two adjacent words.
-
-    When `require_single_token` is True (default), both swapped words must
-    map to exactly one Gemma token each, so the token-level swap is a clean
-    transposition of two positions. Multi-token swaps would shift downstream
-    positions and break the per-position op alignment.
-
-    The corruption is purely positional: x_token_ids and x_prime_token_ids
-    differ ONLY at the two swapped positions, and `apply_ops_for_editor`
-    inverts the swap deterministically, so the editor's LM head is asked
-    for identity at the swap positions (no token generation needed there).
-    """
-    words = words_with_offsets(text)
-    if len(words) < 4:
-        return None
-
-    x_ids, x_offsets = gemma_tokenize(stage.gemma_tok, text)
-    candidates = list(range(len(words) - 1))
-    rng.shuffle(candidates)
-
-    for k in candidates[:max_attempts]:
-        wA, sA, eA = words[k]
-        wB, sB, eB = words[k + 1]
-
-        # text-side gates
-        if len(wA) < min_word_chars or len(wB) < min_word_chars:
-            continue
-        if not (wA.isalpha() and wB.isalpha()):
-            continue
-        if wA.lower() == wB.lower():
-            continue
-        gap = text[eA:sB]
-        if gap.strip() != "":
-            continue   # punct / clause boundary between the words
-
-        # token-side gates
-        oa_s, oa_e = find_token_range(x_offsets, sA, eA)
-        ob_s, ob_e = find_token_range(x_offsets, sB, eB)
-        if oa_s is None or oa_e is None or ob_s is None or ob_e is None:
-            continue
-        if require_single_token and (oa_e - oa_s != 1 or ob_e - ob_s != 1):
-            continue
-        if ob_s != oa_e:
-            continue   # not contiguous in token space
-
-        # build corrupted text
-        new_text = text[:sA] + wB + gap + wA + text[eB:]
-        if new_text == text:
-            continue
-        xp_ids, _ = gemma_tokenize(stage.gemma_tok, new_text)
-        if len(xp_ids) != len(x_ids):
-            continue
-
-        a, b = oa_s, ob_s
-        if xp_ids[a] != x_ids[b] or xp_ids[b] != x_ids[a]:
-            continue
-        # All other positions must match — no spurious retokenization drift.
-        if any(xp_ids[t] != x_ids[t]
-               for t in range(len(x_ids)) if t not in (a, b)):
-            continue
-
-        tagger_gold = [OP_KEEP] * len(xp_ids)
-        tagger_gold[a] = OP_SWAP
-        # ops[b] stays KEEP; apply_ops_for_editor consumes it via SWAP at a.
-
-        # apply_ops_for_editor swaps (a, b) back, so editor input == clean.
-        editor_input = list(x_ids)
-        editor_target = list(x_ids)
-
-        return {
-            "corruption_type": "swap",
-            "x_token_ids": x_ids,
-            "x_prime_token_ids": xp_ids,
-            "tagger_gold": tagger_gold,
-            "editor_input_token_ids": editor_input,
-            "editor_target_token_ids": editor_target,
-            "ins_span_length": 0,
-            "del_span_length": 0,
-            "swap_token_positions": [int(a), int(b)],
-            "x_text": text,
-            "x_prime_text": new_text,
-        }
-    return None
-
-
 def make_identity_sample(stage: Stage, text: str) -> Optional[Dict]:
     x_ids, _ = gemma_tokenize(stage.gemma_tok, text)
     if len(x_ids) < 3:
@@ -690,13 +582,11 @@ def finalize_sample(
 # Main loop
 # ---------------------------------------------------------------------------
 def _normalize_probs(args) -> List[Tuple[str, float]]:
-    p_swap = 0.0 if args.no_swap else args.p_swap
     weights = [
         ("identity", args.p_identity),
         ("repl", args.p_repl),
         ("ins", args.p_ins),
         ("del", args.p_del),
-        ("swap", p_swap),
         ("mixed_repl_ins", args.p_mixed_repl_ins),
         ("mixed_repl_del", args.p_mixed_repl_del),
     ]
@@ -821,13 +711,6 @@ def main():
                 sample = make_del_sample(
                     stage, sent, rng,
                     args.del_word_span_max, args.del_mlm_topk, args.del_top1_prob,
-                )
-            elif bucket == "swap":
-                sample = make_swap_sample(
-                    stage, sent, rng,
-                    max_attempts=args.swap_max_attempts,
-                    min_word_chars=args.swap_min_word_chars,
-                    require_single_token=not args.swap_allow_multi_token,
                 )
             elif bucket == "mixed_repl_ins":
                 mid = make_repl_sample(stage, sent, rng,
