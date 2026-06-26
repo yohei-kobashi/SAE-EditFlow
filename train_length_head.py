@@ -90,6 +90,12 @@ def main():
 
     step = 0
     loss_window = []
+    empty_batches = 0
+    # If the corruption cache has zero (or near-zero) INS yield, every batch
+    # we pull will fail the `gold_length > 0` filter and the loop never
+    # increments `step`. Cap consecutive empties so this case fails loudly
+    # within seconds instead of stalling for the whole job walltime.
+    max_empty_batches = max(200, args.batch_size * 50)
     for batch in loader:
         if step >= args.max_steps:
             break
@@ -99,7 +105,17 @@ def main():
         gold_length = batch["ins_span_length"]
         keep = gold_length > 0
         if not keep.any():
+            empty_batches += 1
+            if empty_batches >= max_empty_batches:
+                print(
+                    f"[length] no INS samples in {empty_batches} consecutive "
+                    f"batches — the corruption cache appears to have zero INS "
+                    f"yield. Check meta.json['bucket_yields']['ins']. "
+                    f"Stopping early."
+                )
+                break
             continue
+        empty_batches = 0
         idx = keep.nonzero(as_tuple=True)[0]
 
         z_X = batch["z_X"][idx]

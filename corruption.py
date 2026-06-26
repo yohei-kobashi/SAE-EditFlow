@@ -119,9 +119,15 @@ def parse_args():
 
     p.add_argument("--ins-word-span-max", type=int, default=3,
                    help="Max # of consecutive words to delete per INS sample.")
-    p.add_argument("--ins-mlm-topk", type=int, default=10)
+    p.add_argument("--ins-mlm-topk", type=int, default=30,
+                   help="MLM top-K candidate list for the recoverability check. "
+                        "Larger K → higher recoverability hit rate → higher INS "
+                        "yield, at the cost of a looser quality bar.")
     p.add_argument("--ins-recover-mode", choices=["strict", "lenient"], default="lenient")
-    p.add_argument("--ins-recover-min-fraction", type=float, default=0.6)
+    p.add_argument("--ins-recover-min-fraction", type=float, default=0.4,
+                   help="Lenient-mode recovery threshold. With default 0.4 and "
+                        "n_words=2, accepting >=1 of 2 recovered words is enough. "
+                        "Lower → higher yield but weaker quality bar.")
 
     p.add_argument("--del-word-span-max", type=int, default=2,
                    help="Max # of consecutive words to insert per DEL sample.")
