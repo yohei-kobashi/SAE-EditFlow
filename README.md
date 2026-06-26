@@ -431,7 +431,7 @@ A single end-to-end training phase trains the editor and the tagger on the same 
 | --- | --- | --- |
 | Identity (no corruption) | 5% | clean Dolma sentence, empty conditioning |
 | Pure REPL | 30% | §6.2.2 |
-| Pure INS | 22% | §6.2.3 |
+| Pure INS | 30% | §6.2.3 |
 | Pure DEL | 22% | §6.2.4 |
 | Pure SWAP | 15% | §6.2.5 |
 | Mixed (REPL + INS) | 3% | §6.2.2 then §6.2.3 on the same sentence |
@@ -652,7 +652,7 @@ l_max_sent: 256
 sample_buckets:
   identity:        0.05
   pure_repl:       0.30
-  pure_ins:        0.22
+  pure_ins:        0.30
   pure_del:        0.22
   pure_swap:       0.15   # 0 disables SWAP (or pass --no-swap)
   mixed_repl_ins:  0.03
@@ -671,9 +671,9 @@ repl:
 # INS corruption (MLM-recoverable word deletion)
 ins:
   word_span_max: 3                # 1..N consecutive words; gold L = Gemma token count
-  mlm_topk: 10
+  mlm_topk: 50                    # higher K → looser recoverability → higher yield
   recoverability_mode: lenient    # strict | lenient
-  recoverability_min_fraction: 0.6
+  recoverability_min_fraction: 0.4
   sae_shift_threshold: 0.3
   ppl_max_ratio: 2.0
 

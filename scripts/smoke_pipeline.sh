@@ -42,6 +42,9 @@
 #
 # Each stage's stdout/stderr is captured under $RUN_DIR/logs/<stage>.log.
 # Per-stage wall time and status land in $RUN_DIR/timing.tsv.
+# Per-stage GPU memory peaks (sampled via `nvidia-smi` every 1s while the
+# stage is running) land in $RUN_DIR/gpu.tsv and are used to derive a
+# recommended batch size at the end of the run.
 
 set -euo pipefail
 
@@ -103,6 +106,22 @@ SUMMARY="$RUN_DIR/timing.tsv"
 if [[ ! -f "$SUMMARY" ]]; then
     printf "stage\tstart\tend\telapsed_sec\tstatus\n" > "$SUMMARY"
 fi
+GPU_TSV="$RUN_DIR/gpu.tsv"
+if [[ ! -f "$GPU_TSV" ]]; then
+    printf "stage\tpeak_used_mib\ttotal_mib\tavg_util_pct\tn_samples\n" > "$GPU_TSV"
+fi
+
+# Decide whether GPU monitoring is possible. Honour CUDA_VISIBLE_DEVICES so we
+# sample the GPU the training process is actually using (first one if a list).
+GPU_AVAILABLE=0
+if [[ "${DEVICE,,}" == cuda* ]] && command -v nvidia-smi >/dev/null 2>&1; then
+    GPU_AVAILABLE=1
+fi
+GPU_ID="${CUDA_VISIBLE_DEVICES:-0}"
+GPU_ID="${GPU_ID%%,*}"
+GPU_MON_PID=
+GPU_MON_FILE=
+trap 'if [[ -n "${GPU_MON_PID:-}" ]]; then kill "$GPU_MON_PID" 2>/dev/null || true; fi' EXIT
 
 DOLMA_CACHE="$RUN_DIR/dolma_cache"
 SAE_CACHE="$RUN_DIR/sae_cache"
@@ -133,6 +152,45 @@ record() {
         >> "$SUMMARY"
 }
 
+start_gpu_monitor() {
+    GPU_MON_PID=
+    GPU_MON_FILE=
+    [[ "$GPU_AVAILABLE" -eq 1 ]] || return 0
+    local name=$1
+    GPU_MON_FILE="$LOG_DIR/gpu_${name}.tsv"
+    : > "$GPU_MON_FILE"
+    (
+        while true; do
+            nvidia-smi -i "$GPU_ID" \
+                --query-gpu=memory.used,memory.total,utilization.gpu \
+                --format=csv,noheader,nounits 2>/dev/null \
+                | awk -F', *' 'NF>=3 {printf "%s\t%s\t%s\n", $1, $2, $3}' \
+                >> "$GPU_MON_FILE"
+            sleep 1
+        done
+    ) &
+    GPU_MON_PID=$!
+}
+
+stop_gpu_monitor() {
+    local name=$1
+    if [[ -n "${GPU_MON_PID:-}" ]]; then
+        kill "$GPU_MON_PID" 2>/dev/null || true
+        wait "$GPU_MON_PID" 2>/dev/null || true
+        GPU_MON_PID=
+    fi
+    [[ -s "${GPU_MON_FILE:-/dev/null}" ]] || return 0
+    awk -F'\t' -v stage="$name" '
+        { if ($1 + 0 > peak) peak = $1 + 0
+          if ($2 + 0 > total) total = $2 + 0
+          sum_util += $3 + 0; n++ }
+        END {
+            avg = (n > 0 ? sum_util / n : 0)
+            printf "%s\t%d\t%d\t%.1f\t%d\n", stage, peak, total, avg, n
+        }
+    ' "$GPU_MON_FILE" >> "$GPU_TSV"
+}
+
 run_stage() {
     local name=$1; shift
     local log="$LOG_DIR/${name}.log"
@@ -140,6 +198,7 @@ run_stage() {
     echo "[smoke] cmd: $*" | tee "$log"
     local start
     start=$(date +%s)
+    start_gpu_monitor "$name"
     # Run the python command, capturing stdout/stderr to both terminal and log.
     # Temporarily disable `set -e` so the script doesn't exit before we read
     # PIPESTATUS. We must NOT chain "|| true" here — that would replace
@@ -148,6 +207,7 @@ run_stage() {
     "$@" 2>&1 | tee -a "$log"
     local rc=${PIPESTATUS[0]}
     set -e
+    stop_gpu_monitor "$name"
     local end
     end=$(date +%s)
     local elapsed=$((end - start))
@@ -438,9 +498,87 @@ Notes:
   - Per-step time can grow super-linearly with batch size (cache pressure
     on small GPUs) or sub-linearly (idle CUDA cores on big GPUs). Treat
     the numbers above as an order-of-magnitude estimate, not an SLA.
+EOF
+
+# --------------------------------------------------------------------------- #
+# GPU memory profile + batch-size recommendation
+# --------------------------------------------------------------------------- #
+# Only show this block if at least one stage produced GPU samples.
+if [[ "$GPU_AVAILABLE" -eq 1 ]] && [[ "$(wc -l < "$GPU_TSV")" -gt 1 ]]; then
+    banner "[smoke] GPU memory peaks (per stage)"
+    if command -v column >/dev/null 2>&1; then
+        column -t -s $'\t' "$GPU_TSV"
+    else
+        cat "$GPU_TSV"
+    fi
+
+    # Look up a stage's recorded peak / total (0 if missing).
+    gpu_field_of() {
+        local stage=$1 field=$2
+        awk -F'\t' -v s="$stage" -v f="$field" \
+            '$1==s {print $f; found=1} END {if (!found) print 0}' "$GPU_TSV"
+    }
+
+    # B_rec = floor(B_smoke * (Total / Peak) * SAFETY), floor at 1.
+    # SAFETY leaves headroom for fragmentation, larger sequences, eval-time
+    # spikes, and the activation-vs-fixed-cost mismatch of this heuristic.
+    SAFETY=0.85
+
+    recommend_batch() {
+        local stage=$1 b_smoke=$2 label=$3
+        local peak total
+        peak=$(gpu_field_of "$stage" 2)
+        total=$(gpu_field_of "$stage" 3)
+        if [[ "$peak" -le 0 || "$total" -le 0 ]]; then
+            printf '  %-26s  (no GPU samples)\n' "$label"
+            return
+        fi
+        awk -v lab="$label" -v b_smoke="$b_smoke" \
+            -v peak="$peak" -v total="$total" -v safety="$SAFETY" 'BEGIN {
+            headroom = total / peak
+            b_rec = int(b_smoke * headroom * safety)
+            if (b_rec < 1) b_rec = 1
+            pct = 100.0 * peak / total
+            printf "  %-26s  smoke B=%-3d  peak %5dMiB / %5dMiB (%4.1f%%)  →  recommended B≈%d\n",
+                lab, b_smoke, peak, total, pct, b_rec
+        }'
+    }
+
+    banner "[smoke] recommended batch sizes for production"
+    recommend_batch "01_train_llm2vec"       "$LLM2VEC_BATCH" "LLM2Vec MNTP (per-device)"
+    recommend_batch "03_train_tagger"        "$BATCH_SIZE"    "Tagger"
+    recommend_batch "04_train_editor_phaseA" "$BATCH_SIZE"    "Editor (Phase A)"
+    recommend_batch "05_train_length_head"   "$BATCH_SIZE"    "Length head"
+
+    cat <<'NOTE'
+
+How the recommendation is derived:
+  B_rec = floor(B_smoke × (Total / Peak) × 0.85)
+
+  This treats the smoke-batch peak as if it were all activation memory. In
+  reality, model weights + optimizer state + KV cache are a fixed cost that
+  doesn't scale with batch, so the *true* maximum batch is usually higher
+  than B_rec. Treat B_rec as a safe starting point — try doubling it and
+  watch nvidia-smi before committing to a longer run.
+
+Other guidance:
+  - LLM2Vec: effective batch = per-device-batch × grad-accum-steps. If a
+    larger per-device batch fits, you can keep effective batch constant by
+    lowering --grad-accum-steps proportionally (fewer accum steps → faster).
+  - Multi-GPU DDP: divide B_rec by world size for the per-device setting.
+  - If average GPU utilisation (avg_util_pct column) is well below ~70%,
+    the bottleneck is data loading or CPU pre-processing, not GPU compute.
+    In that case, raise --num-workers before raising batch size — extra
+    memory headroom won't help if the GPU sits idle waiting for batches.
+NOTE
+fi
+
+cat <<EOF
 
 Artifacts:
   Run dir         : $RUN_DIR
   Per-stage logs  : $LOG_DIR/
   Timing TSV      : $SUMMARY
+  GPU samples TSV : $GPU_TSV   (peak/total/util per stage)
+  Per-stage GPU traces: $LOG_DIR/gpu_<stage>.tsv  (1-Hz nvidia-smi samples)
 EOF

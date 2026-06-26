@@ -103,7 +103,7 @@ def parse_args():
 
     p.add_argument("--p-identity", type=float, default=0.05)
     p.add_argument("--p-repl", type=float, default=0.30)
-    p.add_argument("--p-ins", type=float, default=0.22)
+    p.add_argument("--p-ins", type=float, default=0.30)
     p.add_argument("--p-del", type=float, default=0.22)
     p.add_argument("--p-swap", type=float, default=0.15,
                    help="Probability weight for SWAP corruption (adjacent-word "
@@ -119,7 +119,7 @@ def parse_args():
 
     p.add_argument("--ins-word-span-max", type=int, default=3,
                    help="Max # of consecutive words to delete per INS sample.")
-    p.add_argument("--ins-mlm-topk", type=int, default=30,
+    p.add_argument("--ins-mlm-topk", type=int, default=50,
                    help="MLM top-K candidate list for the recoverability check. "
                         "Larger K → higher recoverability hit rate → higher INS "
                         "yield, at the cost of a looser quality bar.")
