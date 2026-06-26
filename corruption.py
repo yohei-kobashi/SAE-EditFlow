@@ -112,15 +112,6 @@ def parse_args():
 
     p.add_argument("--ins-word-span-max", type=int, default=3,
                    help="Max # of consecutive words to delete per INS sample.")
-    p.add_argument("--ins-mlm-topk", type=int, default=50,
-                   help="MLM top-K candidate list for the recoverability check. "
-                        "Larger K → higher recoverability hit rate → higher INS "
-                        "yield, at the cost of a looser quality bar.")
-    p.add_argument("--ins-recover-mode", choices=["strict", "lenient"], default="lenient")
-    p.add_argument("--ins-recover-min-fraction", type=float, default=0.4,
-                   help="Lenient-mode recovery threshold. With default 0.4 and "
-                        "n_words=2, accepting >=1 of 2 recovered words is enough. "
-                        "Lower → higher yield but weaker quality bar.")
 
     p.add_argument("--del-word-span-max", type=int, default=2,
                    help="Max # of consecutive words to insert per DEL sample.")
@@ -247,35 +238,6 @@ def _norm(w: str) -> str:
     return w.strip().lower()
 
 
-def _word_recovery_hit(candidates: List[str], original: str,
-                       min_prefix_len: int = 3) -> bool:
-    """Decide whether MLM `candidates` recover `original` at a masked slot.
-
-    A candidate counts as a hit iff (after lowercasing / stripping) it is
-    either:
-      - exactly equal to the original word, OR
-      - a prefix of the original word with length >= `min_prefix_len`.
-
-    The prefix rule handles the common case where the original word
-    tokenises to multiple subwords under the MLM's BPE (e.g. ModernBERT
-    splits "scientists" into "Ġscient" + "ists"). With single-token
-    [MASK]s the MLM can only emit one subword, so the strongest signal
-    of correct recovery is a word-initial prefix match.
-    """
-    o = _norm(original)
-    if not o:
-        return False
-    for c in candidates:
-        c = _norm(c)
-        if not c:
-            continue
-        if c == o:
-            return True
-        if len(c) >= min_prefix_len and o.startswith(c):
-            return True
-    return False
-
-
 def make_repl_sample(
     stage: Stage, text: str, rng: random.Random,
     repl_words_max: int, mlm_topk: int,
@@ -361,10 +323,8 @@ def make_repl_sample(
 
 
 INS_REJECT_REASONS = (
-    "too_short_words",     # input has fewer than 8 words (trivial-filter)
+    "too_short_words",     # too few words to fit `word_span_max` with margin
     "too_short_xprime",    # corrupted text would be < 8 non-whitespace chars
-    "mlm_short",           # MLM returned fewer mask predictions than expected
-    "recovery_fail",       # MLM can't recover the deleted words (RECOVERY)
     "ins_span_nonpos",     # token-count diff is <= 0 (STRUCTURAL)
     "suffix_mismatch",     # prefix matched but suffix did not (STRUCTURAL)
     "length_mismatch",     # final editor_input vs target length mismatch (STRUCTURAL)
@@ -373,12 +333,18 @@ INS_REJECT_REASONS = (
 
 def make_ins_sample(
     stage: Stage, text: str, rng: random.Random,
-    word_span_max: int, mlm_topk: int,
-    recover_mode: str, recover_min_fraction: float,
+    word_span_max: int,
     *,
     reject_counter: Optional[Dict[str, int]] = None,
 ) -> Optional[Dict]:
-    """Delete a span of consecutive words whose context can recover them.
+    """Delete a span of consecutive words.
+
+    No MLM-based recovery check: the editor recovers the deleted words from
+    context + z-conditioning, the same way REPL recovers the original word.
+    A recoverability gate on the MLM was over-conservative (an MLM rarely
+    predicts the EXACT original word from context the way our SAE-conditioned
+    editor can), and broke symmetry with REPL/DEL. PPL and SAE-shift gates in
+    `finalize_sample` still apply.
 
     When `reject_counter` is provided, increments the matching reason key on
     every early return so the caller can see which gate is dominating the
@@ -390,10 +356,16 @@ def make_ins_sample(
         return None
 
     words = words_with_offsets(text)
-    if len(words) < 8:
+    if len(words) < 5:
         return _rej("too_short_words")
-    n_words = rng.randint(1, max(1, min(word_span_max, len(words) - 6)))
-    start_wi = rng.randint(1, len(words) - n_words - 2)
+    # Require at least 1 word on each side of the deletion span:
+    #   start_wi >= 1, end_wi <= len(words) - 1
+    # which means n_words <= len(words) - 2.
+    max_span = min(word_span_max, len(words) - 2)
+    if max_span < 1:
+        return _rej("too_short_words")
+    n_words = rng.randint(1, max_span)
+    start_wi = rng.randint(1, len(words) - n_words - 1)
     end_wi = start_wi + n_words
 
     delete_start = words[start_wi][1]
@@ -405,25 +377,6 @@ def make_ins_sample(
     xprime_text = text[:delete_start] + text[delete_end:]
     if len(xprime_text.strip()) < 8:
         return _rej("too_short_xprime")
-
-    # Recovery check: mask all n words in one MLM forward
-    masked_block = " ".join([stage.mlm.mask_token] * n_words)
-    masked_text = text[:delete_start] + masked_block + text[delete_end:]
-    preds_per_mask = stage.mlm.predict_at_masks(masked_text, top_k=mlm_topk)
-    if len(preds_per_mask) < n_words:
-        return _rej("mlm_short")
-    hits = 0
-    for i in range(n_words):
-        orig_word, _, _ = words[start_wi + i]
-        cands = preds_per_mask[i]
-        if _word_recovery_hit(cands, orig_word):
-            hits += 1
-    if recover_mode == "strict":
-        if hits != n_words:
-            return _rej("recovery_fail")
-    else:
-        if hits / n_words < recover_min_fraction:
-            return _rej("recovery_fail")
 
     x_ids, _ = gemma_tokenize(stage.gemma_tok, text)
     xp_ids, _ = gemma_tokenize(stage.gemma_tok, xprime_text)
@@ -728,8 +681,7 @@ def main():
             elif bucket == "ins":
                 sample = make_ins_sample(
                     stage, sent, rng,
-                    args.ins_word_span_max, args.ins_mlm_topk,
-                    args.ins_recover_mode, args.ins_recover_min_fraction,
+                    args.ins_word_span_max,
                     reject_counter=ins_reject_counter,
                 )
             elif bucket == "del":
@@ -745,8 +697,7 @@ def main():
                 # Use the corrupted text as the new clean for INS
                 sample = make_ins_sample(
                     stage, mid["x_prime_text"], rng,
-                    args.ins_word_span_max, args.ins_mlm_topk,
-                    args.ins_recover_mode, args.ins_recover_min_fraction,
+                    args.ins_word_span_max,
                     reject_counter=ins_reject_counter,
                 )
                 if sample is not None:
