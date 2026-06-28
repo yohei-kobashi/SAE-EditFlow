@@ -130,12 +130,14 @@ def load_model(
 ) -> torch.nn.Module:
     """Load a HF causal LM, optionally with the LLM2Vec bidirectional patch.
 
-    Matches the canonical setup: `attn_implementation="eager"` so the
-    explicit 4D mask from `_update_causal_mask` is consumed by the
-    attention kernel directly (no SDPA `is_causal` override).
+    SDPA is used (3-5x faster than eager). The bidir patch sets
+    `module.is_causal=False` AND returns a non-None padding-only 4D mask
+    from `_update_causal_mask`, so SDPA's dispatch (`is_causal = q_len>1
+    and mask is None and module.is_causal`) falls through to False and
+    SDPA consumes the explicit mask = bidirectional.
     """
     model = AutoModelForCausalLM.from_pretrained(
-        path, torch_dtype=dtype, attn_implementation="eager",
+        path, torch_dtype=dtype, attn_implementation="sdpa",
     )
     if bidir_patch:
         _patch_attention_bidirectional(model.model)

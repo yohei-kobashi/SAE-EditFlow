@@ -309,11 +309,15 @@ class BidirectionalLLM(nn.Module):
     and at editor / tagger inference. Tokenizer is shared with the causal
     Gemma so [INS] / [DEL] embeddings added before MNTP are also valid here.
 
-    We force `attn_implementation="eager"` to match the canonical LLM2Vec
-    setup (`run_mntp.py` only registers eager attention). Eager attention
-    consumes the explicit 4D attn_mask from `_update_causal_mask`, so the
-    bidirectional patch is guaranteed to take effect regardless of the
-    transformers / PyTorch SDPA dispatch path.
+    We use `attn_implementation="sdpa"` for speed. The bidirectional patch
+    is still respected because Gemma's SDPA path
+    (`transformers.integrations.sdpa_attention.sdpa_attention_forward`)
+    computes `is_causal = q_len > 1 and attention_mask is None and
+    module.is_causal`. Our `_patch_attention_bidirectional` sets
+    `module.is_causal = False` AND `_update_causal_mask` returns a
+    non-None padding-only 4D mask, so SDPA falls through to
+    `is_causal=False` and uses the explicit mask (= bidirectional).
+    Eager attention is 3-5x slower with no semantic gain here.
     """
 
     def __init__(self, model_name_or_path: str, dtype: torch.dtype = torch.bfloat16):
@@ -321,7 +325,7 @@ class BidirectionalLLM(nn.Module):
         self.backbone = AutoModel.from_pretrained(
             model_name_or_path,
             torch_dtype=dtype,
-            attn_implementation="eager",
+            attn_implementation="sdpa",
         )
         _patch_attention_bidirectional(self.backbone)
 

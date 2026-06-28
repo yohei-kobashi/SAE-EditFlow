@@ -241,7 +241,7 @@ Sparse top-L SAE features per LLM token over the sentence-segmented Dolma sample
 
 MNTP training to turn causal Gemma into a bidirectional encoder. Follows the canonical LLM2Vec recipe (McGill-NLP), with two ingredients:
 
-1. **Bidirectional attention patch.** The inner `GemmaModel`'s `_update_causal_mask` is overridden to return a padding-only 4D mask (no triangular `-inf`), and every self-attention module's `is_causal` flag is set to `False`. The model is loaded with `attn_implementation="eager"` so the explicit mask is consumed directly by the kernel (no SDPA `is_causal` override). Lives in `model._patch_attention_bidirectional` and is reused at inference by `BidirectionalLLM`.
+1. **Bidirectional attention patch.** The inner `GemmaModel`'s `_update_causal_mask` is overridden to return a padding-only 4D mask (no triangular `-inf`), and every self-attention module's `is_causal` flag is set to `False`. The model is loaded with `attn_implementation="sdpa"` for speed. Gemma's SDPA path computes `is_causal = q_len > 1 and attention_mask is None and module.is_causal`; both of the latter two conjuncts are False after the patch, so SDPA falls through to bidirectional with the explicit mask. (Canonical LLM2Vec forces `eager` only because it uses a subclass-level override that registers a single attention class; we monkey-patch the existing module, so all kernels work.) Lives in `model._patch_attention_bidirectional` and is reused at inference by `BidirectionalLLM`.
 2. **MNTP objective (predict-at-i-1).** Token-level masking via HF's `DataCollatorForLanguageModeling` (15% / 80-10-10), then `GemmaForCausalLM.forward(labels=labels)` whose built-in `+1` shift gives `loss = CE(logits[..., :-1, :], labels[..., 1:])`. Combined with the bidirectional attention, the masked token at position `i` is predicted from the bidirectionally-contextualized hidden state at position `i-1` — exactly the LLM2Vec objective. The LM head's pretrained "next-token" mapping is reused without retraining.
 
 `train_llm2vec.py` adds `[MASK]` (if absent), `[INS]`, and `[DEL]` to the tokenizer before any training step, then resizes the LLM's embedding table so MNTP trains the new rows jointly with the rest of the model (§5). The MNTP'd Gemma is the **encoder backbone** of both the editor and the tagger, and is also the **causal PPL scorer** in `corruption.py` (re-loaded with the causal mask intact, no bidir patch). It is not used as the corruption MLM (§6.2) — corruption operates at the text level and uses a separate, swappable MLM.
@@ -675,7 +675,7 @@ mntp:
   mlm_probability:    0.15          # 15% / 80-10-10 (DataCollatorForLanguageModeling)
   objective:          predict_i_from_h_im1   # +1 shift via GemmaForCausalLM.forward(labels=...)
   bidir_patch:
-    attn_implementation: eager
+    attn_implementation: sdpa       # 3-5x faster than eager; Gemma SDPA respects module.is_causal=False + explicit mask
     is_causal:        false         # set on every self-attention module
     update_causal_mask: padding_only  # patched _update_causal_mask (no triu)
 

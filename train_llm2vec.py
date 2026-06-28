@@ -180,15 +180,19 @@ def main():
         "float16": torch.float16,
         "float32": torch.float32,
     }[args.llm_dtype]
-    # `attn_implementation="eager"` matches canonical LLM2Vec
-    # (`run_mntp.py` registers only eager attention). Eager attention
-    # consumes the explicit 4D mask we provide via the patched
-    # `_update_causal_mask`, so the bidirectional patch is guaranteed to
-    # take effect.
+    # We use SDPA (3-5x faster than eager). For Gemma-2 the SDPA path
+    # respects our bidir patch: it computes
+    #   is_causal = q_len > 1 and attention_mask is None and module.is_causal
+    # `_patch_attention_bidirectional` sets module.is_causal=False AND the
+    # patched _update_causal_mask returns a non-None padding-only 4D mask,
+    # so SDPA uses the explicit mask = bidirectional. (Canonical LLM2Vec
+    # forces eager only because it uses a subclass-level override that
+    # only registers an "eager" attention class. We monkey-patch the
+    # existing module, so all kernels work.)
     model = AutoModelForCausalLM.from_pretrained(
         args.llm,
         torch_dtype=dtype,
-        attn_implementation="eager",
+        attn_implementation="sdpa",
     )
     if added > 0 or model.config.vocab_size != len(tokenizer):
         model.resize_token_embeddings(len(tokenizer))
