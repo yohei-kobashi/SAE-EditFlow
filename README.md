@@ -428,28 +428,34 @@ Per-position op composition is handled by `apply_ops_for_editor` and the tagger 
 
 #### 6.2.6 N-dependent gates and self-consistent calibration
 
-A compound corruption's fluency degradation and SAE shift both scale with N, so a fixed threshold either rejects almost all `N ≥ 3` compounds (too tight) or accepts almost all (too loose). The gates are therefore N-dependent. The fluency gate also follows the SLOR formulation (Pauls&Klein 2012 / Lau et al. 2017 / Kann et al. NAACL 2018) — per-token, unigram-normalised log-likelihood — instead of raw PPL ratio, which has well-documented length and rare-word artefacts (Wang+ 2022, Kann+ 2018).
+Three independent gates are applied to each (X, X') pair:
 
 ```
-slor_drop_max(N) = slor_drop_per_op * N        (linear)
-sae_min(N)       = sae_per_op_min   * sqrt(N)
-sae_max(N)       = sae_per_op_max   * sqrt(N)  (minimality upper bound)
+fluency       :  slor_drop = SLOR(X) − SLOR(X')                <= slor_drop_per_op * N    (linear)
+SAE-min       :  |top_K(X) \ top_K(X')|                         >= sae_min_topk_change    (binary by default)
+SAE-max (L2)  :  || pool_max(z_X) − pool_max(z_X') ||_2          <= sae_per_op_max * sqrt(N)
 
 SLOR(s) = (1/|s|) * [log p_M(s) − log p_unigram(s)]
-slor_drop = SLOR(X) − SLOR(X')                  (positive = X' is less fluent)
+top_K(z) = the set of K (default 10) SAE features with the highest pool-max activation
 ```
+
+Fluency uses **SLOR** (Pauls&Klein 2012 / Lau et al. 2017 / Kann et al. NAACL 2018) — per-token, unigram-normalised log-likelihood — instead of raw PPL ratio, which has well-documented length and rare-word artefacts (Wang+ 2022, Kann+ 2018).
+
+The **SAE lower bound** is a **top-K identity change check** (BINARY by default): reject the pair if the top-`K` most-active SAE features are the same SET before and after corruption. L2 shift was the previous lower-bound metric but conflates magnitude wiggles with actual representation change — if the top-K features have the same identities, the editor cannot learn from the conditioning vector even when ||z_X − z_X'|| is non-zero. The default `sae_min_topk_change = 1` means "at least 1 feature must change identity"; raise it for stricter SAE-space separation.
+
+The **SAE upper bound** remains an L2 shift (continuous, `sqrt(N)`-scaled). This is the "minimal pair" guarantee — too much L2 shift means the pair is no longer a minimal edit, regardless of which features changed.
 
 **Why SLOR.** Raw `PPL(X')/PPL(X)` over-penalises corruption that inserts a rare-but-fluent word (because the rare word's marginal probability is low) and conflates fluency change with length change (because PPL is a function of length). SLOR subtracts a unigram baseline and divides by `|s|`, which structurally removes both artefacts. Kann+ 2018 report a Pearson correlation of `0.454` for SLOR vs `0.325` for raw PPL on referenceless fluency evaluation. The same paper's "of Tuvalu" vs "of France" example mirrors what happens in our pipeline when the corruption MLM proposes rare-but-natural words: under raw PPL the candidate is wrongly rejected; under SLOR it survives.
 
 **Why linear N for SLOR drop.** Per-token Δlog-likelihood per op is approximately constant under the empirical fit (we observed `factor^N` matching p50 of raw PPL ratio for `N ∈ 1..5` with `factor = 1.25 ≈ exp(0.22 nats/token/op)`), which says the expected SLOR drop is `(constant) × N` — linear, not `sqrt(N)`. SAE-shift retains `sqrt(N)` (a separate decision, calibrated independently against the same data).
 
-**Calibration.** The three scale constants are not fixed by theory; they are fit by running the compound generator on Dolma in a **calibration mode** that records every attempt's `(N, slor_drop, sae_shift, plus legacy ppl_ratio)` without applying the gate. For each `N ∈ {1..N_MAX}`, percentile statistics of the empirical distribution drive the thresholds:
+**Calibration.** The scale constants are not fixed by theory; they are fit by running the compound generator on Dolma in a **calibration mode** that records every attempt's `(N, slor_drop, sae_shift, sae_topk_change, plus legacy ppl_ratio)` without applying the gate. For each `N ∈ {1..N_MAX}`, percentile statistics drive the thresholds:
 
 | Constant | Setting |
 | --- | --- |
-| `slor_drop_per_op` | such that `slor_drop_max(N)` ≥ 75th percentile of `slor_drop` at each N |
-| `sae_per_op_min`   | such that `sae_min(N)` ≤ 25th percentile of `sae_shift` at each N |
-| `sae_per_op_max`   | such that `sae_max(N)` ≥ 95th percentile of `sae_shift` at each N |
+| `slor_drop_per_op`     | such that `slor_drop_max(N)` ≥ 75th percentile of `slor_drop` at each N |
+| `sae_min_topk_change`  | not a percentile — set per design (`1` = strict binary; raise for stricter separation) |
+| `sae_per_op_max`       | such that `sae_max(N)` ≥ 95th percentile of `sae_shift` at each N |
 
 The calibration is **self-consistent on the same Dolma + MLM compound distribution that the editor will train on**: the calibration source = the training source. We do not calibrate against external paraphrase corpora — paraphrase pairs have a fundamentally different position distribution (humans target meaning-relevant positions; this pipeline uses priority-biased random positions), so the metrics are not directly comparable and would mis-fit the threshold.
 
@@ -709,12 +715,15 @@ compound:
   k_budget:              6        # first-accept rejection attempts per source sentence
   apply_order:           "right_to_left"
 
-# N-dependent gates (§6.2.6); SLOR drop for fluency (linear N), SAE shift
-# for minimality (sqrt N). All knobs calibrated by percentile.
+# N-dependent gates (§6.2.6).
+#   fluency  : SLOR drop, linear N
+#   SAE-min  : top-K identity change, binary (N-independent)
+#   SAE-max  : L2 shift, sqrt N (minimality upper bound)
 gates:
   slor_drop_per_op:      0.10     # slor_drop_max(N) = 0.10 * N (per-token, nats)
-  sae_per_op_min:        0.30     # sae_min(N) = 0.30 * sqrt(N)
-  sae_per_op_max:        2.50     # sae_max(N) = 2.50 * sqrt(N) (minimality upper bound)
+  sae_min_topk_size:     10       # K for the top-K identity check
+  sae_min_topk_change:   1        # min # of features that must differ between top_K(X) and top_K(X')
+  sae_per_op_max:        2.50     # sae_max(N) = 2.50 * sqrt(N) (L2 upper bound)
   unigram:
     sample_size:         5000     # # Dolma sentences scanned to build the SLOR baseline
     smoothing:           1.0      # add-k Laplace
@@ -722,7 +731,6 @@ gates:
   calibration:
     source:              "dolma+mlm self-consistent"   # not external paraphrase corpora
     slor_percentile:     75       # slor_drop_max(N) ≥ this percentile of slor_drop at each N
-    sae_min_percentile:  25       # sae_min(N) ≤ this percentile of sae_shift at each N
     sae_max_percentile:  95       # sae_max(N) ≥ this percentile of sae_shift at each N
     attempts_per_N:      1000     # for the calibration run
 
