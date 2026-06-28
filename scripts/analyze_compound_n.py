@@ -152,26 +152,22 @@ def simulate_gate_yield(
     records: List[Dict], N: int,
     slor_drop_per_op: float,
     sae_min_topk_change: int,
-    sae_per_op_max: float,
 ) -> Dict:
     """Compute the fraction of `records` that would pass the gate at the
     given scale constants.
 
-    Fluency:           SLOR drop linear in N.
-    SAE lower bound:   top-K identity change >= sae_min_topk_change.
-    SAE upper bound:   L2 shift  <=  sae_per_op_max * sqrt(N).
+    Fluency:  SLOR drop linear in N.
+    SAE:      top-K identity change >= sae_min_topk_change (binary).
     """
     if N <= 0 or not records:
         return {"n": len(records), "pass_frac": 1.0,
                 "rej_slor_inf": 0, "rej_slor_drop": 0,
-                "rej_sae_topk": 0, "rej_sae_high": 0}
+                "rej_sae_topk": 0}
     slor_drop_max = slor_drop_per_op * N
-    sae_max = sae_per_op_max * math.sqrt(N)
     passed = 0
-    r_slor_inf = r_slor_drop = r_sae_topk = r_sae_high = 0
+    r_slor_inf = r_slor_drop = r_sae_topk = 0
     for r in records:
         slor_drop = r.get("slor_drop")
-        shift = r.get("sae_shift")
         topk_change = r.get("sae_topk_change")
         if slor_drop is None or not math.isfinite(slor_drop):
             r_slor_inf += 1
@@ -182,9 +178,6 @@ def simulate_gate_yield(
         if topk_change is None or topk_change < sae_min_topk_change:
             r_sae_topk += 1
             continue
-        if shift is None or not math.isfinite(shift) or shift > sae_max:
-            r_sae_high += 1
-            continue
         passed += 1
     total = len(records)
     return {
@@ -193,7 +186,6 @@ def simulate_gate_yield(
         "rej_slor_inf": r_slor_inf,
         "rej_slor_drop": r_slor_drop,
         "rej_sae_topk": r_sae_topk,
-        "rej_sae_high": r_sae_high,
     }
 
 
@@ -204,20 +196,19 @@ TSV_COLUMNS = [
     "N", "records",
     "slor_mean", "slor_p05", "slor_p25", "slor_p50", "slor_p75", "slor_p95",
     "ppl_mean", "ppl_p25", "ppl_p50", "ppl_p75", "ppl_p95",
+    # L2 shift kept for telemetry only (no longer a gate).
     "sae_mean", "sae_p05", "sae_p25", "sae_p50", "sae_p75", "sae_p95",
     "topk_mean", "topk_p25", "topk_p50", "topk_p75", "topk_p95",
     "topk_eq0", "topk_eq1", "topk_2_3", "topk_4plus",
     "op_REPL", "op_INS", "op_DEL",
     "yield_default", "slor_drop_max_default",
-    "sae_min_topk_change_default", "sae_max_default",
+    "sae_min_topk_change_default",
 ]
 
 
 def format_tsv_row(N: int, summary: Dict, gate: Dict,
                    slor_drop_per_op: float,
-                   sae_min_topk_change: int,
-                   sae_per_op_max: float) -> List[str]:
-    s = math.sqrt(N) if N > 0 else 0.0
+                   sae_min_topk_change: int) -> List[str]:
     buckets = summary["topk_bucket"]
     return [
         str(N),
@@ -254,7 +245,6 @@ def format_tsv_row(N: int, summary: Dict, gate: Dict,
         f"{gate['pass_frac']:.3f}",
         f"{slor_drop_per_op * N:.3f}" if N > 0 else "inf",
         str(sae_min_topk_change),
-        f"{sae_per_op_max * s:.3f}",
     ]
 
 
@@ -263,18 +253,18 @@ def render_md(
     sweeps: List[Dict],
     slor_drop_per_op: float,
     sae_min_topk_change: int,
-    sae_per_op_max: float,
 ) -> str:
     out: List[str] = []
     out.append("# Compound-N corruption measurement\n")
     out.append("Default gates (calibrated knobs at the corruption.py defaults):")
     out.append(f"  * `slor_drop_per_op`     = {slor_drop_per_op}  →  slor_drop_max(N) = c · N  (linear)")
     out.append(f"  * `sae_min_topk_change`  = {sae_min_topk_change}  →  top-K(X) must differ from top-K(X') by ≥ this many features")
-    out.append(f"  * `sae_per_op_max`       = {sae_per_op_max}  →  sae_max(N) = max · √N (L2 upper bound)\n")
+    out.append("\nL2 sae_max upper bound removed — top-K identity change is the sole SAE gate; "
+               "raw `sae_shift` is recorded for telemetry only.\n")
 
     # Main table — distributions per N. SLOR is the primary fluency signal;
     # PPL ratio is kept for sanity-check against legacy runs.
-    out.append("## Per-N distributions (SLOR drop primary, PPL ratio for cross-check)\n")
+    out.append("## Per-N distributions (SLOR drop primary, PPL & L2 shift recorded for telemetry)\n")
     out.append("| N | records | SLOR p25 | SLOR p50 | SLOR p75 | SLOR p95 | PPL p50 | PPL p95 | shift p50 | shift p95 |")
     out.append("|---|---------|----------|----------|----------|----------|---------|---------|-----------|-----------|")
     for row in rows:
@@ -286,7 +276,7 @@ def render_md(
             f"{s['sae_p50']:.2f} | {s['sae_p95']:.2f} |"
         )
 
-    # Top-K identity-change distribution (new SAE lower-bound metric)
+    # Top-K identity-change distribution (the SAE gate metric)
     out.append("\n## Top-K SAE feature identity change per N\n")
     out.append("How many of the top-K features differ between top_K(X) and top_K(X'). "
                "0 = activation pattern unchanged (rejected by sae_min); K = completely replaced.\n")
@@ -304,19 +294,17 @@ def render_md(
 
     # Default gate yields
     out.append("\n## Yield under the default gate\n")
-    out.append("| N | slor_drop_max(N) | min_topk_change | sae_max(N) | yield | rej SLOR inf | rej SLOR drop | rej topK unchanged | rej SAE high |")
-    out.append("|---|------------------|-----------------|------------|-------|--------------|---------------|--------------------|--------------|")
+    out.append("| N | slor_drop_max(N) | min_topk_change | yield | rej SLOR inf | rej SLOR drop | rej topK unchanged |")
+    out.append("|---|------------------|-----------------|-------|--------------|---------------|--------------------|")
     for row in rows:
         N = row["N"]
-        s = math.sqrt(N) if N > 0 else 0.0
         slor_drop_max = slor_drop_per_op * N if N > 0 else float("inf")
-        sae_max = sae_per_op_max * s
         g = row["gate_default"]
         slor_max_str = "∞" if not math.isfinite(slor_drop_max) else f"{slor_drop_max:.3f}"
         out.append(
-            f"| {N} | {slor_max_str} | {sae_min_topk_change} | {sae_max:.2f} | "
+            f"| {N} | {slor_max_str} | {sae_min_topk_change} | "
             f"{g['pass_frac']*100:.1f}% | {g['rej_slor_inf']} | {g['rej_slor_drop']} | "
-            f"{g['rej_sae_topk']} | {g['rej_sae_high']} |"
+            f"{g['rej_sae_topk']} |"
         )
 
     # Op-type histogram
@@ -372,8 +360,6 @@ def main():
     ap.add_argument("--sae-min-topk-change", type=int, default=1,
                     help="Min # of features that must differ between "
                          "top-K(X) and top-K(X'). Default 1 (binary).")
-    ap.add_argument("--sae-per-op-max", type=float, default=2.50,
-                    help="sae_max(N) = c * sqrt(N) (L2 upper bound).")
     ap.add_argument("--report-tsv", help="Path to write TSV summary "
                                           "(default: <run_dir>/report.tsv)")
     ap.add_argument("--report-md", help="Path to write Markdown report "
@@ -410,22 +396,22 @@ def main():
         summary = summarise_one_N(records)
         gate = simulate_gate_yield(
             records, N,
-            args.slor_drop_per_op, args.sae_min_topk_change, args.sae_per_op_max,
+            args.slor_drop_per_op, args.sae_min_topk_change,
         )
         rows.append({"N": N, "records": records, "summary": summary,
                      "gate_default": gate})
 
-    # Gate sweep — vary each scale knob independently.
+    # Gate sweep — vary each scale knob independently. Only two gate
+    # knobs remain since the L2 sae_max upper bound was removed.
     sweeps: List[Dict] = []
-    slor_grid     = [0.05, 0.10, 0.15, 0.20, 0.30]
-    topk_grid     = [1, 2, 3, 4]
-    sae_max_grid  = [1.50, 2.50, 4.00, 6.00]
+    slor_grid = [0.05, 0.10, 0.15, 0.20, 0.30]
+    topk_grid = [1, 2, 3, 4]
     for sl in slor_grid:
         per_n_pass = {}
         for row in rows:
             g = simulate_gate_yield(
                 row["records"], row["N"],
-                sl, args.sae_min_topk_change, args.sae_per_op_max,
+                sl, args.sae_min_topk_change,
             )
             per_n_pass[row["N"]] = g["pass_frac"]
         sweeps.append({"label": f"slor_drop_per_op={sl}", "per_n_pass": per_n_pass})
@@ -434,19 +420,10 @@ def main():
         for row in rows:
             g = simulate_gate_yield(
                 row["records"], row["N"],
-                args.slor_drop_per_op, tk, args.sae_per_op_max,
+                args.slor_drop_per_op, tk,
             )
             per_n_pass[row["N"]] = g["pass_frac"]
         sweeps.append({"label": f"sae_min_topk_change={tk}", "per_n_pass": per_n_pass})
-    for smax in sae_max_grid:
-        per_n_pass = {}
-        for row in rows:
-            g = simulate_gate_yield(
-                row["records"], row["N"],
-                args.slor_drop_per_op, args.sae_min_topk_change, smax,
-            )
-            per_n_pass[row["N"]] = g["pass_frac"]
-        sweeps.append({"label": f"sae_max={smax}", "per_n_pass": per_n_pass})
 
     # TSV
     tsv_path = Path(args.report_tsv) if args.report_tsv else (run_dir / "report.tsv")
@@ -457,7 +434,6 @@ def main():
             cells = format_tsv_row(
                 row["N"], row["summary"], row["gate_default"],
                 args.slor_drop_per_op, args.sae_min_topk_change,
-                args.sae_per_op_max,
             )
             f.write("\t".join(cells) + "\n")
     print(f"[analyze-N] wrote {tsv_path}")
@@ -467,7 +443,7 @@ def main():
     md_path.parent.mkdir(parents=True, exist_ok=True)
     md_path.write_text(render_md(
         rows, sweeps,
-        args.slor_drop_per_op, args.sae_min_topk_change, args.sae_per_op_max,
+        args.slor_drop_per_op, args.sae_min_topk_change,
     ))
     print(f"[analyze-N] wrote {md_path}")
 

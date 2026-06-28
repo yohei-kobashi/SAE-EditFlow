@@ -16,7 +16,7 @@ non-overlapping word ranges on the original X. First-accept rejection
 within K_BUDGET attempts per source sentence preserves the natural
 post-gate distribution (no PPL-ranking bias).
 
-**N-dependent gates (§6.2.6).** Three gates with independent shape:
+**N-dependent gates (§6.2.6).** Two gates with independent shape:
 
   (i) Fluency — SLOR drop (per-token, unigram-normalised log-likelihood;
       Pauls&Klein 2012 / Lau+ 2017 / Kann+ 2018). LINEAR-in-N budget
@@ -24,18 +24,19 @@ post-gate distribution (no PPL-ranking bias).
 
          slor_drop_max(N) = slor_drop_per_op * N
 
-  (ii) SAE lower bound — top-K identity change (BINARY by default).
-       Reject if the top-K (=10) SAE feature SET is identical between
-       X and X'. This catches cases where the magnitudes wiggle but the
-       active feature pattern is unchanged, which the editor cannot
-       learn from. N-independent.
+  (ii) SAE side — top-K identity change (BINARY by default). Reject if
+       fewer than `sae_min_topk_change` features differ between
+       top_K(X) and top_K(X'). N-independent.
 
          require:  |top_K(X) \\ top_K(X')|  >=  sae_min_topk_change
 
-  (iii) SAE upper bound — L2 shift, sqrt(N). Enforces minimality of the
-        (X, X') pair.
-
-         sae_max(N) = sae_per_op_max * sqrt(N)
+The previous L2 upper bound on SAE shift (sae_max) has been removed:
+top-K identity change already captures whether the representation moved
+meaningfully, and an L2 cap on top of it would also reject corruptions
+that flip a small number of top-K features with high magnitude — those
+are exactly the cases where the SAE conditioning has a clear, focused
+interpretation that the editor can learn from. `sae_shift` is still
+recorded in calibration / telemetry for offline analysis.
 
 SLOR(s) = (1/|s|) * [log p_M(s) - log p_unigram(s)]. The unigram baseline
 is built once from a slice of Dolma at startup (or loaded from
@@ -208,11 +209,20 @@ def parse_args():
                    help="Reject if fewer than this many features differ "
                         "between top-K(X) and top-K(X'). Default 1 = at "
                         "least one feature must change identity.")
+    # Deprecated SAE knobs — kept so old scripts that pass them do not
+    # error out, but ignored at runtime.
+    #   sae_per_op_max — L2 upper-bound on shift. Removed because the
+    #     top-K identity check already captures whether the
+    #     representation moved meaningfully; an additional L2 cap
+    #     would conflate "wide L2 spread" with "non-minimal pair",
+    #     and a corruption that flips top-K features by definition
+    #     changes the meaning regardless of L2 magnitude.
+    #   sae_per_op_min — L2 lower bound. Replaced by top-K identity
+    #     change (--sae-min-topk-size / --sae-min-topk-change).
     p.add_argument("--sae-per-op-max", type=float, default=2.50,
-                   help="sae_max(N) = sae_per_op_max * sqrt(N) (minimality "
-                        "upper bound on L2 shift).")
-    # Deprecated lower-bound knob — kept so old scripts that pass it do
-    # not error out, but ignored at runtime.
+                   help="DEPRECATED. The L2 upper-bound gate has been "
+                        "removed; top-K identity change is the sole "
+                        "SAE-side gate. Flag kept for back-compat.")
     p.add_argument("--sae-per-op-min", type=float, default=0.30,
                    help="DEPRECATED. Replaced by top-K identity change "
                         "(--sae-min-topk-size / --sae-min-topk-change). "
@@ -1077,7 +1087,6 @@ COMPOUND_REJECT_REASONS = (
     "slor_undefined",         # SLOR could not be computed (e.g. T<2 tokens)
     "slor_drop_too_high",     # corruption exceeds the per-N SLOR budget
     "sae_topk_unchanged",     # top-K SAE feature set did not change enough
-    "sae_shift_too_large",
     "empty_xprime_text",
 )
 
@@ -1230,9 +1239,8 @@ def build_identity_sample(stage: Stage, text: str) -> Tuple[Optional[Dict], str]
 # ---------------------------------------------------------------------------
 # N-dependent gates (§6.2.6)
 # ---------------------------------------------------------------------------
-def gate_thresholds(N: int, args) -> Tuple[float, int, float]:
-    """Return (slor_drop_max, sae_min_topk_change, sae_max_l2)
-    for a compound of N ops.
+def gate_thresholds(N: int, args) -> Tuple[float, int]:
+    """Return (slor_drop_max, sae_min_topk_change) for a compound of N ops.
 
     Fluency gate: SLOR drop budget is LINEAR in N (one "drop" per op).
     Each independent edit, on average, lowers per-token log-likelihood
@@ -1240,22 +1248,25 @@ def gate_thresholds(N: int, args) -> Tuple[float, int, float]:
     See Kann+ 2018 (SLOR), Wang+ 2022 (length bias), and the per-N
     empirical fit (factor^N matches p50 of raw PPL ratio for N ∈ 1..5).
 
-    SAE lower bound: top-K identity check (binary). Reject if fewer
-    than `sae_min_topk_change` features differ between top-K(X) and
+    SAE gate: top-K identity check (binary). Reject if fewer than
+    `sae_min_topk_change` features differ between top-K(X) and
     top-K(X'). This catches corruptions that move SAE feature
     magnitudes a bit but do not change which features are most active —
     which is the case the editor cannot learn from. N-independent by
     design: even at N=1 we require at least 1 change.
 
-    SAE upper bound: L2 shift, sqrt(N) scaling — unchanged. Enforces
-    that the pair remains in the "neighbourhood" of the clean text.
+    The previous L2 upper bound (sae_max) was removed: top-K identity
+    change already captures whether the representation moved
+    meaningfully, and an L2 cap on top of it would penalise
+    corruptions that change a small number of top-K features but with
+    high magnitude — exactly the cases where the SAE conditioning has
+    a clear, focused interpretation.
     """
     if N <= 0:
-        return (float("inf"), 0, float("inf"))
+        return (float("inf"), 0)
     slor_drop_max = args.slor_drop_per_op * N
     sae_min_topk_change = int(args.sae_min_topk_change)
-    sae_max_l2 = args.sae_per_op_max * math.sqrt(N)
-    return slor_drop_max, sae_min_topk_change, sae_max_l2
+    return slor_drop_max, sae_min_topk_change
 
 
 def finalize_sample(
@@ -1313,7 +1324,7 @@ def finalize_sample(
     # identical; topk_size means it was completely replaced.
     topk_change = max(len(topk_X), len(topk_Xp)) - topk_overlap
 
-    slor_drop_max, sae_min_topk_change, sae_max = gate_thresholds(N, args)
+    slor_drop_max, sae_min_topk_change = gate_thresholds(N, args)
 
     if calibration_writer is not None:
         calibration_writer.write(json.dumps({
@@ -1332,11 +1343,10 @@ def finalize_sample(
             "ppl_corr":  ppl_corr  if math.isfinite(ppl_corr)  else None,
             "ppl_ratio": ppl_ratio,
             # SAE
-            "sae_shift": shift,
+            "sae_shift": shift,                           # telemetry only
             "sae_topk_size": topk_size,
             "sae_topk_change": topk_change,
             "sae_min_topk_change_at_N": sae_min_topk_change,
-            "sae_max_at_N": sae_max,
         }) + "\n")
 
     if not args.calibration_mode and not is_identity:
@@ -1346,8 +1356,6 @@ def finalize_sample(
             return None, "slor_drop_too_high"
         if topk_change < sae_min_topk_change:
             return None, "sae_topk_unchanged"
-        if shift > sae_max:
-            return None, "sae_shift_too_large"
 
     sample.pop("x_text", None)
     sample.pop("x_prime_text", None)
@@ -1368,7 +1376,6 @@ def finalize_sample(
             "sae_topk_size": topk_size,
             "sae_topk_change": topk_change,
             "sae_min_topk_change_at_N": sae_min_topk_change,
-            "sae_max_at_N": sae_max,
         },
     })
     return sample, ""
@@ -1698,17 +1705,18 @@ def main():
             # Fluency: SLOR drop, linear N
             "slor_drop_per_op": float(args.slor_drop_per_op),
             "slor_n_scaling": "linear",
-            # SAE lower bound: top-K identity change (binary by default)
+            # SAE side: top-K identity change (binary by default).
+            # No L2 upper bound — top-K change subsumes minimality
+            # because a corruption that flips top-K features has by
+            # definition altered the SAE-space interpretation.
             "sae_min_topk_size":   int(args.sae_min_topk_size),
             "sae_min_topk_change": int(args.sae_min_topk_change),
-            # SAE upper bound: L2 shift, sqrt(N)
-            "sae_per_op_max": float(args.sae_per_op_max),
-            "sae_max_n_scaling": "sqrt",
             "unigram_smoothing": float(args.unigram_smoothing),
             "unigram_sample_size": int(args.unigram_sample_size),
-            # deprecated, kept so old downstream tools can read meta.json
+            # Deprecated, kept so old downstream tools can read meta.json.
             "ppl_per_op_factor": float(args.ppl_per_op_factor),
-            "sae_per_op_min": float(args.sae_per_op_min),
+            "sae_per_op_min":    float(args.sae_per_op_min),
+            "sae_per_op_max":    float(args.sae_per_op_max),
         },
         "compound": {
             "n_max": int(args.n_max),
