@@ -39,6 +39,13 @@
 #                            overriding this var.
 #   SAE_LAYER               (default: 12)
 #   MLM_MODEL               corruption MLM preset   (default: modernbert-base)
+#   SPACY_MODEL             spaCy model for POS tagging used by INS position
+#                            selection (default: en_core_web_sm). UPOS tags are
+#                            language-agnostic, so ja_core_news_sm / etc. work.
+#   CALIBRATION             1 → run corruption.py in --calibration-mode
+#                            (records (N, ppl_ratio, sae_shift) without applying
+#                            the gate; useful for fitting ppl_per_op_factor /
+#                            sae_per_op_min / sae_per_op_max).
 #
 # Each stage's stdout/stderr is captured under $RUN_DIR/logs/<stage>.log.
 # Per-stage wall time and status land in $RUN_DIR/timing.tsv.
@@ -82,6 +89,8 @@ SAE_REPO=${SAE_REPO:-"google/gemma-scope-2b-pt-res"}
 SAE_PATH=${SAE_PATH:-"layer_12/width_16k/average_l0_82/params.npz"}
 SAE_LAYER=${SAE_LAYER:-12}
 MLM_MODEL=${MLM_MODEL:-"modernbert-base"}
+SPACY_MODEL=${SPACY_MODEL:-"en_core_web_sm"}
+CALIBRATION=${CALIBRATION:-0}
 
 # Production-scale defaults baked into the training scripts' argparses.
 # These are used only for the extrapolation table at the end.
@@ -250,6 +259,8 @@ SAE_REPO             = $SAE_REPO
 SAE_PATH             = $SAE_PATH
 SAE_LAYER            = $SAE_LAYER
 MLM_MODEL            = $MLM_MODEL
+SPACY_MODEL          = $SPACY_MODEL
+CALIBRATION          = $CALIBRATION
 EOF
 
 # --------------------------------------------------------------------------- #
@@ -298,6 +309,12 @@ fi
 # --------------------------------------------------------------------------- #
 # Stage 2: corruption
 # --------------------------------------------------------------------------- #
+CORRUPTION_EXTRA_ARGS=()
+if [[ "$CALIBRATION" == "1" ]]; then
+    CORRUPTION_EXTRA_ARGS+=(--calibration-mode
+                            --calibration-out "$CORRUPTION_DIR/calibration.jsonl")
+fi
+
 if [[ -f "$CORRUPTION_DIR/meta.json" ]]; then
     skip_stage "02_corruption" "exists at $CORRUPTION_DIR"
 else
@@ -312,10 +329,12 @@ else
             --sae-path "$SAE_PATH" \
             --sae-layer "$SAE_LAYER" \
             --mlm-model "$MLM_MODEL" \
+            --spacy-model "$SPACY_MODEL" \
             --target-samples "$CORRUPTION_SAMPLES" \
             --samples-per-shard "$CORRUPTION_SHARD" \
             --device "$DEVICE" \
-            --seed "$SEED"
+            --seed "$SEED" \
+            "${CORRUPTION_EXTRA_ARGS[@]}"
 fi
 
 # --------------------------------------------------------------------------- #

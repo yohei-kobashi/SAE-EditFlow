@@ -292,8 +292,11 @@ class CorruptionDataset(IterableDataset):
     Each record looks like (see README §8.2):
         {
           "source_sent_id": str,
-          "corruption_type": str,             # "repl" / "ins" / "del" /
-                                              # "identity" / "mixed_..."
+          "bucket": str,                      # "identity" / "single_op" /
+                                              # "compound_2_3" / "compound_4_plus"
+          "N_total": int,                     # number of ops (0 for identity)
+          "op_types": [...],                  # per-op type (REPL/INS/DEL) in
+                                              # application order
           "x_token_ids": [...],
           "x_prime_token_ids": [...],
           "editor_input_token_ids": [...],
@@ -301,8 +304,8 @@ class CorruptionDataset(IterableDataset):
           "tagger_gold": [...],               # values in {KEEP, REPL, INS, DEL}
           "z_X_topk": [{"f": int, "v": float}, ...],
           "z_X_prime_topk": [{"f": int, "v": float}, ...],
-          "ins_span_length": int,
-          "del_span_length": int,
+          "ins_span_lengths": [int, ...],     # one entry per INS gap
+          "del_span_lengths": [int, ...],     # one entry per DEL span
           "filter_telemetry": {...}
         }
     """
@@ -453,7 +456,12 @@ class CorruptionCollator:
 
             z_X[b] = _dense_topk(r["z_X_topk"], self.d_sae)
             z_X_prime[b] = _dense_topk(r["z_X_prime_topk"], self.d_sae)
-            ins_span_length[b] = int(r.get("ins_span_length", 0))
+            # ins_span_length is a single scalar for the length-head trainer.
+            # For compound samples with multiple INS gaps we take the first
+            # gap's length as a temporary simplification; the length head
+            # will need refactoring to handle multi-gap supervision.
+            spans = r.get("ins_span_lengths") or ([r["ins_span_length"]] if "ins_span_length" in r else [])
+            ins_span_length[b] = int(spans[0]) if spans else 0
 
         return {
             "tagger_input_ids": torch.from_numpy(tag_ids),

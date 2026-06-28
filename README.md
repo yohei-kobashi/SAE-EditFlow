@@ -303,7 +303,9 @@ No MLM-based recoverability filter is applied. An MLM rarely predicts the EXACT 
 - **HIGH priority** — modifiers (adjectives, adverbs), adverbial phrases (PP attached to a verb, sentential adverbs), **sentence-initial words**, function words (determiners, prepositions, conjunctions, modals, auxiliaries, possessive pronouns, `to`).
 - **LOW priority** — subject / object nouns, main verbs, content words carrying core semantics.
 
-A lightweight POS tagger (e.g., spaCy `en_core_web_sm`) tags each word; the candidate deletion span is sampled with `p_high` (default 0.85) probability from HIGH-priority spans and `1 - p_high` from LOW-priority spans. This is INS-specific. REPL position selection does not require an analogous filter because its substitution-quality gate is already implicit in the MLM top-K (low-confidence substitutions are not in the top-K so a "bad position" rarely produces a usable candidate). DEL position is MLM-driven (the MLM only proposes plausible insertions at any given site).
+spaCy tags each word with **Universal POS (UPOS)**. UPOS is shared across languages, so extending to a new corpus only requires swapping the spaCy model (e.g. `ja_core_news_sm` for Japanese) — the HIGH-priority tag set is unchanged. The candidate deletion span is sampled with `p_high` (default 0.85) probability from HIGH-priority spans and `1 - p_high` from LOW-priority spans. This is INS-specific. REPL position selection does not require an analogous filter because its substitution-quality gate is already implicit in the MLM top-K (low-confidence substitutions are not in the top-K so a "bad position" rarely produces a usable candidate). DEL position is MLM-driven (the MLM only proposes plausible insertions at any given site).
+
+HIGH-priority UPOS tags: `ADJ` (adjectives), `ADV` (adverbs), `DET` (determiners), `ADP` (adpositions / prepositions), `CCONJ` (coordinating conjunctions), `SCONJ` (subordinating conjunctions), `AUX` (auxiliaries), `PART` (particles, e.g. English `to`). Plus any token at the sentence-initial position. LOW-priority: everything else, mainly `NOUN`, `PROPN`, `VERB`, `NUM`, `PRON`.
 
 ```
 1. Sample clean sentence X (text) from the segmented corpus.
@@ -713,19 +715,27 @@ ins:
   position_priority:              # bias toward easy-to-delete syntactic categories
     p_high:              0.85
     sentence_initial_is_high: true
-    high_priority_pos_tags:       # spaCy / NLTK POS tags considered HIGH priority
-      - JJ                        # adjectives
-      - JJR
-      - JJS
-      - RB                        # adverbs
-      - RBR
-      - RBS
-      - DT                        # determiners
-      - IN                        # prepositions
-      - CC                        # coordinating conjunctions
-      - MD                        # modals
-      - PRP$                      # possessive pronouns
-      - TO
+    high_priority_upos:           # spaCy Universal POS tags considered HIGH priority
+                                   # (UPOS is language-agnostic — same list for any spaCy model)
+      - ADJ                       # adjectives
+      - ADV                       # adverbs
+      - DET                       # determiners (incl. articles)
+      - ADP                       # adpositions (prepositions / postpositions)
+      - CCONJ                     # coordinating conjunctions
+      - SCONJ                     # subordinating conjunctions
+      - AUX                       # auxiliaries / modals
+      - PART                      # particles (English "to", "not", etc.)
+
+# spaCy POS tagging
+spacy:
+  model:                "en_core_web_sm"     # change to ja_core_news_sm, de_core_news_sm, ... for other languages
+  disabled_pipes:                            # we only need POS, skip the rest for speed
+    - parser
+    - ner
+    - lemmatizer
+                                              # NOTE: keep `attribute_ruler` enabled — it is what maps
+                                              # tagger output (token.tag_, PTB) to UPOS (token.pos_),
+                                              # which is what the HIGH/LOW priority decision reads.
 
 # DEL op (MLM-plausible word insertion)
 del:

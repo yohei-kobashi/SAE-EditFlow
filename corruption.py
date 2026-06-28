@@ -2,26 +2,45 @@
 Stage 2: corruption data generation for SAE-LEWIS.
 
 Produces a sharded JSON-lines corruption cache (see README §8.2) by applying
-fluency-preserving, MLM-based corruption to sentence-segmented Dolma:
+fluency-preserving, MLM-based corruption to sentence-segmented Dolma.
+
+**Compound corruption (§6.2.5).** Each accepted sample combines N ops drawn
+from {REPL, INS, DEL} on a single clean sentence:
 
   REPL : substitute words with MLM-predicted alternatives
-  INS  : delete words whose context can recover them
+  INS  : delete words whose context can recover them (POS-priority biased)
   DEL  : insert MLM-predicted words that the editor must drop
 
-Corruption operates at the WORD / TEXT level. The MLM (any HF AutoModelFor-
-MaskedLM via `model.MLMProvider`) is decoupled from the downstream editor /
-tagger encoder: the MLM's tokenizer is encapsulated and the final training
-sample is re-tokenized with the downstream Gemma tokenizer at the end. The
-two systems communicate only through text.
+N is drawn from a truncated geometric, capped at N_MAX. Ops have
+non-overlapping word ranges on the original X. First-accept rejection
+within K_BUDGET attempts per source sentence preserves the natural
+post-gate distribution (no PPL-ranking bias).
 
-Per-sample filters (rejection sampling):
-  - MLM recoverability for INS (text-level word equality against the MLM's
-    top-K predictions)
-  - Perplexity ratio under the frozen causal Gemma
-  - SAE-shift L2 between clean and corrupted text (via Gemma + Gemma Scope)
+**N-dependent gates (§6.2.6).** PPL ratio and SAE-shift thresholds scale
+with sqrt(N):
 
-The SAE forward and the perplexity scorer keep using Gemma; only the MLM
-that proposes corruption candidates is swappable.
+  ppl_max(N) = ppl_per_op_factor ** sqrt(N)
+  sae_min(N) = sae_per_op_min     * sqrt(N)
+  sae_max(N) = sae_per_op_max     * sqrt(N)   (minimality upper bound)
+
+The scale constants are calibrated against the empirical Dolma + MLM
+compound distribution via `--calibration-mode`, which records every
+attempt's (N, ppl_ratio, sae_shift) without applying the gate.
+
+**Position selection (§6.2.3).** INS deletion positions are biased toward
+syntactic categories where removal is least disruptive: spaCy Universal
+POS tags ADJ, ADV, DET, ADP, CCONJ, SCONJ, AUX, PART, plus the sentence-
+initial word. REPL position selection is unbiased (top-K MLM is the
+implicit quality gate). DEL position is MLM-driven.
+
+Corruption operates at the WORD / TEXT level. The MLM (any HF AutoModel-
+ForMaskedLM via `model.MLMProvider`) is decoupled from the downstream
+editor / tagger encoder: the MLM's tokenizer is encapsulated and the
+final training sample is re-tokenised with the downstream Gemma
+tokenizer at the end.
+
+The SAE forward and the perplexity scorer use Gemma; only the MLM that
+proposes corruption candidates is swappable.
 """
 
 from __future__ import annotations
@@ -33,9 +52,9 @@ import math
 import random
 import re
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -80,13 +99,17 @@ def parse_args():
     p.add_argument("--mlm-dtype", default="bfloat16",
                    choices=["bfloat16", "float16", "float32"])
 
+    # spaCy POS tagger (UPOS)
+    p.add_argument("--spacy-model", default="en_core_web_sm",
+                   help="spaCy model for POS tagging. UPOS tags are language-"
+                        "agnostic, so switching to ja_core_news_sm / "
+                        "de_core_news_sm / ... is enough for other languages.")
+
     # Sentence segmentation
     p.add_argument("--sentence-splitter", choices=["pysbd", "nltk"], default="pysbd")
     p.add_argument("--sent-min-tokens", type=int, default=5)
     p.add_argument("--sent-max-tokens", type=int, default=256)
-    p.add_argument("--max-sentences-per-text", type=int, default=None,
-                   help="Cap on qualifying sentences kept per source document. "
-                        "None = use every sentence.")
+    p.add_argument("--max-sentences-per-text", type=int, default=None)
     p.add_argument("--sentence-sample-strategy",
                    choices=["head", "random", "stride"], default="head")
     p.add_argument("--no-quality-filter", action="store_true")
@@ -95,32 +118,64 @@ def parse_args():
     p.add_argument("--quality-require-terminal-punct", action="store_true", default=True)
     p.add_argument("--quality-require-initial-capital", action="store_true", default=False)
 
+    # Output
     p.add_argument("--target-samples", type=int, default=100000)
     p.add_argument("--samples-per-shard", type=int, default=10000)
-    p.add_argument("--reject-budget", type=int, default=5)
+    p.add_argument("--k-budget", type=int, default=6,
+                   help="First-accept rejection attempts per source sentence "
+                        "(§6.2.5).")
 
-    p.add_argument("--p-identity", type=float, default=0.05)
-    p.add_argument("--p-repl", type=float, default=0.30)
-    p.add_argument("--p-ins", type=float, default=0.30)
-    p.add_argument("--p-del", type=float, default=0.22)
-    p.add_argument("--p-mixed-repl-ins", type=float, default=0.03)
-    p.add_argument("--p-mixed-repl-del", type=float, default=0.03)
+    # Sample bucket weights (§6.3.1). Buckets are determined post-hoc by
+    # realised N from the compound generator. We rejection-sample on N to
+    # match the target weights.
+    p.add_argument("--p-identity", type=float, default=0.10)
+    p.add_argument("--p-single-op", type=float, default=0.15)
+    p.add_argument("--p-compound-2-3", type=float, default=0.45)
+    p.add_argument("--p-compound-4-plus", type=float, default=0.30)
 
-    p.add_argument("--repl-words-max", type=int, default=4,
-                   help="Max # of words to substitute per REPL sample.")
+    # Compound op sampling (§6.2.5)
+    p.add_argument("--n-max", type=int, default=5,
+                   help="Cap on op count per compound sample.")
+    p.add_argument("--n-distribution-p", type=float, default=0.4,
+                   help="Truncated geometric parameter for N over {0..N_MAX}.")
+    p.add_argument("--op-weight-repl", type=float, default=0.55)
+    p.add_argument("--op-weight-ins", type=float, default=0.25)
+    p.add_argument("--op-weight-del", type=float, default=0.20)
+    p.add_argument("--op-position-max-retries", type=int, default=20,
+                   help="Per-op attempts to find a non-conflicting position "
+                        "before giving up on the compound.")
+
+    # Per-op span / MLM knobs
     p.add_argument("--repl-mlm-topk", type=int, default=8)
-
     p.add_argument("--ins-word-span-max", type=int, default=3,
-                   help="Max # of consecutive words to delete per INS sample.")
-
+                   help="Max # of consecutive words to delete per INS op.")
+    p.add_argument("--ins-p-high", type=float, default=0.85,
+                   help="Probability of sampling INS span from HIGH-priority "
+                        "POS positions (§6.2.3).")
     p.add_argument("--del-word-span-max", type=int, default=2,
-                   help="Max # of consecutive words to insert per DEL sample.")
+                   help="Max # of consecutive words to insert per DEL op.")
     p.add_argument("--del-mlm-topk", type=int, default=8)
     p.add_argument("--del-top1-prob", type=float, default=0.5)
 
-    p.add_argument("--sae-shift-threshold", type=float, default=0.3)
-    p.add_argument("--ppl-max-ratio", type=float, default=2.0)
-    p.add_argument("--k-train", type=int, default=64)
+    # N-dependent gates (§6.2.6)
+    p.add_argument("--ppl-per-op-factor", type=float, default=1.8,
+                   help="ppl_max(N) = ppl_per_op_factor ** sqrt(N).")
+    p.add_argument("--sae-per-op-min", type=float, default=0.30,
+                   help="sae_min(N) = sae_per_op_min * sqrt(N).")
+    p.add_argument("--sae-per-op-max", type=float, default=2.50,
+                   help="sae_max(N) = sae_per_op_max * sqrt(N) (minimality "
+                        "upper bound).")
+    p.add_argument("--calibration-mode", action="store_true",
+                   help="Skip the PPL/SAE-shift gate; record every attempt's "
+                        "(N, ppl_ratio, sae_shift) to a JSONL file for "
+                        "percentile fitting.")
+    p.add_argument("--calibration-out",
+                   help="Path to JSONL of (N, ppl_ratio, sae_shift) records "
+                        "in --calibration-mode. Defaults to "
+                        "<out-dir>/calibration.jsonl.")
+
+    p.add_argument("--k-train", type=int, default=64,
+                   help="Top-K for SAE pool-max conditioning.")
 
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=42)
@@ -136,6 +191,7 @@ class Stage:
     causal_llm: torch.nn.Module
     mlm: MLMProvider
     gemma_tok: any
+    spacy_nlp: any
     mask_id: int           # downstream (Gemma) mask id
     ins_id: int
     del_id: int
@@ -145,12 +201,13 @@ class Stage:
 
 
 # ---------------------------------------------------------------------------
-# Text / word utilities
+# Text / word utilities (kept from earlier version)
 # ---------------------------------------------------------------------------
 _WORD_RE = re.compile(r"\S+")
 
 
 def words_with_offsets(text: str) -> List[Tuple[str, int, int]]:
+    """Whitespace-tokenized words with (token_str, char_start, char_end)."""
     return [(m.group(), m.start(), m.end()) for m in _WORD_RE.finditer(text)]
 
 
@@ -181,9 +238,97 @@ def find_token_range(
     return tok_start, tok_end
 
 
+def find_token_at_char(
+    offsets: List[Tuple[int, int]],
+    char_pos: int,
+) -> Optional[int]:
+    """Return the index of the token whose char range starts at or after `char_pos`.
+
+    Used for finding the INS gap marker position (zero-width gap in xp_text).
+    """
+    for i, (s, e) in enumerate(offsets):
+        if s == 0 and e == 0:
+            continue
+        if s >= char_pos:
+            return i
+    return None  # gap at end of sequence
+
+
 def looks_like_word(s: str) -> bool:
     s = s.strip()
     return bool(s) and any(c.isalpha() for c in s) and not s.startswith(("##", "▁"))
+
+
+# ---------------------------------------------------------------------------
+# spaCy POS tagger (UPOS)
+# ---------------------------------------------------------------------------
+HIGH_PRIORITY_UPOS: Set[str] = {
+    "ADJ", "ADV", "DET", "ADP", "CCONJ", "SCONJ", "AUX", "PART",
+}
+
+
+def load_spacy(model_name: str):
+    """Load spaCy with POS-only pipeline (parser/ner/lemmatizer disabled).
+
+    Auto-downloads the model if not present.
+    """
+    import spacy
+    try:
+        nlp = spacy.load(
+            model_name,
+            # `attribute_ruler` must stay enabled — it's what maps tagger
+            # output (token.tag_, PTB style) to UPOS (token.pos_), which is
+            # what we read for the HIGH/LOW priority decision.
+            disable=["parser", "ner", "lemmatizer"],
+        )
+    except OSError:
+        from spacy.cli import download
+        download(model_name)
+        nlp = spacy.load(
+            model_name,
+            # `attribute_ruler` must stay enabled — it's what maps tagger
+            # output (token.tag_, PTB style) to UPOS (token.pos_), which is
+            # what we read for the HIGH/LOW priority decision.
+            disable=["parser", "ner", "lemmatizer"],
+        )
+    return nlp
+
+
+def upos_priority_for_words(
+    nlp,
+    text: str,
+    words: List[Tuple[str, int, int]],
+) -> List[str]:
+    """Return ["HIGH" or "LOW"] per entry in `words`.
+
+    A word is HIGH if any spaCy token overlapping its char span has a
+    HIGH-priority UPOS tag, or if it is the sentence-initial word.
+    """
+    doc = nlp(text)
+    # spaCy tokens with their UPOS; doc.token.idx is the char start.
+    spacy_tokens: List[Tuple[int, int, str]] = []
+    for t in doc:
+        if t.is_space:
+            continue
+        cs = t.idx
+        ce = t.idx + len(t.text)
+        spacy_tokens.append((cs, ce, t.pos_))
+
+    priorities: List[str] = []
+    for wi, (_, ws, we) in enumerate(words):
+        if wi == 0:
+            priorities.append("HIGH")              # sentence-initial
+            continue
+        upos_set = set()
+        for cs, ce, pos in spacy_tokens:
+            if cs >= we:
+                break
+            if ce <= ws:
+                continue
+            upos_set.add(pos)
+        prio = "HIGH" if upos_set & HIGH_PRIORITY_UPOS else "LOW"
+        priorities.append(prio)
+    return priorities
 
 
 # ---------------------------------------------------------------------------
@@ -232,332 +377,713 @@ def causal_perplexity_text(stage: Stage, text: str) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Word-level corruption operations
+# OpSpec + non-overlap helpers
+# ---------------------------------------------------------------------------
+@dataclass
+class OpSpec:
+    """A single op within a compound corruption.
+
+    Coordinates are word indices on the ORIGINAL X. Final char positions in
+    xp_text are computed at apply time via cumulative shifts.
+    """
+    op_type: str                   # "repl" | "ins" | "del"
+    word_start: int                # for REPL/INS: start of span; for DEL: word AFTER which to insert (== insertion point)
+    word_end: int                  # for REPL/INS: exclusive end of span; for DEL: == word_start (zero-width)
+    payload: Optional[str] = None  # REPL: replacement text; DEL: insertion text; INS: None
+
+
+def claim_slots(op: OpSpec, claims: Set[Tuple[str, int]]) -> None:
+    """Add `op`'s exclusion claims to the running `claims` set."""
+    if op.op_type == "repl":
+        claims.add(("word", op.word_start))
+    elif op.op_type == "ins":
+        for w in range(op.word_start, op.word_end):
+            claims.add(("word", w))
+        claims.add(("ins_gap_marker", op.word_end))
+        # No DEL may insert at any word position in [word_start, word_end]:
+        for w in range(op.word_start, op.word_end + 1):
+            claims.add(("ins_forbid_del", w))
+    elif op.op_type == "del":
+        claims.add(("del_boundary", op.word_start))
+        claims.add(("word", op.word_start))             # forbid REPL/INS on that word
+        claims.add(("ins_gap_marker", op.word_start))   # forbid INS marker landing here
+
+
+def can_add_op(op: OpSpec, claims: Set[Tuple[str, int]]) -> bool:
+    """Check if `op` can be added without conflicting with existing `claims`."""
+    if op.op_type == "repl":
+        for w in range(op.word_start, op.word_end):
+            if ("word", w) in claims:
+                return False
+            if ("ins_gap_marker", w) in claims:
+                return False
+        return True
+    elif op.op_type == "ins":
+        for w in range(op.word_start, op.word_end):
+            if ("word", w) in claims:
+                return False
+            if ("ins_gap_marker", w) in claims:
+                return False
+        if ("word", op.word_end) in claims:
+            return False
+        if ("ins_gap_marker", op.word_end) in claims:
+            return False
+        for w in range(op.word_start, op.word_end + 1):
+            if ("ins_forbid_del", w) in claims:
+                return False
+        return True
+    elif op.op_type == "del":
+        if ("del_boundary", op.word_start) in claims:
+            return False
+        if ("word", op.word_start) in claims:
+            return False
+        if ("ins_gap_marker", op.word_start) in claims:
+            return False
+        if ("ins_forbid_del", op.word_start) in claims:
+            return False
+        return True
+    raise ValueError(f"unknown op_type {op.op_type!r}")
+
+
+# ---------------------------------------------------------------------------
+# Per-op proposers
 # ---------------------------------------------------------------------------
 def _norm(w: str) -> str:
     return w.strip().lower()
 
 
-def make_repl_sample(
-    stage: Stage, text: str, rng: random.Random,
-    repl_words_max: int, mlm_topk: int,
-) -> Optional[Dict]:
-    """Replace each chosen word with an MLM-predicted alternative.
-
-    Same-Gemma-token-count constraint: each substitution must use the same
-    number of Gemma tokens as the original word. This keeps editor input
-    and target aligned by position without an INS/DEL spillover.
-    """
-    words = words_with_offsets(text)
-    if len(words) < 5:
-        return None
-
-    n_repl = rng.randint(1, max(1, min(repl_words_max, len(words) // 3)))
-    word_indices = sorted(rng.sample(range(len(words)), n_repl))
-
-    x_ids, x_offsets = gemma_tokenize(stage.gemma_tok, text)
-    current_text = text
-    char_shift = 0
-    repl_char_ranges: List[Tuple[int, int]] = []
-    orig_token_ranges_in_x: List[Tuple[int, int]] = []
-    for wi in word_indices:
+def propose_repl_op(
+    stage: Stage, text: str, words: List[Tuple[str, int, int]],
+    rng: random.Random, claims: Set[Tuple[str, int]],
+    mlm_topk: int, max_retries: int,
+) -> Optional[OpSpec]:
+    """Sample one REPL op on a random unclaimed word, with MLM-generated replacement."""
+    for _ in range(max_retries):
+        candidates = [
+            wi for wi in range(len(words))
+            if can_add_op(OpSpec("repl", wi, wi + 1), claims)
+        ]
+        if not candidates:
+            return None
+        wi = rng.choice(candidates)
         orig_word, ws, we = words[wi]
-        new_ws = ws + char_shift
-        new_we = we + char_shift
-        # Build masked text with a SINGLE [MASK] for this word
-        masked_text = current_text[:new_ws] + stage.mlm.mask_token + current_text[new_we:]
+        masked_text = text[:ws] + stage.mlm.mask_token + text[we:]
         preds = stage.mlm.predict_at_masks(masked_text, top_k=mlm_topk)
         if not preds or not preds[0]:
-            return None
+            continue
         cands = [c for c in preds[0]
                  if looks_like_word(c) and _norm(c) != _norm(orig_word)
                  and len(c) <= max(20, len(orig_word) * 3)]
         if not cands:
-            return None
+            continue
         replacement = cands[rng.randrange(min(len(cands), max(1, mlm_topk // 2)))]
-        # Substitute
-        current_text = current_text[:new_ws] + replacement + current_text[new_we:]
-        repl_char_ranges.append((new_ws, new_ws + len(replacement)))
-        char_shift += len(replacement) - len(orig_word)
-        # Track the original word's Gemma token range for the same-count check
-        os, oe = find_token_range(x_offsets, ws, we)
-        if os is None or oe is None:
-            return None
-        orig_token_ranges_in_x.append((os, oe))
+        return OpSpec("repl", wi, wi + 1, payload=replacement)
+    return None
 
-    xp_ids, xp_offsets = gemma_tokenize(stage.gemma_tok, current_text)
-    if len(xp_ids) != len(x_ids):
+
+def propose_ins_op(
+    stage: Stage, text: str, words: List[Tuple[str, int, int]],
+    priorities: List[str], rng: random.Random, claims: Set[Tuple[str, int]],
+    word_span_max: int, p_high: float, max_retries: int,
+) -> Optional[OpSpec]:
+    """Sample one INS op with priority-biased word selection (§6.2.3)."""
+    # Enumerate candidate (start, span) pairs that satisfy the placement rules.
+    # Leave at least 1 word on each side: start >= 1 AND start + span <= len-1.
+    high_cands: List[Tuple[int, int]] = []
+    low_cands: List[Tuple[int, int]] = []
+    for start in range(1, len(words) - 1):
+        for span in range(1, min(word_span_max, len(words) - start - 1) + 1):
+            op = OpSpec("ins", start, start + span)
+            if not can_add_op(op, claims):
+                continue
+            # Priority is based on the FIRST word of the span (sentence-initial
+            # is always HIGH and only applies to wi==0, which we exclude).
+            prio = priorities[start]
+            if prio == "HIGH":
+                high_cands.append((start, span))
+            else:
+                low_cands.append((start, span))
+    pool: Optional[List[Tuple[int, int]]] = None
+    if rng.random() < p_high and high_cands:
+        pool = high_cands
+    elif low_cands:
+        pool = low_cands
+    elif high_cands:
+        pool = high_cands
+    if not pool:
+        return None
+    start, span = rng.choice(pool)
+    return OpSpec("ins", start, start + span, payload=None)
+
+
+def propose_del_op(
+    stage: Stage, text: str, words: List[Tuple[str, int, int]],
+    rng: random.Random, claims: Set[Tuple[str, int]],
+    word_span_max: int, mlm_topk: int, top1_prob: float, max_retries: int,
+) -> Optional[OpSpec]:
+    """Sample one DEL op: pick an insertion point and grow a MLM-driven payload."""
+    for _ in range(max_retries):
+        # DEL inserts BEFORE words[insert_at]; require insert_at >= 1 (skip
+        # sentence-initial slot for now) and < len(words).
+        candidates = [
+            wi for wi in range(1, len(words))
+            if can_add_op(OpSpec("del", wi, wi), claims)
+        ]
+        if not candidates:
+            return None
+        insert_at = rng.choice(candidates)
+        n_words = rng.randint(1, max(1, word_span_max))
+        # Build payload iteratively by masking BEFORE words[insert_at].
+        # We do this on a copy of `text` (independent of other ops, which
+        # are applied at compound-apply time).
+        current = text
+        char_anchor = words[insert_at][1]
+        # Inserted text grows: each iteration prepends "{w} " at char_anchor.
+        for _step in range(n_words):
+            masked = current[:char_anchor] + stage.mlm.mask_token + " " + current[char_anchor:]
+            preds = stage.mlm.predict_at_masks(masked, top_k=mlm_topk)
+            if not preds or not preds[0]:
+                break
+            cands = [c for c in preds[0] if looks_like_word(c)]
+            if not cands:
+                break
+            w = cands[0] if rng.random() < top1_prob else cands[
+                rng.randrange(min(len(cands), max(1, mlm_topk // 2)))
+            ]
+            # Insert the new word + space at char_anchor; subsequent iteration
+            # will mask before the same anchor → words accumulate in order of
+            # appearance from left.
+            current = current[:char_anchor] + w + " " + current[char_anchor:]
+            char_anchor += len(w) + 1
+        # The payload is the joined sequence of words (without trailing space);
+        # apply_compound adds the trailing space.
+        payload = current[words[insert_at][1]:char_anchor].rstrip()
+        if not payload:
+            continue
+        return OpSpec("del", insert_at, insert_at, payload=payload)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Text-level compound application
+# ---------------------------------------------------------------------------
+def length_change(op: OpSpec, text: str, words: List[Tuple[str, int, int]]) -> int:
+    """Net char length contribution of `op` to xp_text."""
+    if op.op_type == "repl":
+        cs = words[op.word_start][1]
+        ce = words[op.word_end - 1][2]
+        return len(op.payload) - (ce - cs)
+    elif op.op_type == "ins":
+        cs = words[op.word_start][1]
+        ce = words[op.word_end - 1][2]
+        # Trailing whitespace absorption (matches apply logic).
+        if ce < len(text) and text[ce].isspace():
+            ce += 1
+        return -(ce - cs)
+    elif op.op_type == "del":
+        return len(op.payload) + 1   # payload + trailing space
+    raise ValueError(f"unknown op_type {op.op_type!r}")
+
+
+def apply_compound_to_text(
+    text: str,
+    words: List[Tuple[str, int, int]],
+    ops: List[OpSpec],
+) -> Tuple[str, Dict[int, int]]:
+    """Apply `ops` to `text` and return (xp_text, final_pos_by_op_index).
+
+    `final_pos_by_op_index[i]` is the char position in `xp_text` where op `i`
+    in the input list starts contributing its content (REPL/DEL) or where
+    its gap lives (INS, zero-width).
+
+    Implementation: build xp_text left-to-right by interleaving unchanged
+    `text` slices with each op's content/skip, sorted by original char
+    position. Same-position tiebreaker not needed here because the
+    non-overlap rules forbid two ops at the same char anchor.
+    """
+    # Tag each op with its ORIGINAL anchor char position and the index for
+    # the result map. For DEL/INS the anchor is the start of word_start;
+    # for REPL the anchor is the start of word_start as well.
+    indexed = list(enumerate(ops))
+    indexed.sort(key=lambda iop: words[iop[1].word_start][1])
+
+    pieces: List[str] = []
+    cursor = 0
+    cum_shift = 0
+    final_pos: Dict[int, int] = {}
+
+    for idx, op in indexed:
+        orig_anchor = words[op.word_start][1]
+        final_pos[idx] = orig_anchor + cum_shift
+        if op.op_type == "repl":
+            cs = words[op.word_start][1]
+            ce = words[op.word_end - 1][2]
+            pieces.append(text[cursor:cs])
+            pieces.append(op.payload)
+            cursor = ce
+            cum_shift += len(op.payload) - (ce - cs)
+        elif op.op_type == "ins":
+            cs = words[op.word_start][1]
+            ce = words[op.word_end - 1][2]
+            # Match length_change(): absorb one trailing whitespace if any.
+            if ce < len(text) and text[ce].isspace():
+                ce += 1
+            pieces.append(text[cursor:cs])
+            cursor = ce          # skip deleted chars
+            cum_shift -= (ce - cs)
+        elif op.op_type == "del":
+            pos = words[op.word_start][1]
+            pieces.append(text[cursor:pos])
+            ins_text = op.payload + " "
+            pieces.append(ins_text)
+            cursor = pos          # don't consume any original char
+            cum_shift += len(ins_text)
+        else:
+            raise ValueError(f"unknown op_type {op.op_type!r}")
+    pieces.append(text[cursor:])
+    return "".join(pieces), final_pos
+
+
+# ---------------------------------------------------------------------------
+# Token-level gold construction from compound
+# ---------------------------------------------------------------------------
+@dataclass
+class OpTokenRanges:
+    """Token-level coordinates for one op after compound application."""
+    op_type: str
+    # For REPL/INS: token range covering the original word span in x_ids
+    x_tok_start: Optional[int] = None
+    x_tok_end: Optional[int] = None
+    # For REPL/DEL: token range covering the op's content in xp_ids
+    xp_tok_start: Optional[int] = None
+    xp_tok_end: Optional[int] = None
+    # For INS: gap position in xp_ids (token index where marker lands)
+    xp_gap_pos: Optional[int] = None
+
+
+def resolve_token_ranges(
+    ops: List[OpSpec],
+    final_pos: Dict[int, int],
+    text: str,
+    xp_text: str,
+    words: List[Tuple[str, int, int]],
+    x_offsets: List[Tuple[int, int]],
+    xp_offsets: List[Tuple[int, int]],
+) -> Optional[List[OpTokenRanges]]:
+    """Map each op's char spans to token ranges in x_ids / xp_ids.
+
+    Returns `None` if any op fails to resolve (e.g. REPL token count mismatch,
+    INS span boundary not found cleanly, etc.) — caller will reject the
+    compound sample.
+    """
+    out: List[OpTokenRanges] = []
+    for idx, op in enumerate(ops):
+        rec = OpTokenRanges(op_type=op.op_type)
+        if op.op_type == "repl":
+            # Original word span in X
+            orig_cs = words[op.word_start][1]
+            orig_ce = words[op.word_end - 1][2]
+            xs, xe = find_token_range(x_offsets, orig_cs, orig_ce)
+            if xs is None or xe is None:
+                return None
+            # Final span in xp_text
+            fcs = final_pos[idx]
+            fce = fcs + len(op.payload)
+            ps, pe = find_token_range(xp_offsets, fcs, fce)
+            if ps is None or pe is None:
+                return None
+            if (pe - ps) != (xe - xs):
+                return None  # same-token-count constraint violated
+            rec.x_tok_start, rec.x_tok_end = xs, xe
+            rec.xp_tok_start, rec.xp_tok_end = ps, pe
+        elif op.op_type == "ins":
+            orig_cs = words[op.word_start][1]
+            orig_ce = words[op.word_end - 1][2]
+            # Note: don't include the absorbed trailing space in the x_ids
+            # token range; it belongs to the NEXT word's token anyway under
+            # SentencePiece.
+            xs, xe = find_token_range(x_offsets, orig_cs, orig_ce)
+            if xs is None or xe is None:
+                return None
+            rec.x_tok_start, rec.x_tok_end = xs, xe
+            # Gap position in xp_text: at the char where the deletion landed.
+            gap_char = final_pos[idx]
+            gap_tok = find_token_at_char(xp_offsets, gap_char)
+            if gap_tok is None:
+                # Gap at the very end of xp_ids — this shouldn't happen since
+                # we leave at least one word after the deletion, but if it
+                # does, we fail rather than silently corrupting the gold.
+                return None
+            rec.xp_gap_pos = gap_tok
+        elif op.op_type == "del":
+            fcs = final_pos[idx]
+            # DEL payload (without trailing space) sits at [fcs, fcs + len)
+            fce = fcs + len(op.payload)
+            ps, pe = find_token_range(xp_offsets, fcs, fce)
+            if ps is None or pe is None:
+                return None
+            rec.xp_tok_start, rec.xp_tok_end = ps, pe
+        else:
+            return None
+        out.append(rec)
+    return out
+
+
+def build_compound_gold(
+    x_ids: List[int],
+    xp_ids: List[int],
+    ops: List[OpSpec],
+    token_ranges: List[OpTokenRanges],
+    mask_id: int,
+    ins_id: int,
+    del_id: int,
+) -> Optional[Dict]:
+    """Build tagger_gold, editor_input, editor_target from the compound.
+
+    Returns None if alignment fails (an asserted invariant breaks); the
+    sample is then rejected.
+    """
+    # Sort ops by their xp anchor: REPL/DEL use xp_tok_start; INS uses xp_gap_pos.
+    def xp_anchor(rec: OpTokenRanges) -> int:
+        if rec.op_type == "ins":
+            return rec.xp_gap_pos
+        return rec.xp_tok_start
+
+    paired = sorted(
+        enumerate(token_ranges),
+        key=lambda iop: xp_anchor(iop[1]),
+    )
+
+    tagger_gold: List[int] = []
+    editor_input: List[int] = []
+    editor_target: List[int] = []
+    ins_span_lengths: List[int] = []
+    del_span_lengths: List[int] = []
+
+    i_x = 0
+    i_xp = 0
+    pending_ins = False        # next emitted xp position should carry OP_INS
+
+    for _, rec in paired:
+        target_xp = xp_anchor(rec)
+        # Emit KEEP segment up to target_xp.
+        while i_xp < target_xp:
+            if i_x >= len(x_ids):
+                return None
+            tagger_gold.append(OP_INS if pending_ins else OP_KEEP)
+            editor_input.append(xp_ids[i_xp])
+            editor_target.append(x_ids[i_x])
+            if pending_ins:
+                pending_ins = False
+            i_xp += 1
+            i_x += 1
+
+        if rec.op_type == "repl":
+            assert rec.xp_tok_start is not None and rec.xp_tok_end is not None
+            assert rec.x_tok_start is not None and rec.x_tok_end is not None
+            L = rec.xp_tok_end - rec.xp_tok_start
+            if pending_ins:
+                # An INS gap immediately before a REPL violates non-overlap
+                # rules; treat as a hard failure for safety.
+                return None
+            for k in range(L):
+                tagger_gold.append(OP_REPL)
+                editor_input.append(mask_id)
+                editor_target.append(x_ids[rec.x_tok_start + k])
+            i_xp = rec.xp_tok_end
+            i_x = rec.x_tok_end
+        elif rec.op_type == "ins":
+            assert rec.x_tok_start is not None and rec.x_tok_end is not None
+            L = rec.x_tok_end - rec.x_tok_start
+            ins_span_lengths.append(L)
+            for k in range(L):
+                editor_input.append(ins_id)
+                editor_target.append(x_ids[rec.x_tok_start + k])
+            i_x = rec.x_tok_end
+            pending_ins = True
+        elif rec.op_type == "del":
+            assert rec.xp_tok_start is not None and rec.xp_tok_end is not None
+            L = rec.xp_tok_end - rec.xp_tok_start
+            if pending_ins:
+                return None
+            del_span_lengths.append(L)
+            for k in range(L):
+                tagger_gold.append(OP_DEL)
+                editor_input.append(xp_ids[rec.xp_tok_start + k])
+                editor_target.append(del_id)
+            i_xp = rec.xp_tok_end
+            # i_x doesn't advance (DEL doesn't consume x_ids)
+
+    # Trailing KEEP segment.
+    while i_xp < len(xp_ids):
+        if i_x >= len(x_ids):
+            return None
+        tagger_gold.append(OP_INS if pending_ins else OP_KEEP)
+        editor_input.append(xp_ids[i_xp])
+        editor_target.append(x_ids[i_x])
+        if pending_ins:
+            pending_ins = False
+        i_xp += 1
+        i_x += 1
+
+    if pending_ins:
+        # INS gap at the end of xp_ids — should not happen with our placement
+        # rules (we require at least one word after every INS). Fail safely.
         return None
 
-    # Same-token-count check for each substitution, and capture REPL positions
-    repl_positions_in_xp: List[int] = []
-    for (cs, ce), (os, oe) in zip(repl_char_ranges, orig_token_ranges_in_x):
-        ns, ne = find_token_range(xp_offsets, cs, ce)
-        if ns is None or ne is None:
-            return None
-        if (ne - ns) != (oe - os):
-            return None
-        repl_positions_in_xp.extend(range(ns, ne))
-    if not repl_positions_in_xp:
+    # Final consistency checks.
+    if i_x != len(x_ids):
         return None
-
-    tagger_gold = [OP_KEEP] * len(xp_ids)
-    editor_input = list(xp_ids)
-    for i in repl_positions_in_xp:
-        tagger_gold[i] = OP_REPL
-        editor_input[i] = stage.mask_id
-    editor_target = list(x_ids)            # aligned 1:1 by construction
+    if len(tagger_gold) != len(xp_ids):
+        return None
+    if len(editor_input) != len(editor_target):
+        return None
 
     return {
-        "corruption_type": "repl",
-        "x_token_ids": x_ids,
-        "x_prime_token_ids": xp_ids,
         "tagger_gold": tagger_gold,
         "editor_input_token_ids": editor_input,
         "editor_target_token_ids": editor_target,
-        "ins_span_length": 0,
-        "del_span_length": 0,
-        "x_text": text,
-        "x_prime_text": current_text,
+        "ins_span_lengths": ins_span_lengths,
+        "del_span_lengths": del_span_lengths,
     }
 
 
-INS_REJECT_REASONS = (
-    # Structural rejections, raised inside make_ins_sample:
-    "too_short_words",     # too few words to fit `word_span_max` with margin
-    "too_short_xprime",    # corrupted text would be < 8 non-whitespace chars
-    "ins_span_nonpos",     # token-count diff is <= 0 (STRUCTURAL)
-    "suffix_mismatch",     # prefix matched but suffix did not (STRUCTURAL)
-    "length_mismatch",     # final editor_input vs target length mismatch (STRUCTURAL)
-    # Post-corruption rejections, raised inside finalize_sample:
-    "ppl_inf",             # PPL not finite for clean or corrupted text
-    "ppl_too_high",        # corrupted PPL > ppl_max_ratio * clean PPL
-    "sae_shift_too_small", # SAE pool-max L2 diff < sae_shift_threshold
+# ---------------------------------------------------------------------------
+# Compound sample builder
+# ---------------------------------------------------------------------------
+COMPOUND_REJECT_REASONS = (
+    "too_short_sentence",     # < threshold word count
+    "ops_unsuitable",         # could not propose N non-conflicting ops
+    "apply_failed",           # text-level application failed (rare)
+    "token_align_failed",     # find_token_range failed for some op
+    "repl_token_count_mismatch",
+    "gold_build_failed",      # tagger/editor gold construction failed
+    "ppl_inf",
+    "ppl_too_high",
+    "sae_shift_too_small",
+    "sae_shift_too_large",
+    "empty_xprime_text",
 )
 
 
-def make_ins_sample(
+def sample_op_types(
+    rng: random.Random, N: int,
+    w_repl: float, w_ins: float, w_del: float,
+) -> List[str]:
+    types = ("repl", "ins", "del")
+    weights = (w_repl, w_ins, w_del)
+    total = sum(weights)
+    norm = [w / total for w in weights]
+    out: List[str] = []
+    for _ in range(N):
+        r = rng.random()
+        cum = 0.0
+        choice = types[-1]
+        for t, w in zip(types, norm):
+            cum += w
+            if r < cum:
+                choice = t
+                break
+        out.append(choice)
+    return out
+
+
+def sample_compound(
     stage: Stage, text: str, rng: random.Random,
-    word_span_max: int,
-    *,
-    reject_counter: Optional[Dict[str, int]] = None,
-) -> Optional[Dict]:
-    """Delete a span of consecutive words.
+    N: int, args,
+) -> Tuple[Optional[List[OpSpec]], str]:
+    """Propose N non-overlapping ops on `text` with MLM-generated payloads.
 
-    No MLM-based recovery check: the editor recovers the deleted words from
-    context + z-conditioning, the same way REPL recovers the original word.
-    A recoverability gate on the MLM was over-conservative (an MLM rarely
-    predicts the EXACT original word from context the way our SAE-conditioned
-    editor can), and broke symmetry with REPL/DEL. PPL and SAE-shift gates in
-    `finalize_sample` still apply.
-
-    When `reject_counter` is provided, increments the matching reason key on
-    every early return so the caller can see which gate is dominating the
-    yield. Reasons are listed in `INS_REJECT_REASONS`.
+    Returns (ops, "") on success or (None, reason) on failure.
     """
-    def _rej(reason: str):
-        if reject_counter is not None:
-            reject_counter[reason] = reject_counter.get(reason, 0) + 1
-        return None
-
     words = words_with_offsets(text)
-    if len(words) < 5:
-        return _rej("too_short_words")
-    # Require at least 1 word on each side of the deletion span:
-    #   start_wi >= 1, end_wi <= len(words) - 1
-    # which means n_words <= len(words) - 2.
-    max_span = min(word_span_max, len(words) - 2)
-    if max_span < 1:
-        return _rej("too_short_words")
-    n_words = rng.randint(1, max_span)
-    start_wi = rng.randint(1, len(words) - n_words - 1)
-    end_wi = start_wi + n_words
+    if len(words) < 3:
+        return None, "too_short_sentence"
+    priorities = upos_priority_for_words(stage.spacy_nlp, text, words)
 
-    delete_start = words[start_wi][1]
-    delete_end = words[end_wi - 1][2]
-    # Absorb one trailing whitespace if any (avoids "the  cat")
-    if delete_end < len(text) and text[delete_end].isspace():
-        delete_end += 1
-
-    xprime_text = text[:delete_start] + text[delete_end:]
-    if len(xprime_text.strip()) < 8:
-        return _rej("too_short_xprime")
-
-    x_ids, _ = gemma_tokenize(stage.gemma_tok, text)
-    xp_ids, _ = gemma_tokenize(stage.gemma_tok, xprime_text)
-
-    # ins_span_length is the number of Gemma tokens removed by the deletion.
-    # Derive it directly from the token-count diff — this is robust to the
-    # SentencePiece-style leading-space encoding (▁cat's char range starts
-    # at the space BEFORE "cat", so an offset-based scan over the eaten
-    # delete_end character range would over-reach into the next token and
-    # break `len(editor_input) == len(editor_target)` for every INS sample).
-    ins_span_length = len(x_ids) - len(xp_ids)
-    if ins_span_length <= 0:
-        return _rej("ins_span_nonpos")
-
-    # Find the gap position in xp_ids by walking the matching prefix
-    # between x_ids and xp_ids; the first divergence is where the deletion
-    # happened. This is token-level — no offset arithmetic involved.
-    gap_xp = 0
-    upper = min(len(x_ids), len(xp_ids))
-    while gap_xp < upper and x_ids[gap_xp] == xp_ids[gap_xp]:
-        gap_xp += 1
-    # Verify the suffix matches after skipping the deleted span — otherwise
-    # the deletion did not produce a clean token-level transposition (rare;
-    # punctuation-adjacent deletions or SentencePiece boundary shifts).
-    if list(xp_ids[gap_xp:]) != list(x_ids[gap_xp + ins_span_length:]):
-        return _rej("suffix_mismatch")
-
-    # Construct training tuple
-    tagger_gold = [OP_KEEP] * len(xp_ids)
-    if gap_xp < len(tagger_gold):
-        tagger_gold[gap_xp] = OP_INS
-    elif tagger_gold:
-        tagger_gold[-1] = OP_INS
-
-    editor_input = list(xp_ids[:gap_xp]) + [stage.ins_id] * ins_span_length + list(xp_ids[gap_xp:])
-    editor_target = list(x_ids)
-    if len(editor_input) != len(editor_target):
-        return _rej("length_mismatch")
-
-    return {
-        "corruption_type": "ins",
-        "x_token_ids": x_ids,
-        "x_prime_token_ids": xp_ids,
-        "tagger_gold": tagger_gold,
-        "editor_input_token_ids": editor_input,
-        "editor_target_token_ids": editor_target,
-        "ins_span_length": int(ins_span_length),
-        "del_span_length": 0,
-        "x_text": text,
-        "x_prime_text": xprime_text,
-    }
+    op_types = sample_op_types(
+        rng, N, args.op_weight_repl, args.op_weight_ins, args.op_weight_del,
+    )
+    claims: Set[Tuple[str, int]] = set()
+    ops: List[OpSpec] = []
+    for t in op_types:
+        op: Optional[OpSpec] = None
+        if t == "repl":
+            op = propose_repl_op(
+                stage, text, words, rng, claims,
+                mlm_topk=args.repl_mlm_topk,
+                max_retries=args.op_position_max_retries,
+            )
+        elif t == "ins":
+            op = propose_ins_op(
+                stage, text, words, priorities, rng, claims,
+                word_span_max=args.ins_word_span_max,
+                p_high=args.ins_p_high,
+                max_retries=args.op_position_max_retries,
+            )
+        elif t == "del":
+            op = propose_del_op(
+                stage, text, words, rng, claims,
+                word_span_max=args.del_word_span_max,
+                mlm_topk=args.del_mlm_topk,
+                top1_prob=args.del_top1_prob,
+                max_retries=args.op_position_max_retries,
+            )
+        if op is None:
+            return None, "ops_unsuitable"
+        claim_slots(op, claims)
+        ops.append(op)
+    return ops, ""
 
 
-def make_del_sample(
-    stage: Stage, text: str, rng: random.Random,
-    word_span_max: int, mlm_topk: int, top1_prob: float,
-) -> Optional[Dict]:
-    """Insert MLM-predicted words after a chosen position; editor learns to drop them."""
+def build_compound_sample(
+    stage: Stage, text: str, ops: List[OpSpec],
+) -> Tuple[Optional[Dict], str]:
+    """Apply `ops` to `text`, build the training sample. Returns (sample, "")
+    or (None, reason)."""
     words = words_with_offsets(text)
-    if len(words) < 5:
-        return None
-    insert_after_wi = rng.randint(0, len(words) - 2)
-    insert_char = words[insert_after_wi][2]
-    n_words = rng.randint(1, max(1, word_span_max))
-
-    current_text = text
-    char_shift = 0
-    inserted_chars_start = insert_char
-    for _ in range(n_words):
-        pos = insert_char + char_shift
-        masked_text = current_text[:pos] + " " + stage.mlm.mask_token + current_text[pos:]
-        preds = stage.mlm.predict_at_masks(masked_text, top_k=mlm_topk)
-        if not preds or not preds[0]:
-            return None
-        cands = [c for c in preds[0] if looks_like_word(c)]
-        if not cands:
-            return None
-        w = cands[0] if rng.random() < top1_prob else cands[
-            rng.randrange(min(len(cands), max(1, mlm_topk // 2)))
-        ]
-        ins_text = " " + w
-        current_text = current_text[:pos] + ins_text + current_text[pos:]
-        char_shift += len(ins_text)
-
-    inserted_chars_end = insert_char + char_shift
+    try:
+        xp_text, final_pos = apply_compound_to_text(text, words, ops)
+    except Exception:
+        return None, "apply_failed"
+    if not xp_text:
+        return None, "empty_xprime_text"
 
     x_ids, x_offsets = gemma_tokenize(stage.gemma_tok, text)
-    xp_ids, xp_offsets = gemma_tokenize(stage.gemma_tok, current_text)
+    xp_ids, xp_offsets = gemma_tokenize(stage.gemma_tok, xp_text)
 
-    is_, ie_ = find_token_range(xp_offsets, inserted_chars_start, inserted_chars_end)
-    if is_ is None or ie_ is None or ie_ == is_:
-        return None
-    del_span_length = ie_ - is_
+    token_ranges = resolve_token_ranges(
+        ops, final_pos, text, xp_text, words, x_offsets, xp_offsets,
+    )
+    if token_ranges is None:
+        # Distinguish REPL token-count mismatch from other alignment failures.
+        # (Cheap re-check: any REPL whose payload tokenization length differs
+        # from its original?)
+        for op in ops:
+            if op.op_type == "repl":
+                orig_cs = words[op.word_start][1]
+                orig_ce = words[op.word_end - 1][2]
+                xs, xe = find_token_range(x_offsets, orig_cs, orig_ce)
+                if xs is None:
+                    return None, "token_align_failed"
+        return None, "token_align_failed"
 
-    tagger_gold = [OP_KEEP] * len(xp_ids)
-    editor_input = list(xp_ids)
-    editor_target = list(xp_ids)
-    for i in range(is_, ie_):
-        if i < len(tagger_gold):
-            tagger_gold[i] = OP_DEL
-            editor_target[i] = stage.del_id
+    gold = build_compound_gold(
+        x_ids, xp_ids, ops, token_ranges,
+        mask_id=stage.mask_id, ins_id=stage.ins_id, del_id=stage.del_id,
+    )
+    if gold is None:
+        return None, "gold_build_failed"
 
-    return {
-        "corruption_type": "del",
+    sample = {
         "x_token_ids": x_ids,
         "x_prime_token_ids": xp_ids,
-        "tagger_gold": tagger_gold,
-        "editor_input_token_ids": editor_input,
-        "editor_target_token_ids": editor_target,
-        "ins_span_length": 0,
-        "del_span_length": int(del_span_length),
+        "tagger_gold": gold["tagger_gold"],
+        "editor_input_token_ids": gold["editor_input_token_ids"],
+        "editor_target_token_ids": gold["editor_target_token_ids"],
+        "ins_span_lengths": gold["ins_span_lengths"],
+        "del_span_lengths": gold["del_span_lengths"],
+        "op_types": [op.op_type.upper() for op in ops],
+        "N_total": len(ops),
         "x_text": text,
-        "x_prime_text": current_text,
+        "x_prime_text": xp_text,
     }
+    return sample, ""
 
 
-def make_identity_sample(stage: Stage, text: str) -> Optional[Dict]:
+def build_identity_sample(stage: Stage, text: str) -> Tuple[Optional[Dict], str]:
     x_ids, _ = gemma_tokenize(stage.gemma_tok, text)
     if len(x_ids) < 3:
-        return None
-    return {
-        "corruption_type": "identity",
+        return None, "too_short_sentence"
+    sample = {
         "x_token_ids": x_ids,
         "x_prime_token_ids": list(x_ids),
         "tagger_gold": [OP_KEEP] * len(x_ids),
         "editor_input_token_ids": list(x_ids),
         "editor_target_token_ids": list(x_ids),
-        "ins_span_length": 0,
-        "del_span_length": 0,
+        "ins_span_lengths": [],
+        "del_span_lengths": [],
+        "op_types": [],
+        "N_total": 0,
         "x_text": text,
         "x_prime_text": text,
     }
+    return sample, ""
 
 
 # ---------------------------------------------------------------------------
-# Finalisation (PPL + SAE-shift filters + conditioning precompute)
+# N-dependent gates (§6.2.6)
 # ---------------------------------------------------------------------------
-FINALIZE_REJECT_REASONS = (
-    "empty_xprime_text",   # sample had no x_prime_text (programmer error; shouldn't happen)
-    "ppl_inf",             # PPL not finite for clean or corrupted text
-    "ppl_too_high",        # ppl_corr > ppl_max_ratio * ppl_clean
-    "sae_shift_too_small", # ||SAE(clean) - SAE(corrupted)|| < threshold
-)
+def gate_thresholds(N: int, args) -> Tuple[float, float, float]:
+    """Return (ppl_max_ratio, sae_min, sae_max) for a compound of N ops."""
+    if N <= 0:
+        return (float("inf"), 0.0, float("inf"))
+    s = math.sqrt(N)
+    ppl_max = args.ppl_per_op_factor ** s
+    sae_min = args.sae_per_op_min * s
+    sae_max = args.sae_per_op_max * s
+    return ppl_max, sae_min, sae_max
 
 
 def finalize_sample(
-    stage: Stage, sample: Dict, source_id: str,
-    ppl_max_ratio: float, sae_shift_threshold: float,
+    stage: Stage, sample: Dict, source_id: str, args,
+    calibration_writer: Optional[any] = None,
 ) -> Tuple[Optional[Dict], str]:
-    """Return (sample, "") on success, (None, reason) on rejection.
+    """Apply N-dependent PPL / SAE-shift gates and attach conditioning topk.
 
-    Rejection reasons are listed in `FINALIZE_REJECT_REASONS` and are used
-    by the main loop to populate per-bucket reject counters (e.g. so the
-    INS bucket's reject breakdown includes PPL / SAE-shift failures, not
-    only the structural failures from `make_ins_sample`).
+    In --calibration-mode, the gate is skipped and the metrics are written
+    to `calibration_writer` (a JSONL handle). The sample is then still
+    finalised and returned so the calibration run still emits a usable
+    cache (useful for end-to-end shape testing).
     """
     x_text = sample.get("x_text", "")
     xp_text = sample.get("x_prime_text", "")
     if not xp_text:
         return None, "empty_xprime_text"
 
-    if sample["corruption_type"] != "identity":
+    N = int(sample.get("N_total", 0))
+    is_identity = (N == 0)
+
+    if is_identity:
+        ppl_clean = ppl_corr = float("nan")
+        ppl_ratio: Optional[float] = None
+    else:
         ppl_clean = causal_perplexity_text(stage, x_text)
         ppl_corr = causal_perplexity_text(stage, xp_text)
         if not (math.isfinite(ppl_clean) and math.isfinite(ppl_corr)):
-            return None, "ppl_inf"
-        if ppl_corr > ppl_max_ratio * ppl_clean:
-            return None, "ppl_too_high"
-    else:
-        ppl_clean = ppl_corr = float("nan")
+            ppl_ratio = None
+        else:
+            ppl_ratio = ppl_corr / ppl_clean
 
     fX, vX = sae_pool_max_topk_from_text(stage, x_text)
     fXp, vXp = sae_pool_max_topk_from_text(stage, xp_text)
     shift = sae_l2_shift(fX, vX, fXp, vXp)
-    if sample["corruption_type"] != "identity" and shift < sae_shift_threshold:
-        return None, "sae_shift_too_small"
+
+    ppl_max, sae_min, sae_max = gate_thresholds(N, args)
+
+    if calibration_writer is not None:
+        calibration_writer.write(json.dumps({
+            "N": N,
+            "source_sent_id": source_id,
+            "op_types": sample["op_types"],
+            "ppl_clean": ppl_clean if math.isfinite(ppl_clean) else None,
+            "ppl_corr": ppl_corr if math.isfinite(ppl_corr) else None,
+            "ppl_ratio": ppl_ratio,
+            "sae_shift": shift,
+            "ppl_max_at_N": ppl_max if math.isfinite(ppl_max) else None,
+            "sae_min_at_N": sae_min,
+            "sae_max_at_N": sae_max,
+        }) + "\n")
+
+    if not args.calibration_mode and not is_identity:
+        if ppl_ratio is None:
+            return None, "ppl_inf"
+        if ppl_ratio > ppl_max:
+            return None, "ppl_too_high"
+        if shift < sae_min:
+            return None, "sae_shift_too_small"
+        if shift > sae_max:
+            return None, "sae_shift_too_large"
 
     sample.pop("x_text", None)
     sample.pop("x_prime_text", None)
@@ -566,42 +1092,85 @@ def finalize_sample(
         "z_X_topk": topk_records(fX, vX),
         "z_X_prime_topk": topk_records(fXp, vXp),
         "filter_telemetry": {
-            "ppl_clean": ppl_clean,
-            "ppl_ratio": (ppl_corr / ppl_clean) if math.isfinite(ppl_clean) else None,
+            "ppl_clean": ppl_clean if math.isfinite(ppl_clean) else None,
+            "ppl_ratio": ppl_ratio,
+            "ppl_max_at_N": ppl_max if math.isfinite(ppl_max) else None,
             "sae_shift_l2": shift,
+            "sae_min_at_N": sae_min,
+            "sae_max_at_N": sae_max,
         },
     })
     return sample, ""
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Bucket logic (§6.3.1)
 # ---------------------------------------------------------------------------
-def _normalize_probs(args) -> List[Tuple[str, float]]:
-    weights = [
-        ("identity", args.p_identity),
-        ("repl", args.p_repl),
-        ("ins", args.p_ins),
-        ("del", args.p_del),
-        ("mixed_repl_ins", args.p_mixed_repl_ins),
-        ("mixed_repl_del", args.p_mixed_repl_del),
-    ]
-    total = sum(w for _, w in weights)
+BUCKETS = ("identity", "single_op", "compound_2_3", "compound_4_plus")
+
+
+def bucket_for_N(N: int) -> str:
+    if N <= 0:
+        return "identity"
+    if N == 1:
+        return "single_op"
+    if N <= 3:
+        return "compound_2_3"
+    return "compound_4_plus"
+
+
+def normalize_bucket_weights(args) -> Dict[str, float]:
+    weights = {
+        "identity": args.p_identity,
+        "single_op": args.p_single_op,
+        "compound_2_3": args.p_compound_2_3,
+        "compound_4_plus": args.p_compound_4_plus,
+    }
+    total = sum(weights.values())
     if total <= 0:
-        raise ValueError("all bucket probabilities are zero")
-    return [(k, w / total) for k, w in weights if w > 0]
+        raise ValueError("all bucket weights are zero")
+    return {k: v / total for k, v in weights.items()}
 
 
-def pick_bucket(buckets: List[Tuple[str, float]], rng: random.Random) -> str:
+def sample_N_for_bucket(bucket: str, rng: random.Random, args) -> int:
+    """Sample N from the truncated geometric, conditioned on the bucket."""
+    if bucket == "identity":
+        return 0
+    if bucket == "single_op":
+        return 1
+    # Truncated geometric over {2..N_MAX} or {4..N_MAX}
+    p = args.n_distribution_p
+    lo = 2 if bucket == "compound_2_3" else 4
+    hi = 3 if bucket == "compound_2_3" else args.n_max
+    if hi < lo:
+        return lo
+    # Sample a geometric variate truncated to [lo, hi].
+    weights = [(1 - p) ** (k - lo) * p for k in range(lo, hi + 1)]
+    s = sum(weights)
+    if s <= 0:
+        return lo
+    r = rng.random() * s
+    cum = 0.0
+    for k, w in zip(range(lo, hi + 1), weights):
+        cum += w
+        if r < cum:
+            return k
+    return hi
+
+
+def pick_bucket(probs: Dict[str, float], rng: random.Random) -> str:
     r = rng.random()
     cum = 0.0
-    for name, p in buckets:
-        cum += p
+    for b in BUCKETS:
+        cum += probs[b]
         if r < cum:
-            return name
-    return buckets[-1][0]
+            return b
+    return BUCKETS[-1]
 
 
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 def _str_dtype(s: str) -> torch.dtype:
     return {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[s]
 
@@ -632,9 +1201,13 @@ def main():
     mlm = MLMProvider(args.mlm_model, dtype=_str_dtype(args.mlm_dtype)).to(args.device)
     print(f"[corruption] resolved MLM: {mlm.resolved_name}  mask={mlm.mask_token!r}")
 
+    print(f"[corruption] loading spaCy POS tagger: {args.spacy_model}")
+    spacy_nlp = load_spacy(args.spacy_model)
+
     stage = Stage(
         extractor=extractor, causal_llm=causal_llm, mlm=mlm,
         gemma_tok=gemma_tok,
+        spacy_nlp=spacy_nlp,
         mask_id=int(gemma_tok.mask_token_id),
         ins_id=int(gemma_tok.convert_tokens_to_ids("[INS]")),
         del_id=int(gemma_tok.convert_tokens_to_ids("[DEL]")),
@@ -642,8 +1215,13 @@ def main():
         device=args.device, k_train=int(args.k_train),
     )
 
-    buckets = _normalize_probs(args)
-    print(f"[corruption] sample buckets: {buckets}")
+    bucket_probs = normalize_bucket_weights(args)
+    print(f"[corruption] bucket weights: {bucket_probs}")
+    print(f"[corruption] compound op weights: "
+          f"REPL={args.op_weight_repl}, INS={args.op_weight_ins}, DEL={args.op_weight_del}")
+    if args.calibration_mode:
+        print(f"[corruption] CALIBRATION MODE: gate disabled; metrics → "
+              f"{args.calibration_out or (out_dir / 'calibration.jsonl')}")
 
     shard_paths = download_dolma_shards(args.data_cache_dir, max_files=args.max_files)
     text_iter = iter_dolma_texts(shard_paths, min_chars=64)
@@ -669,8 +1247,16 @@ def main():
     attempted = 0
     bucket_attempts: Dict[str, int] = defaultdict(int)
     bucket_accepts: Dict[str, int] = defaultdict(int)
-    ins_reject_counter: Dict[str, int] = defaultdict(int)
+    n_attempts: Dict[int, int] = defaultdict(int)
+    n_accepts: Dict[int, int] = defaultdict(int)
+    reject_reasons: Dict[str, int] = defaultdict(int)
     cur_shard_file = None
+
+    calibration_writer = None
+    if args.calibration_mode:
+        cal_path = Path(args.calibration_out) if args.calibration_out else (out_dir / "calibration.jsonl")
+        cal_path.parent.mkdir(parents=True, exist_ok=True)
+        calibration_writer = open(cal_path, "wt", encoding="utf-8")
 
     def open_shard():
         nonlocal cur_shard_file, shard_idx
@@ -687,134 +1273,125 @@ def main():
         if not (args.sent_min_tokens <= gemma_token_count <= args.sent_max_tokens):
             continue
         sent_idx += 1
-        for _ in range(args.reject_budget):
-            attempted += 1
-            bucket = pick_bucket(buckets, rng)
-            bucket_attempts[bucket] += 1
-            sample: Optional[Dict] = None
-            if bucket == "identity":
-                sample = make_identity_sample(stage, sent)
-            elif bucket == "repl":
-                sample = make_repl_sample(
-                    stage, sent, rng, args.repl_words_max, args.repl_mlm_topk,
-                )
-            elif bucket == "ins":
-                sample = make_ins_sample(
-                    stage, sent, rng,
-                    args.ins_word_span_max,
-                    reject_counter=ins_reject_counter,
-                )
-            elif bucket == "del":
-                sample = make_del_sample(
-                    stage, sent, rng,
-                    args.del_word_span_max, args.del_mlm_topk, args.del_top1_prob,
-                )
-            elif bucket == "mixed_repl_ins":
-                mid = make_repl_sample(stage, sent, rng,
-                                       args.repl_words_max, args.repl_mlm_topk)
-                if mid is None:
-                    continue
-                # Use the corrupted text as the new clean for INS
-                sample = make_ins_sample(
-                    stage, mid["x_prime_text"], rng,
-                    args.ins_word_span_max,
-                    reject_counter=ins_reject_counter,
-                )
-                if sample is not None:
-                    sample["corruption_type"] = "mixed_repl_ins"
-            elif bucket == "mixed_repl_del":
-                mid = make_repl_sample(stage, sent, rng,
-                                       args.repl_words_max, args.repl_mlm_topk)
-                if mid is None:
-                    continue
-                sample = make_del_sample(
-                    stage, mid["x_prime_text"], rng,
-                    args.del_word_span_max, args.del_mlm_topk, args.del_top1_prob,
-                )
-                if sample is not None:
-                    sample["corruption_type"] = "mixed_repl_del"
 
+        bucket = pick_bucket(bucket_probs, rng)
+        for _attempt in range(args.k_budget):
+            attempted += 1
+            bucket_attempts[bucket] += 1
+            N = sample_N_for_bucket(bucket, rng, args)
+            n_attempts[N] += 1
+            sample: Optional[Dict] = None
+            reason = ""
+            if N == 0:
+                sample, reason = build_identity_sample(stage, sent)
+            else:
+                ops, reason = sample_compound(stage, sent, rng, N, args)
+                if ops is None:
+                    reject_reasons[reason] += 1
+                else:
+                    sample, reason = build_compound_sample(stage, sent, ops)
+                    if sample is None:
+                        reject_reasons[reason] += 1
             if sample is None:
                 continue
             final, finalize_reason = finalize_sample(
-                stage, sample, source_id=f"dolma:s{sent_idx}",
-                ppl_max_ratio=args.ppl_max_ratio,
-                sae_shift_threshold=args.sae_shift_threshold,
+                stage, sample,
+                source_id=f"dolma:s{sent_idx}",
+                args=args,
+                calibration_writer=calibration_writer,
             )
             if final is None:
-                # Track post-finalize rejections in the INS counter so the
-                # INS reject breakdown reflects PPL / SAE-shift losses too.
-                if bucket in ("ins", "mixed_repl_ins") and finalize_reason:
-                    ins_reject_counter[finalize_reason] += 1
+                reject_reasons[finalize_reason] += 1
                 continue
+            final["bucket"] = bucket
             cur_shard_file.write(json.dumps(final, ensure_ascii=False) + "\n")
             written += 1
             bucket_accepts[bucket] += 1
+            n_accepts[N] += 1
             if written % args.samples_per_shard == 0 and written < args.target_samples:
                 cur_shard_file.close()
                 open_shard()
-                yield_ = written / max(1, attempted)
+                yield_pct = written / max(1, attempted)
                 per_bucket = ", ".join(
-                    f"{name}={bucket_accepts[name]}/"
-                    f"{bucket_attempts[name]}="
-                    f"{bucket_accepts[name] / max(1, bucket_attempts[name]):.2f}"
-                    for name, _ in buckets
+                    f"{b}={bucket_accepts[b]}/{bucket_attempts[b]}="
+                    f"{bucket_accepts[b] / max(1, bucket_attempts[b]):.2f}"
+                    for b in BUCKETS
+                )
+                per_N = ", ".join(
+                    f"N={k}:{n_accepts[k]}/{n_attempts[k]}="
+                    f"{n_accepts[k] / max(1, n_attempts[k]):.2f}"
+                    for k in sorted(n_attempts)
                 )
                 print(
                     f"[corruption] written={written} sents={sent_idx} "
-                    f"attempts={attempted} yield={yield_:.3f}  ({per_bucket})"
+                    f"attempts={attempted} yield={yield_pct:.3f}  "
+                    f"buckets({per_bucket})  N({per_N})"
                 )
-                ins_total = sum(ins_reject_counter.values())
-                if ins_total:
-                    ins_breakdown = ", ".join(
-                        f"{r}={ins_reject_counter[r]}"
-                        f"({100.0 * ins_reject_counter[r] / ins_total:.0f}%)"
-                        for r in INS_REJECT_REASONS
-                        if ins_reject_counter[r] > 0
-                    )
-                    print(f"[corruption] INS reject reasons: {ins_breakdown}")
+                if reject_reasons:
+                    top = sorted(reject_reasons.items(), key=lambda kv: -kv[1])[:8]
+                    print(f"[corruption] reject reasons: " +
+                          ", ".join(f"{k}={v}" for k, v in top))
             break
 
     if cur_shard_file is not None:
         cur_shard_file.close()
+    if calibration_writer is not None:
+        calibration_writer.close()
 
-    # Final summary — print regardless of whether the last shard was a
-    # samples_per_shard cut (the per-shard log is gated on
-    # `written < target_samples`, so the very last completed batch never
-    # surfaces its breakdown otherwise).
-    yield_ = written / max(1, attempted)
+    # Final summary
+    yield_pct = written / max(1, attempted)
     per_bucket = ", ".join(
-        f"{name}={bucket_accepts[name]}/"
-        f"{bucket_attempts[name]}="
-        f"{bucket_accepts[name] / max(1, bucket_attempts[name]):.2f}"
-        for name, _ in buckets
+        f"{b}={bucket_accepts[b]}/{bucket_attempts[b]}="
+        f"{bucket_accepts[b] / max(1, bucket_attempts[b]):.2f}"
+        for b in BUCKETS
+    )
+    per_N = ", ".join(
+        f"N={k}:{n_accepts[k]}/{n_attempts[k]}="
+        f"{n_accepts[k] / max(1, n_attempts[k]):.2f}"
+        for k in sorted(n_attempts)
     )
     print(
         f"[corruption] FINAL written={written} sents={sent_idx} "
-        f"attempts={attempted} yield={yield_:.3f}  ({per_bucket})"
+        f"attempts={attempted} yield={yield_pct:.3f}  "
+        f"buckets({per_bucket})  N({per_N})"
     )
-    ins_total = sum(ins_reject_counter.values())
-    if ins_total:
-        ins_breakdown = ", ".join(
-            f"{r}={ins_reject_counter[r]}"
-            f"({100.0 * ins_reject_counter[r] / ins_total:.0f}%)"
-            for r in INS_REJECT_REASONS
-            if ins_reject_counter[r] > 0
-        )
-        print(f"[corruption] FINAL INS reject reasons: {ins_breakdown}")
+    if reject_reasons:
+        all_rej = sorted(reject_reasons.items(), key=lambda kv: -kv[1])
+        print(f"[corruption] FINAL reject reasons: " +
+              ", ".join(f"{k}={v}" for k, v in all_rej))
 
     meta = {
         "samples_written": int(written),
         "sentences_seen": int(sent_idx),
         "attempts": int(attempted),
-        "yield": float(written / max(1, attempted)),
+        "yield": float(yield_pct),
         "bucket_attempts": {k: int(v) for k, v in bucket_attempts.items()},
         "bucket_accepts": {k: int(v) for k, v in bucket_accepts.items()},
         "bucket_yields": {
             k: float(bucket_accepts[k] / max(1, bucket_attempts[k]))
             for k in bucket_attempts
         },
-        "ins_reject_reasons": {k: int(ins_reject_counter[k]) for k in INS_REJECT_REASONS},
+        "n_attempts": {str(k): int(v) for k, v in n_attempts.items()},
+        "n_accepts": {str(k): int(v) for k, v in n_accepts.items()},
+        "reject_reasons": {k: int(v) for k, v in reject_reasons.items()},
+        "calibration_mode": bool(args.calibration_mode),
+        "gates": {
+            "ppl_per_op_factor": float(args.ppl_per_op_factor),
+            "sae_per_op_min": float(args.sae_per_op_min),
+            "sae_per_op_max": float(args.sae_per_op_max),
+        },
+        "compound": {
+            "n_max": int(args.n_max),
+            "n_distribution_p": float(args.n_distribution_p),
+            "op_weight_repl": float(args.op_weight_repl),
+            "op_weight_ins": float(args.op_weight_ins),
+            "op_weight_del": float(args.op_weight_del),
+            "k_budget": int(args.k_budget),
+        },
+        "ins_position": {
+            "p_high": float(args.ins_p_high),
+            "high_priority_upos": sorted(HIGH_PRIORITY_UPOS),
+        },
         "d_sae": int(extractor.d_sae),
         "k_train": int(args.k_train),
         "mask_id": int(stage.mask_id),
@@ -824,6 +1401,7 @@ def main():
         "llm2vec_dir": args.llm2vec_dir,
         "mlm_model": args.mlm_model,
         "mlm_resolved": mlm.resolved_name,
+        "spacy_model": args.spacy_model,
         "sae_repo": args.sae_repo,
         "sae_path": args.sae_path,
         "sae_layer": int(args.sae_layer),
