@@ -2,23 +2,50 @@
 Sample LinguaLens minimal pairs and report token-level diff distribution.
 
 For each (sentence1, sentence2) pair we tokenize with the Gemma tokenizer
-used by the SAE-LEWIS pipeline (google/gemma-2-2b by default) and compute:
+used by the SAE-LEWIS pipeline (google/gemma-2-2b by default) and compute
+three related but distinct measures of edit complexity at TOKEN
+granularity (so the numbers stay directly tied to what the SAE-LEWIS
+editor would have to emit):
 
-  * len(tok1), len(tok2), |Δlen|
-  * EDIT(tok1, tok2) -- token-level Levenshtein (insert/delete/substitute,
-    all cost 1). This corresponds to the minimum N a SAE-LEWIS compound
-    corruption would need to transform sentence1 into sentence2.
-  * |set(tok1) △ set(tok2)| -- set-level symmetric difference (order-
-    insensitive, ignores duplicates). Coarser but useful when many edits
-    are local rearrangements.
+  * `tok_edit` -- classical Levenshtein, insert/delete/substitute cost 1
+    each. The minimum number of single-token edit operations needed to
+    transform sentence1 into sentence2. Suffers from two over-counts when
+    interpreted as an SAE-LEWIS op count:
+      (a) a contiguous block insertion of K tokens scores K, whereas the
+          editor emits 1 INS marker + length-K via the length head.
+      (b) a single multi-subword word substitution scores #subtokens,
+          whereas the corruption pipeline would call it 1 REPL op.
+
+  * `n_hunks` -- number of contiguous non-equal blocks in the
+    difflib.SequenceMatcher diff. Corresponds 1-to-1 to SAE-LEWIS's
+    `N_total` (one REPL/INS/DEL hunk = one op), so this is the right
+    metric for "does the LinguaLens N distribution match the
+    corruption pipeline's bucket weights?".
+
+  * `editor_ops` -- weighted hunk count that reflects the editor's
+    inference cost:
+        REPL hunk of K tokens   -> K ops  (one marker per token)
+        DEL  hunk of K tokens   -> K ops  (one [DEL] marker per token)
+        INS  gap of any size    -> 1 op   (one [INS] marker;
+                                            length head emits the rest)
+    `editor_ops` answers "how many emit-operations does the editor
+    actually have to make at inference time?". By construction
+    `tok_edit >= editor_ops >= n_hunks`.
+
+Also recorded:
+  * `len(tok1)`, `len(tok2)`, `|Δlen|`
+  * `set_diff = |set(tok1) △ set(tok2)|` (order-insensitive, dedup-counted)
+  * `op_types` -- per-hunk REPL/INS/DEL counts so the report can compare
+    against the corruption pipeline's `(0.55, 0.25, 0.20)` op weights.
 
 Output: a Markdown report with per-language and overall percentiles plus
-a histogram of edit distances. Designed to be checked into the repo
-without going into README.md.
+per-integer histograms for `tok_edit`, `n_hunks`, and `editor_ops`.
+Designed to be checked into the repo without going into README.md.
 """
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import random
 from collections import Counter, defaultdict
@@ -45,6 +72,54 @@ def token_edit_distance(a: List[int], b: List[int]) -> int:
             cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
         prev = cur
     return prev[m]
+
+
+def diff_metrics(a: List[int], b: List[int]) -> Dict:
+    """Return (n_hunks, editor_ops, op_types) from a difflib diff.
+
+    Maps difflib opcodes onto SAE-LEWIS op types as follows:
+      * 'replace' -> REPL hunk (1 hunk; editor cost = (i2-i1) per-token markers)
+      * 'insert'  -> DEL hunk  (corruption side INSERTED tokens that the
+                                 editor must DELETE; editor cost =
+                                 (j2-j1) per-token markers)
+      * 'delete'  -> INS hunk  (corruption side DELETED tokens that the
+                                 editor must INSERT back; editor cost = 1
+                                 marker + length-K from the length head)
+
+    The 'insert' vs 'delete' inversion intentionally matches the
+    SAE-LEWIS naming convention: op names describe what the editor must
+    do, not what the corruption did.
+    """
+    sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
+    opcodes = sm.get_opcodes()
+    n_hunks = 0
+    editor_ops = 0
+    counts = {"REPL": 0, "INS": 0, "DEL": 0}
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == "equal":
+            continue
+        n_hunks += 1
+        if tag == "replace":
+            # Same-token-count substitution at the editor: one REPL marker
+            # per token.
+            counts["REPL"] += 1
+            editor_ops += (i2 - i1)
+        elif tag == "delete":
+            # Tokens present in `a` but not in `b` → editor must INSERT
+            # them back (SAE-LEWIS naming). One INS marker, length-K from
+            # the length head.
+            counts["INS"] += 1
+            editor_ops += 1
+        elif tag == "insert":
+            # Tokens present in `b` but not in `a` → editor must DELETE
+            # them. One [DEL] marker per inserted token.
+            counts["DEL"] += 1
+            editor_ops += (j2 - j1)
+    return {
+        "n_hunks": n_hunks,
+        "editor_ops": editor_ops,
+        "op_types": counts,
+    }
 
 
 def percentiles(values: List[float], qs: List[float]) -> List[float]:
@@ -95,39 +170,65 @@ def _per_value_hist(values: List[int], max_exact: int = 20) -> Tuple[Dict[str, i
 
 def summarise(records: List[Dict]) -> Dict:
     if not records:
-        return {
-            "n": 0, "len1_p50": None, "len2_p50": None,
-            "delta_len_p50": None, "edit_p50": None, "set_diff_p50": None,
-        }
+        return {"n": 0}
     len1 = [r["len1"] for r in records]
     len2 = [r["len2"] for r in records]
     dlen = [abs(r["len1"] - r["len2"]) for r in records]
-    edit = [r["edit"] for r in records]
+    edit = [r["tok_edit"] for r in records]
     setd = [r["set_diff"] for r in records]
+    nhk  = [r["n_hunks"]   for r in records]
+    eops = [r["editor_ops"] for r in records]
     qs = [0.05, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99]
     p_len1 = percentiles(len1, qs)
     p_len2 = percentiles(len2, qs)
     p_dlen = percentiles(dlen, qs)
     p_edit = percentiles(edit, qs)
     p_setd = percentiles(setd, qs)
+    p_nhk  = percentiles(nhk,  qs)
+    p_eops = percentiles(eops, qs)
     edit_hist, edit_labels = _per_value_hist(edit, max_exact=20)
     set_diff_hist, set_diff_labels = _per_value_hist(setd, max_exact=20)
+    nhk_hist, nhk_labels = _per_value_hist(nhk, max_exact=10)
+    eops_hist, eops_labels = _per_value_hist(eops, max_exact=20)
+    # Per-op-type totals (sums across the corpus). Lets us compute the
+    # observed REPL : INS : DEL ratio and compare to the corruption
+    # pipeline's (0.55, 0.25, 0.20) default.
+    op_totals = {"REPL": 0, "INS": 0, "DEL": 0}
+    for r in records:
+        for t, c in r["op_types"].items():
+            op_totals[t] += c
+    op_total_sum = sum(op_totals.values())
+    op_ratio = {
+        t: (op_totals[t] / op_total_sum) if op_total_sum else 0.0
+        for t in op_totals
+    }
     return {
         "n": len(records),
         "len1_mean": sum(len1) / len(len1),
         "len2_mean": sum(len2) / len(len2),
-        "edit_mean": sum(edit) / len(edit),
-        "set_diff_mean": sum(setd) / len(setd),
+        "tok_edit_mean":   sum(edit) / len(edit),
+        "n_hunks_mean":    sum(nhk)  / len(nhk),
+        "editor_ops_mean": sum(eops) / len(eops),
+        "set_diff_mean":   sum(setd) / len(setd),
         "len1_pcts": p_len1,
         "len2_pcts": p_len2,
         "delta_len_pcts": p_dlen,
-        "edit_pcts": p_edit,
+        "tok_edit_pcts":   p_edit,
+        "n_hunks_pcts":    p_nhk,
+        "editor_ops_pcts": p_eops,
         "set_diff_pcts": p_setd,
-        # Per-integer histogram of edit distance (0..20 exact, then tail).
-        "edit_hist": edit_hist,
-        "edit_hist_labels": edit_labels,
+        # Per-integer histograms (0..max_exact exact, then tail).
+        "tok_edit_hist": edit_hist,
+        "tok_edit_hist_labels": edit_labels,
+        "n_hunks_hist": nhk_hist,
+        "n_hunks_hist_labels": nhk_labels,
+        "editor_ops_hist": eops_hist,
+        "editor_ops_hist_labels": eops_labels,
         "set_diff_hist": set_diff_hist,
         "set_diff_hist_labels": set_diff_labels,
+        # Op-type histogram + ratio
+        "op_totals": op_totals,
+        "op_ratio":  op_ratio,
     }
 
 
@@ -144,22 +245,41 @@ def render_md(
         f"(seed={args.seed}).\n"
     )
     out.append(
-        "**EDIT** = token-level Levenshtein distance (insert/delete/substitute, "
-        "all cost 1) — the minimum N a SAE-LEWIS compound corruption would "
-        "need to transform `sentence1` into `sentence2`.  **set_diff** = "
-        "`|set(tok1) △ set(tok2)|` — order-insensitive, dedup-counted token "
-        "set symmetric difference.\n"
+        "Three token-level edit metrics (all `tok_edit ≥ editor_ops ≥ "
+        "n_hunks`):\n"
+        "* **`tok_edit`** — classical Levenshtein, insert/delete/substitute "
+        "cost 1. The minimum number of single-token edits. Over-counts "
+        "INS (a contiguous block insertion of K tokens scores K, not 1).\n"
+        "* **`editor_ops`** — editor inference cost: REPL/DEL hunks "
+        "contribute one marker per token, INS hunks contribute one marker "
+        "per gap (length head emits the rest). What the editor actually "
+        "has to emit at inference time.\n"
+        "* **`n_hunks`** — number of contiguous non-equal diff blocks. "
+        "Corresponds 1-to-1 to SAE-LEWIS's `N_total` (one hunk = one op). "
+        "Use this to compare against the corruption pipeline's bucket "
+        "weights.\n"
+        "* `set_diff` = `|set(tok1) △ set(tok2)|` — order-insensitive, "
+        "dedup-counted token set symmetric difference.\n"
     )
 
     # Overall
     out.append("\n## Overall\n")
     out.append(_render_summary_table(overall, qs_labels))
+    out.append(_render_op_ratio_table("Op-type histogram (overall)", overall))
     out.append(_render_hist_table(
-        "Edit-distance histogram (overall)",
-        overall["edit_hist"], overall["edit_hist_labels"], overall["n"],
+        "tok_edit histogram (overall)",
+        overall["tok_edit_hist"], overall["tok_edit_hist_labels"], overall["n"],
     ))
     out.append(_render_hist_table(
-        "Set-diff histogram (overall)",
+        "editor_ops histogram (overall)",
+        overall["editor_ops_hist"], overall["editor_ops_hist_labels"], overall["n"],
+    ))
+    out.append(_render_hist_table(
+        "n_hunks histogram (overall) -- compare to SAE-LEWIS bucket weights",
+        overall["n_hunks_hist"], overall["n_hunks_hist_labels"], overall["n"],
+    ))
+    out.append(_render_hist_table(
+        "set_diff histogram (overall)",
         overall["set_diff_hist"], overall["set_diff_hist_labels"], overall["n"],
     ))
 
@@ -168,31 +288,49 @@ def render_md(
     for lang, summ in sorted(by_lang.items()):
         out.append(f"\n### {lang}  (n = {summ['n']})\n")
         out.append(_render_summary_table(summ, qs_labels))
+        out.append(_render_op_ratio_table(f"{lang}: Op-type histogram", summ))
         out.append(_render_hist_table(
-            f"{lang}: Edit-distance histogram",
-            summ["edit_hist"], summ["edit_hist_labels"], summ["n"],
+            f"{lang}: tok_edit histogram",
+            summ["tok_edit_hist"], summ["tok_edit_hist_labels"], summ["n"],
+        ))
+        out.append(_render_hist_table(
+            f"{lang}: editor_ops histogram",
+            summ["editor_ops_hist"], summ["editor_ops_hist_labels"], summ["n"],
+        ))
+        out.append(_render_hist_table(
+            f"{lang}: n_hunks histogram",
+            summ["n_hunks_hist"], summ["n_hunks_hist_labels"], summ["n"],
         ))
 
-    # Top features (by edit-distance median, to flag what's hardest)
-    out.append("\n## Top features by edit-distance p50 (largest first)\n")
-    out.append("| feature | n | EDIT p50 | EDIT p90 | set_diff p50 | mean len1 | mean len2 |\n")
-    out.append("|---------|---|----------|----------|--------------|-----------|-----------|\n")
-    rows = sorted(feature_summary, key=lambda kv: kv[1]["edit_pcts"][2], reverse=True)
+    # Top features (by n_hunks median, since that's the SAE-LEWIS-relevant
+    # signal). Falls back to tok_edit for ties.
+    def _feature_sort_key(kv):
+        s = kv[1]
+        return (s["n_hunks_pcts"][2], s["tok_edit_pcts"][2])
+
+    out.append("\n## Top features by n_hunks p50 (largest first)\n")
+    out.append(
+        "| feature | n | n_hunks p50 | editor_ops p50 | tok_edit p50 | "
+        "REPL% | INS% | DEL% | mean len1 | mean len2 |\n"
+    )
+    out.append(
+        "|---------|---|-------------|----------------|--------------|"
+        "-------|------|------|-----------|-----------|\n"
+    )
+    rows = sorted(feature_summary, key=_feature_sort_key, reverse=True)
     for name, s in rows[:25]:
-        out.append(
-            f"| {name} | {s['n']} | {s['edit_pcts'][2]:.1f} | "
-            f"{s['edit_pcts'][4]:.1f} | {s['set_diff_pcts'][2]:.1f} | "
-            f"{s['len1_mean']:.1f} | {s['len2_mean']:.1f} |\n"
-        )
-    out.append("\n## Bottom features by edit-distance p50 (smallest first)\n")
-    out.append("| feature | n | EDIT p50 | EDIT p90 | set_diff p50 | mean len1 | mean len2 |\n")
-    out.append("|---------|---|----------|----------|--------------|-----------|-----------|\n")
+        out.append(_render_feature_row(name, s))
+    out.append("\n## Bottom features by n_hunks p50 (smallest first)\n")
+    out.append(
+        "| feature | n | n_hunks p50 | editor_ops p50 | tok_edit p50 | "
+        "REPL% | INS% | DEL% | mean len1 | mean len2 |\n"
+    )
+    out.append(
+        "|---------|---|-------------|----------------|--------------|"
+        "-------|------|------|-----------|-----------|\n"
+    )
     for name, s in rows[-25:][::-1]:
-        out.append(
-            f"| {name} | {s['n']} | {s['edit_pcts'][2]:.1f} | "
-            f"{s['edit_pcts'][4]:.1f} | {s['set_diff_pcts'][2]:.1f} | "
-            f"{s['len1_mean']:.1f} | {s['len2_mean']:.1f} |\n"
-        )
+        out.append(_render_feature_row(name, s))
 
     out.append(
         "\n## Notes\n\n"
@@ -239,31 +377,67 @@ def _render_summary_table(summ: Dict, qs_labels: List[str]) -> str:
     out.append("\n| metric | mean | " + " | ".join(qs_labels) + " |\n")
     out.append("|--------|------|" + "|".join("-----" for _ in qs_labels) + "|\n")
     out.append(
-        f"| `len(tok1)`   | {summ['len1_mean']:.2f} | "
+        f"| `len(tok1)`     | {summ['len1_mean']:.2f} | "
         + " | ".join(f"{v:.1f}" for v in summ["len1_pcts"])
         + " |\n"
     )
     out.append(
-        f"| `len(tok2)`   | {summ['len2_mean']:.2f} | "
+        f"| `len(tok2)`     | {summ['len2_mean']:.2f} | "
         + " | ".join(f"{v:.1f}" for v in summ["len2_pcts"])
         + " |\n"
     )
     out.append(
-        f"| `|Δlen|`      | -   | "
+        f"| `|Δlen|`        | -    | "
         + " | ".join(f"{v:.1f}" for v in summ["delta_len_pcts"])
         + " |\n"
     )
     out.append(
-        f"| `EDIT`        | {summ['edit_mean']:.2f} | "
-        + " | ".join(f"{v:.1f}" for v in summ["edit_pcts"])
+        f"| `tok_edit`      | {summ['tok_edit_mean']:.2f} | "
+        + " | ".join(f"{v:.1f}" for v in summ["tok_edit_pcts"])
         + " |\n"
     )
     out.append(
-        f"| `set_diff`    | {summ['set_diff_mean']:.2f} | "
+        f"| `editor_ops`    | {summ['editor_ops_mean']:.2f} | "
+        + " | ".join(f"{v:.1f}" for v in summ["editor_ops_pcts"])
+        + " |\n"
+    )
+    out.append(
+        f"| `n_hunks`       | {summ['n_hunks_mean']:.2f} | "
+        + " | ".join(f"{v:.1f}" for v in summ["n_hunks_pcts"])
+        + " |\n"
+    )
+    out.append(
+        f"| `set_diff`      | {summ['set_diff_mean']:.2f} | "
         + " | ".join(f"{v:.1f}" for v in summ["set_diff_pcts"])
         + " |\n"
     )
     return "".join(out)
+
+
+def _render_op_ratio_table(title: str, summ: Dict) -> str:
+    out: List[str] = []
+    out.append(f"\n**{title}** (hunk counts across all pairs in the slice; "
+               "compare ratio against the corruption pipeline's default "
+               "`(REPL=0.55, INS=0.25, DEL=0.20)`):\n\n")
+    out.append("| op | total hunks | ratio |\n")
+    out.append("|----|-------------|-------|\n")
+    for t in ("REPL", "INS", "DEL"):
+        c = summ["op_totals"][t]
+        r = summ["op_ratio"][t]
+        out.append(f"| {t} | {c} | {r:.3f} |\n")
+    return "".join(out)
+
+
+def _render_feature_row(name: str, s: Dict) -> str:
+    return (
+        f"| {name} | {s['n']} | "
+        f"{s['n_hunks_pcts'][2]:.1f} | {s['editor_ops_pcts'][2]:.1f} | "
+        f"{s['tok_edit_pcts'][2]:.1f} | "
+        f"{100*s['op_ratio']['REPL']:.0f}% | "
+        f"{100*s['op_ratio']['INS']:.0f}% | "
+        f"{100*s['op_ratio']['DEL']:.0f}% | "
+        f"{s['len1_mean']:.1f} | {s['len2_mean']:.1f} |\n"
+    )
 
 
 def main():
@@ -309,13 +483,17 @@ def main():
         ids2 = tok(ex["sentence2"], add_special_tokens=True)["input_ids"]
         ed = token_edit_distance(ids1, ids2)
         sd = len(set(ids1) ^ set(ids2))
+        dm = diff_metrics(ids1, ids2)
         rec = {
-            "language": ex["language"],
-            "feature":  ex["feature"],
-            "len1":     len(ids1),
-            "len2":     len(ids2),
-            "edit":     ed,
-            "set_diff": sd,
+            "language":    ex["language"],
+            "feature":     ex["feature"],
+            "len1":        len(ids1),
+            "len2":        len(ids2),
+            "tok_edit":    ed,
+            "n_hunks":     dm["n_hunks"],
+            "editor_ops":  dm["editor_ops"],
+            "op_types":    dm["op_types"],
+            "set_diff":    sd,
         }
         records.append(rec)
         by_lang[ex["language"]].append(rec)
@@ -345,26 +523,42 @@ def main():
     # Brief console summary
     print()
     print(f"Overall (n={overall['n']}):")
-    print(f"  EDIT       p50={overall['edit_pcts'][2]:.1f}  "
-          f"p75={overall['edit_pcts'][3]:.1f}  "
-          f"p90={overall['edit_pcts'][4]:.1f}  "
-          f"p95={overall['edit_pcts'][5]:.1f}")
-    print(f"  set_diff   p50={overall['set_diff_pcts'][2]:.1f}  "
-          f"p75={overall['set_diff_pcts'][3]:.1f}  "
-          f"p90={overall['set_diff_pcts'][4]:.1f}")
+    for label, key in (
+        ("tok_edit  ", "tok_edit_pcts"),
+        ("editor_ops", "editor_ops_pcts"),
+        ("n_hunks   ", "n_hunks_pcts"),
+        ("set_diff  ", "set_diff_pcts"),
+    ):
+        p = overall[key]
+        print(f"  {label} p50={p[2]:.1f}  p75={p[3]:.1f}  "
+              f"p90={p[4]:.1f}  p95={p[5]:.1f}")
     print(f"  len1       p50={overall['len1_pcts'][2]:.1f}  "
           f"len2 p50={overall['len2_pcts'][2]:.1f}")
-    # Print histogram in label order (0, 1, 2, ..., 20, 21-50, 51+).
-    print("  edit hist (overall):")
-    n_overall = overall["n"]
-    cum = 0
-    for label in overall["edit_hist_labels"]:
-        c = overall["edit_hist"].get(label, 0)
-        if c == 0 and label in ("21-50", "51+", "other"):
-            continue
-        cum += c
-        print(f"    {label:>5} : {c:>5}  ({100.0*c/n_overall:5.1f}%, "
-              f"cum {100.0*cum/n_overall:5.1f}%)")
+    print(f"  op-type totals: REPL={overall['op_totals']['REPL']} "
+          f"({100*overall['op_ratio']['REPL']:.1f}%)  "
+          f"INS={overall['op_totals']['INS']} "
+          f"({100*overall['op_ratio']['INS']:.1f}%)  "
+          f"DEL={overall['op_totals']['DEL']} "
+          f"({100*overall['op_ratio']['DEL']:.1f}%)")
+
+    def _print_hist(title: str, hist_key: str, labels_key: str):
+        print(f"  {title}:")
+        n_overall = overall["n"]
+        cum = 0
+        for label in overall[labels_key]:
+            c = overall[hist_key].get(label, 0)
+            if c == 0 and label in ("21-50", "51+", "other"):
+                continue
+            cum += c
+            print(f"    {label:>5} : {c:>5}  ({100.0*c/n_overall:5.1f}%, "
+                  f"cum {100.0*cum/n_overall:5.1f}%)")
+
+    _print_hist("tok_edit hist (overall)",
+                "tok_edit_hist", "tok_edit_hist_labels")
+    _print_hist("editor_ops hist (overall)",
+                "editor_ops_hist", "editor_ops_hist_labels")
+    _print_hist("n_hunks hist (overall)  -- compare vs SAE-LEWIS buckets",
+                "n_hunks_hist", "n_hunks_hist_labels")
 
 
 if __name__ == "__main__":
