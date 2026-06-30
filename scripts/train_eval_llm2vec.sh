@@ -30,6 +30,9 @@
 #   LLM2VEC_DIR          MNTP 出力先 (default: $RUN_DIR/llm2vec)
 #   SIMCSE_DIR           SimCSE 出力先 (default: $RUN_DIR/llm2vec_simcse)
 #   EVAL_DIR             評価出力先  (default: $RUN_DIR/eval)
+#   SHARED_CACHE_ROOT    Dolma cache の共通ルート (default: ./shared_cache)。
+#                         RUN_DIR の外に置くので FORCE_FRESH=1 でも残る。
+#   DOLMA_CACHE          Dolma shards (default: $SHARED_CACHE_ROOT/dolma)
 #   DEVICE               cuda | cpu  (default: cuda)
 #   SEED                 (default: 42)
 #
@@ -158,7 +161,12 @@ fi
 mkdir -p "$RUN_DIR"
 LOG_DIR="$RUN_DIR/logs"
 mkdir -p "$LOG_DIR"
-DOLMA_CACHE="$RUN_DIR/dolma_cache"
+
+# Shared Dolma cache OUTSIDE $RUN_DIR — bytes are identical regardless of
+# training config, so re-downloading per-run is pure waste. FORCE_FRESH=1
+# does NOT wipe this. Override DOLMA_CACHE explicitly to put it per-run.
+SHARED_CACHE_ROOT=${SHARED_CACHE_ROOT:-"./shared_cache"}
+DOLMA_CACHE=${DOLMA_CACHE:-"$SHARED_CACHE_ROOT/dolma"}
 
 SUMMARY="$RUN_DIR/timing.tsv"
 if [[ ! -f "$SUMMARY" ]]; then

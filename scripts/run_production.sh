@@ -26,6 +26,13 @@
 #   RUN_DIR                 output root (DEFAULT: ./runs/prod -- NOT
 #                            timestamped, so re-running the same command
 #                            resumes the same run)
+#   SHARED_CACHE_ROOT       root for Dolma + SAE caches; SHARED across runs
+#                            (default: ./shared_cache). Override to put on
+#                            a fast scratch disk.
+#   DOLMA_CACHE             Dolma shard dir (default: $SHARED_CACHE_ROOT/dolma)
+#   SAE_CACHE               SAE cache dir; keyed by (LLM, SAE path, max-sents)
+#                            so multiple configs coexist as siblings
+#                            (default: $SHARED_CACHE_ROOT/sae/<key>)
 #   DEVICE                  cuda | cpu (default: cuda)
 #   SEED                    (default: 42)
 #
@@ -151,8 +158,25 @@ GPU_MON_PID=
 GPU_MON_FILE=
 trap 'if [[ -n "${GPU_MON_PID:-}" ]]; then kill "$GPU_MON_PID" 2>/dev/null || true; fi' EXIT
 
-DOLMA_CACHE="$RUN_DIR/dolma_cache"
-SAE_CACHE="$RUN_DIR/sae_cache"
+# --------------------------------------------------------------------------- #
+# Shared caches (deliberately OUTSIDE $RUN_DIR so they survive FORCE_FRESH
+# and are reused across runs).
+#   - Dolma shards   : identical bytes regardless of training config
+#   - SAE features   : reusable when (LLM, SAE config, max-sentences) match;
+#                       precompute_sae.py has all-or-nothing resume keyed on
+#                       meta.json, so we key the path on the same fields and
+#                       let mismatching configs coexist in sibling dirs.
+# Override SHARED_CACHE_ROOT to redirect both to a scratch disk:
+#   SHARED_CACHE_ROOT=/scratch/$USER bash scripts/run_production.sh
+# --------------------------------------------------------------------------- #
+SHARED_CACHE_ROOT=${SHARED_CACHE_ROOT:-"./shared_cache"}
+DOLMA_CACHE=${DOLMA_CACHE:-"$SHARED_CACHE_ROOT/dolma"}
+
+_LLM_SLUG="$(echo "$LLM" | tr '/' '-')"
+_SAE_PATH_SLUG="$(dirname "$SAE_PATH" | tr '/' '-')"
+SAE_CACHE_KEY="${_LLM_SLUG}_${_SAE_PATH_SLUG}_n${SAE_MAX_SENTS}"
+SAE_CACHE=${SAE_CACHE:-"$SHARED_CACHE_ROOT/sae/$SAE_CACHE_KEY"}
+
 LLM2VEC_DIR="$RUN_DIR/llm2vec"
 SIMCSE_DIR="$RUN_DIR/llm2vec_simcse"
 CORRUPTION_DIR="$RUN_DIR/corruption"
@@ -507,8 +531,11 @@ banner "[prod] DONE"
 printf 'Total wall time this invocation: %dh%02dm%02ds\n' \
     $((TOTAL / 3600)) $(((TOTAL % 3600) / 60)) $((TOTAL % 60))
 echo
+echo "Shared caches (outside $RUN_DIR — reused across runs):"
+echo "  Dolma shards      : $DOLMA_CACHE"
+echo "  SAE features      : $SAE_CACHE"
+echo
 echo "Artifacts under $RUN_DIR:"
-echo "  SAE cache         : $SAE_CACHE"
 echo "  LLM2Vec MNTP      : $LLM2VEC_DIR"
 echo "  LLM2Vec MNTP+SimCSE: $SIMCSE_DIR  (skipped if SKIP_SIMCSE=1)"
 echo "  Downstream uses   : $DOWNSTREAM_LLM2VEC_DIR"

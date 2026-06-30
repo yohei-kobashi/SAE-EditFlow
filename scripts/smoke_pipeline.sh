@@ -13,9 +13,17 @@
 #   bash scripts/smoke_pipeline.sh
 #   RUN_DIR=./runs/myrun bash scripts/smoke_pipeline.sh
 #   LLM2VEC_STEPS=500 BATCH_SIZE=8 bash scripts/smoke_pipeline.sh
+#   SHARED_CACHE_ROOT=/scratch/$USER bash scripts/smoke_pipeline.sh   # put
+#                                                                     # Dolma + SAE on scratch
 #
 # Environment variables (override any of these):
 #   RUN_DIR                 output root (default: ./runs/smoke-<ts>)
+#   SHARED_CACHE_ROOT       root for Dolma + SAE caches; SHARED across runs
+#                            (default: ./shared_cache)
+#   DOLMA_CACHE             Dolma shard dir (default: $SHARED_CACHE_ROOT/dolma)
+#   SAE_CACHE               SAE cache dir; keyed by (LLM, SAE path, max-sents)
+#                            so smoke / prod / different SAE configs coexist
+#                            (default: $SHARED_CACHE_ROOT/sae/<key>)
 #   DEVICE                  cuda | cpu (default: cuda)
 #   SEED                    (default: 42)
 #   DOLMA_MAX_FILES         # of Dolma shards to download (default: 1)
@@ -164,8 +172,25 @@ GPU_MON_PID=
 GPU_MON_FILE=
 trap 'if [[ -n "${GPU_MON_PID:-}" ]]; then kill "$GPU_MON_PID" 2>/dev/null || true; fi' EXIT
 
-DOLMA_CACHE="$RUN_DIR/dolma_cache"
-SAE_CACHE="$RUN_DIR/sae_cache"
+# --------------------------------------------------------------------------- #
+# Shared caches (deliberately OUTSIDE $RUN_DIR so they survive FORCE_FRESH
+# and are reused across runs).
+#   - Dolma shards   : identical bytes regardless of training config
+#   - SAE features   : reusable when (LLM, SAE config, max-sentences) match;
+#                       precompute_sae.py has all-or-nothing resume keyed on
+#                       meta.json, so we key the path on the same fields and
+#                       let mismatching configs coexist in sibling dirs.
+# Override SHARED_CACHE_ROOT to redirect both to a scratch disk:
+#   SHARED_CACHE_ROOT=/scratch/$USER bash scripts/smoke_pipeline.sh
+# --------------------------------------------------------------------------- #
+SHARED_CACHE_ROOT=${SHARED_CACHE_ROOT:-"./shared_cache"}
+DOLMA_CACHE=${DOLMA_CACHE:-"$SHARED_CACHE_ROOT/dolma"}
+
+_LLM_SLUG="$(echo "$LLM" | tr '/' '-')"
+_SAE_PATH_SLUG="$(dirname "$SAE_PATH" | tr '/' '-')"
+SAE_CACHE_KEY="${_LLM_SLUG}_${_SAE_PATH_SLUG}_n${SAE_MAX_SENTS}"
+SAE_CACHE=${SAE_CACHE:-"$SHARED_CACHE_ROOT/sae/$SAE_CACHE_KEY"}
+
 LLM2VEC_DIR="$RUN_DIR/llm2vec"
 SIMCSE_DIR="$RUN_DIR/llm2vec_simcse"
 CORRUPTION_DIR="$RUN_DIR/corruption"
