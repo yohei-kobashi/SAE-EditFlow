@@ -57,9 +57,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from model import _patch_attention_bidirectional  # type: ignore  # noqa: E402
 
 
-# CoNLL-2003 label set (HF datasets convention).
-CONLL2003_LABELS = ["O", "B-PER", "I-PER", "B-ORG", "I-ORG",
-                    "B-LOC", "I-LOC", "B-MISC", "I-MISC"]
+# CoNLL-2003 label set used as fallback when the dataset doesn't expose
+# `features["ner_tags"].feature.names`. Modern parquet mirrors do expose
+# them; we auto-detect at load time.
+CONLL2003_LABELS_FALLBACK = ["O", "B-PER", "I-PER", "B-ORG", "I-ORG",
+                              "B-LOC", "I-LOC", "B-MISC", "I-MISC"]
 LABEL_PAD = -100   # CE ignore_index
 
 
@@ -81,12 +83,18 @@ def parse_args():
     p.add_argument("--no-bidir", dest="bidir", action="store_false",
                    help="Plain causal forward — useful for measuring the "
                         "base LLM in its native mode.")
-    p.add_argument("--dataset", default="conll2003",
-                   help="HF dataset id. Defaults to conll2003 (no auth needed). "
-                        "Use `tner/wikiann` + --dataset-config en for the "
-                        "multilingual fallback.")
+    p.add_argument("--dataset", default="eriktks/conll2003",
+                   help="HF dataset id. Default `eriktks/conll2003` is a "
+                        "parquet-format mirror of CoNLL-2003 (the legacy "
+                        "`conll2003` uses a Python script that newer "
+                        "datasets versions refuse to load). Alternatives: "
+                        "`tomaarsen/conll2003`, `conllpp`, `tner/wikiann` "
+                        "with --dataset-config en.")
     p.add_argument("--dataset-config", default=None,
                    help="Optional dataset config (e.g. 'en' for wikiann).")
+    p.add_argument("--tags-field", default="ner_tags",
+                   help="Field name holding the per-token tag ids. "
+                        "Some mirrors use `tags` instead of `ner_tags`.")
 
     # Per-token probe hyperparameters. Paper-style defaults (small linear
     # head over a 2-3K-d hidden state on a few-K-example dataset converges
@@ -118,7 +126,7 @@ def _dtype(s: str) -> torch.dtype:
 # word's NER tag; subsequent subwords + all special tokens are set to -100
 # (LABEL_PAD) so they don't contribute to the CE loss.
 # --------------------------------------------------------------------------- #
-def _tokenize_and_align(examples, tokenizer, max_length: int):
+def _tokenize_and_align(examples, tokenizer, max_length: int, tags_field: str):
     tokenized = tokenizer(
         examples["tokens"],
         is_split_into_words=True,
@@ -127,7 +135,7 @@ def _tokenize_and_align(examples, tokenizer, max_length: int):
         padding=False,                # padded at collate time
     )
     labels = []
-    for i, word_labels in enumerate(examples["ner_tags"]):
+    for i, word_labels in enumerate(examples[tags_field]):
         word_ids = tokenized.word_ids(batch_index=i)
         prev = None
         seq = []
@@ -250,16 +258,52 @@ def main():
     dtype = _dtype(args.dtype)
 
     # ---- Dataset ----------------------------------------------------------
-    print(f"[ner] loading dataset {args.dataset}"
-          + (f" (config={args.dataset_config})" if args.dataset_config else ""))
+    # Try the requested dataset first, then fall back through a chain of
+    # parquet mirrors so we don't fail just because one mirror went down or
+    # got renamed.
     from datasets import load_dataset  # local import to keep startup snappy
-    if args.dataset_config:
-        ds = load_dataset(args.dataset, args.dataset_config)
-    else:
-        ds = load_dataset(args.dataset)
-    print(f"[ner] splits: train={len(ds['train'])} "
-          f"val={len(ds['validation'])} test={len(ds['test'])}")
-    n_labels = len(CONLL2003_LABELS)
+    candidates = [args.dataset]
+    fallbacks = ["eriktks/conll2003", "tomaarsen/conll2003", "conllpp"]
+    for f in fallbacks:
+        if f not in candidates:
+            candidates.append(f)
+    ds = None
+    chosen = None
+    last_err: Optional[Exception] = None
+    for cand in candidates:
+        try:
+            print(f"[ner] loading dataset {cand}"
+                  + (f" (config={args.dataset_config})" if args.dataset_config else ""))
+            if args.dataset_config:
+                ds = load_dataset(cand, args.dataset_config)
+            else:
+                ds = load_dataset(cand)
+            chosen = cand
+            break
+        except Exception as e:
+            print(f"[ner]   {cand} failed: {type(e).__name__}: {e}")
+            last_err = e
+    if ds is None:
+        raise RuntimeError(
+            f"All dataset candidates failed: {candidates}. Last error: {last_err}"
+        )
+    print(f"[ner] using {chosen}: splits "
+          f"train={len(ds['train'])} val={len(ds['validation'])} test={len(ds['test'])}")
+
+    # Auto-detect label names from the dataset features when possible —
+    # different mirrors may use slightly different orderings.
+    label_names = list(CONLL2003_LABELS_FALLBACK)
+    try:
+        feat = ds["train"].features[args.tags_field]
+        if hasattr(feat, "feature") and hasattr(feat.feature, "names"):
+            label_names = list(feat.feature.names)
+        elif hasattr(feat, "names"):
+            label_names = list(feat.names)
+        print(f"[ner] detected label set ({len(label_names)}): {label_names}")
+    except (KeyError, AttributeError) as e:
+        print(f"[ner] could not auto-detect labels ({e}); "
+              f"falling back to CoNLL-2003 fixed set")
+    n_labels = len(label_names)
 
     # ---- Encoder + tokenizer ---------------------------------------------
     model, tokenizer = _load_encoder(args.encoder, dtype, args.device, args.bidir)
@@ -273,7 +317,9 @@ def main():
     for split in ("train", "validation", "test"):
         # Bring the HF Dataset into a dict-of-lists in one shot.
         as_dict = ds[split][:]
-        tokenized[split] = _tokenize_and_align(as_dict, tokenizer, args.max_seq_length)
+        tokenized[split] = _tokenize_and_align(
+            as_dict, tokenizer, args.max_seq_length, args.tags_field,
+        )
         n_tokens_with_label = sum(
             sum(1 for x in seq if x != LABEL_PAD)
             for seq in tokenized[split]["labels"]
@@ -363,8 +409,8 @@ def main():
                         continue
                     p_ids.append(p)
                     l_ids.append(l)
-                    p_str.append(CONLL2003_LABELS[p])
-                    l_str.append(CONLL2003_LABELS[l])
+                    p_str.append(label_names[p])
+                    l_str.append(label_names[l])
                 all_pred_ids.append(p_ids)
                 all_label_ids.append(l_ids)
                 all_pred_seqs.append(p_str)
@@ -392,8 +438,11 @@ def main():
     results = {
         "encoder": args.encoder,
         "bidirectional_patch": bool(args.bidir),
-        "dataset": args.dataset,
+        "dataset": chosen,
+        "dataset_requested": args.dataset,
         "dataset_config": args.dataset_config,
+        "tags_field": args.tags_field,
+        "labels": label_names,
         "entity_f1": float(entity_f1) if not np.isnan(entity_f1) else None,
         "token_macro_f1_non_o": float(token_macro_f1),
         "n_train": int(len(train_examples)),
