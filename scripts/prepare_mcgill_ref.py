@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Dict
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -89,21 +90,24 @@ def _peek_adapter_config(adapter_repo: str) -> dict:
 
 def _load_adapter_with_remap(model, adapter_repo: str, adapter_name: str = "default"):
     """Manually load LoRA weights from `adapter_model.safetensors`, remapping
-    legacy keys (saved without `.{adapter_name}.` infix by older PEFT
-    versions) to the format current PEFT expects.
+    legacy keys to the format current PEFT expects.
 
-    Old PEFT (≤ 0.6) saved adapter weights as
-        base_model.model.<base_path>.lora_A.weight
-    Current PEFT (≥ 0.7) expects
-        base_model.model.<base_path>.lora_A.{adapter_name}.weight
-    The mismatch means PeftModel.from_pretrained creates the LoRA modules
-    correctly (so trainable_params count looks right) but silently leaves
-    lora_A at Kaiming init and lora_B at zero — merge → no-op.
+    Two known mismatches in McGill's checkpoints:
+      1. Missing `.{adapter_name}.` infix (older PEFT save format).
+      2. Missing one `.model.` level: McGill saved with LoRA attached to
+         the inner MistralModel directly, so keys read
+            base_model.model.layers.X.<sub>.lora_A.weight
+         while PEFT-on-MistralForCausalLM expects
+            base_model.model.model.layers.X.<sub>.lora_A.{name}.weight
+         (one extra `model.` because the LoRA is wrapped inside the outer
+         CausalLM's `.model` attribute).
 
-    This helper hot-patches the weights AFTER PEFT has built the module
-    tree, so the merge sees the real adapter.
+    The helper auto-detects the expected prefix from the live model's
+    state_dict, then transforms each safetensors key by computing the
+    prefix difference. This avoids hard-coding the missing-`.model.`
+    pattern (which would break for future adapters with other layouts).
 
-    Returns the number of remapped keys that landed in the model.
+    Returns the number of keys actually loaded.
     """
     import re
     from huggingface_hub import hf_hub_download
@@ -112,44 +116,80 @@ def _load_adapter_with_remap(model, adapter_repo: str, adapter_name: str = "defa
     weights_path = hf_hub_download(adapter_repo, filename="adapter_model.safetensors")
     raw = load_file(weights_path)
 
-    sample_keys = list(raw.items())[:3]
+    sample_keys = list(raw.items())[:2]
     print(f"[mcgill]   safetensors sample keys: {[k for k, _ in sample_keys]}")
 
-    # Detect format: do keys already contain `.{adapter_name}.`?
-    have_adapter_infix = any(f".lora_A.{adapter_name}.weight" in k for k in raw)
-    if have_adapter_infix:
-        print(f"[mcgill]   keys already have .{adapter_name}. infix — no remap needed")
+    # Discover the expected key format from the live PEFT model.
+    expected_lora_keys = [k for k in model.state_dict() if "lora_" in k]
+    sample_expected = expected_lora_keys[:2] if expected_lora_keys else []
+    print(f"[mcgill]   PEFT-expected sample keys: {sample_expected}")
+    if not expected_lora_keys:
+        print("[mcgill]   WARNING: live model has no lora_* keys — wrap step failed?")
+        return 0
+
+    # Use a representative pair to learn the structural transformation:
+    # safetensors key → expected key. Pick a layer-0 q_proj entry from each.
+    def _pick(keys, sub: str, suffix: str):
+        for k in keys:
+            if sub in k and k.endswith(suffix):
+                return k
+        return None
+
+    src_key = _pick(list(raw.keys()), "layers.0", "q_proj.lora_A.weight")
+    if src_key is None:
+        # Fall back: any layer-0 lora_A.
+        src_key = next((k for k in raw if "layers.0" in k and "lora_A" in k), None)
+    dst_key = _pick(expected_lora_keys, "layers.0",
+                    f"q_proj.lora_A.{adapter_name}.weight")
+    if dst_key is None:
+        dst_key = next(
+            (k for k in expected_lora_keys
+             if "layers.0" in k and "lora_A" in k
+             and f".{adapter_name}." in k),
+            None,
+        )
+    print(f"[mcgill]   sample mapping: {src_key}\n"
+          f"                      -> {dst_key}")
+    if src_key is None or dst_key is None:
+        print("[mcgill]   could not derive remap; loading raw with no transform")
         remapped = raw
     else:
-        # Legacy format: insert the adapter name between lora_A/lora_B and `.weight`.
-        pat = re.compile(r"(lora_[AB])\.weight$")
-        remapped = {}
+        # Compute the prefix and suffix transforms. We split each key into
+        # (prefix, tail-after-`layers.0`) and (head, suffix-after-`lora_A`).
+        # Then apply: new = dst_prefix + src_middle + dst_suffix.
+        src_pre, src_mid = src_key.split("layers.0", 1)
+        dst_pre, dst_mid = dst_key.split("layers.0", 1)
+        # src_mid: ".self_attn.q_proj.lora_A.weight"
+        # dst_mid: ".self_attn.q_proj.lora_A.default.weight"
+        # The structural change is prefix-only AND lora_A/B suffix.
+        src_lora_pat = re.compile(r"(lora_[AB])\.weight$")
+        dst_lora_pat = f"\\1.{adapter_name}.weight"
+        remapped: Dict[str, torch.Tensor] = {}
         for k, v in raw.items():
-            new_k = pat.sub(rf"\1.{adapter_name}.weight", k)
+            if not k.startswith(src_pre):
+                # Unfamiliar key — keep as is (lets non-lora_* keys pass through).
+                remapped[k] = v
+                continue
+            new_k = dst_pre + k[len(src_pre):]
+            new_k = src_lora_pat.sub(dst_lora_pat, new_k)
             remapped[new_k] = v
-        print(f"[mcgill]   remapped {len(remapped)} keys to add .{adapter_name}. infix")
+        print(f"[mcgill]   remapped {len(remapped)} keys "
+              f"(prefix {src_pre!r} → {dst_pre!r}, "
+              f"+infix .{adapter_name}.)")
 
-    # Use the peft helper if available — it handles a few more edge cases
-    # (e.g. base_model.model vs base_model prefix differences) than plain
-    # nn.Module.load_state_dict.
-    try:
-        from peft.utils.save_and_load import set_peft_model_state_dict
-        # `set_peft_model_state_dict` already strips the `base_model.model.`
-        # prefix for us; pass the dict as-is.
-        out = set_peft_model_state_dict(model, remapped, adapter_name=adapter_name)
-        # Newer peft returns IncompatibleKeys, older returns None.
-        if hasattr(out, "missing_keys"):
-            missing = len(out.missing_keys)
-            unexpected = len(out.unexpected_keys)
-        else:
-            missing = unexpected = "?"
-    except ImportError:
-        out = model.load_state_dict(remapped, strict=False)
-        missing = len(out.missing_keys)
-        unexpected = len(out.unexpected_keys)
-    print(f"[mcgill]   set_peft_model_state_dict: missing={missing}, "
-          f"unexpected={unexpected}")
-    return len(remapped)
+    # Load directly via state_dict; bypassing set_peft_model_state_dict
+    # because it does its own (different) prefix stripping which conflicts
+    # with our hand-computed remap.
+    out = model.load_state_dict(remapped, strict=False)
+    missing = len(out.missing_keys)
+    unexpected = len(out.unexpected_keys)
+    loaded = sum(1 for k in remapped if k in model.state_dict())
+    print(f"[mcgill]   load_state_dict: missing={missing}, "
+          f"unexpected={unexpected}, matched={loaded}")
+    if loaded == 0:
+        print("[mcgill]   first 3 missing : ", list(out.missing_keys)[:3])
+        print("[mcgill]   first 3 unexpected: ", list(out.unexpected_keys)[:3])
+    return loaded
 
 
 def main():
