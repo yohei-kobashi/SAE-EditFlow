@@ -190,7 +190,7 @@ def iter_sentences(
     min_chars: int = 16,
     max_chars: int = 2000,
     max_sentences_per_text: Optional[int] = None,
-    sample_strategy: str = "head",
+    sample_strategy: str = "random",
     seed: int = 42,
     quality_filter: bool = True,
     quality_kwargs: Optional[Dict] = None,

@@ -70,7 +70,11 @@ def parse_args():
                    help="Cap on qualifying sentences kept per source document. "
                         "None = use every sentence.")
     p.add_argument("--sentence-sample-strategy",
-                   choices=["head", "random", "stride"], default="head")
+                   choices=["head", "random", "stride"], default="random",
+                   help="Per-document sampling when --max-sentences-per-text "
+                        "is set. Default 'random' to avoid the lead-bias of "
+                        "'head'. No effect when --max-sentences-per-text is "
+                        "None.")
     p.add_argument("--no-quality-filter", action="store_true",
                    help="Disable the looks-like-sentence heuristic filter.")
 
@@ -119,7 +123,7 @@ class DolmaSentenceTokenStream(IterableDataset):
         sent_min_chars: int = 16,
         sent_max_chars: int = 2000,
         max_sentences_per_text: Optional[int] = None,
-        sample_strategy: str = "head",
+        sample_strategy: str = "random",
         seed: int = 42,
         quality_filter: bool = True,
     ):

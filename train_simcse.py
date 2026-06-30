@@ -178,7 +178,7 @@ class DolmaSentenceStream(IterableDataset):
             min_chars=self.sent_min_chars,
             max_chars=self.sent_max_chars,
             max_sentences_per_text=None,
-            sample_strategy="head",
+            sample_strategy="random",
             seed=worker_seed,
             quality_filter=self.quality_filter,
         )

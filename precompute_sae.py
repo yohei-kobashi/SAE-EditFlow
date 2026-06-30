@@ -62,7 +62,12 @@ def parse_args():
                    help="Cap on qualifying sentences kept per source document. "
                         "None = use every sentence.")
     p.add_argument("--sentence-sample-strategy",
-                   choices=["head", "random", "stride"], default="head")
+                   choices=["head", "random", "stride"], default="random",
+                   help="Per-document sampling when --max-sentences-per-text "
+                        "is set. Default 'random' to avoid the lead-bias of "
+                        "'head' (document-initial sentences are often titles / "
+                        "lead-ins). Strategy has no effect when "
+                        "--max-sentences-per-text is None.")
     p.add_argument("--no-quality-filter", action="store_true",
                    help="Disable the looks-like-sentence heuristic filter.")
     p.add_argument("--batch-size", type=int, default=32)

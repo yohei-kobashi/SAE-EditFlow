@@ -159,9 +159,13 @@ def collect_sentences(args, tokenizer) -> List[str]:
         min_chars=16,
         max_chars=2000,
         max_sentences_per_text=None,
-        sample_strategy="head",
+        sample_strategy="random",
         # Distinct seed so held-out sentences don't overlap with any
         # training-time stream that used --seed args.seed.
+        # NB: with max_sentences_per_text=None the strategy has no effect on
+        # sentence selection (all sentences are yielded in order). Leakage
+        # vs the training stream is bounded by `--max-files 1` (eval reads
+        # only the first shard) + the seed offset above.
         seed=args.seed + 9999,
         quality_filter=True,
     ):

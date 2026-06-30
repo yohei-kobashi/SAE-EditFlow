@@ -132,7 +132,10 @@ def parse_args():
     p.add_argument("--sent-max-tokens", type=int, default=256)
     p.add_argument("--max-sentences-per-text", type=int, default=None)
     p.add_argument("--sentence-sample-strategy",
-                   choices=["head", "random", "stride"], default="head")
+                   choices=["head", "random", "stride"], default="random",
+                   help="Per-document sampling when --max-sentences-per-text "
+                        "is set. Default 'random' to avoid lead-bias. No "
+                        "effect when --max-sentences-per-text is None.")
     p.add_argument("--no-quality-filter", action="store_true")
     p.add_argument("--quality-min-words", type=int, default=3)
     p.add_argument("--quality-min-alpha-ratio", type=float, default=0.5)
