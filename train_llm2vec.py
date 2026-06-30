@@ -80,25 +80,53 @@ def parse_args():
 
     p.add_argument("--per-device-batch-size", type=int, default=8)
     p.add_argument("--grad-accum-steps", type=int, default=4)
-    # LR / warmup calibrated to the canonical "full fine-tune Gemma-2B
-    # under bf16" stable range. The previous (5e-5, 500-step warmup)
-    # default blew up at the LR peak: loss dipped 5.0 → 4.3 during
-    # warmup, then climbed back to 5.4 the moment the LR hit 5e-5, and
-    # never recovered. 1e-5 with 1000-step warmup keeps the loss
-    # monotonic-ish through the LR peak. Canonical LLM2Vec uses LoRA
-    # + LR=3e-4, which we are NOT doing — full FT requires a much
-    # lower LR.
-    p.add_argument("--learning-rate", type=float, default=1e-5)
-    p.add_argument("--max-steps", type=int, default=10000)
-    p.add_argument("--warmup-steps", type=int, default=1000)
-    p.add_argument("--save-steps", type=int, default=1000)
+
+    # ---- LoRA controls ----------------------------------------------------
+    # Canonical LLM2Vec uses LoRA. Empirical evidence on Gemma-2B: full
+    # fine-tune ended at MNTP loss ≈ 4.6 and STS-B Spearman ≈ 0.43 (no
+    # better than the base LM). Switching to LoRA hits the paper's range.
+    p.add_argument("--use-lora", dest="use_lora", action="store_true",
+                   default=True,
+                   help="Default. Canonical LLM2Vec recipe — train a LoRA "
+                        "adapter on top of the frozen base, then merge it "
+                        "into the saved checkpoint.")
+    p.add_argument("--no-use-lora", dest="use_lora", action="store_false",
+                   help="Full fine-tune (every parameter trainable). NOT "
+                        "canonical; reproduce only for ablation. Adjust LR "
+                        "down to ~1e-5 — the LoRA default 3e-4 will blow up.")
+    p.add_argument("--lora-r", type=int, default=16,
+                   help="LoRA rank (LLM2Vec paper default).")
+    p.add_argument("--lora-alpha", type=int, default=32,
+                   help="LoRA scaling factor (paper default).")
+    p.add_argument("--lora-dropout", type=float, default=0.05)
+    p.add_argument("--lora-target-modules", nargs="+",
+                   default=["q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj"],
+                   help="Modules to LoRA-fy. Gemma-2's attention + MLP linear "
+                        "projections; matches the canonical LLM2Vec list.")
+
+    # LR / max_steps defaults are tuned to the LoRA path (3e-4 / 1000 steps =
+    # paper recipe). For --no-use-lora override both at the CLI: 1e-5 / 10000
+    # steps is the empirically-stable full-FT range.
+    p.add_argument("--learning-rate", type=float, default=3e-4,
+                   help="Default tuned for --use-lora (canonical LLM2Vec = "
+                        "3e-4 with LoRA r=16, warmup ≈ 10%% of max_steps). "
+                        "When passing --no-use-lora, override to ~1e-5 — "
+                        "full-FT Gemma-2B at LoRA's LR blows up at the LR "
+                        "peak (we saw 5.0 → 4.3 → 5.4 → stuck).")
+    p.add_argument("--max-steps", type=int, default=1000,
+                   help="Canonical LLM2Vec MNTP recipe trains for ~1k LoRA "
+                        "steps on Wikipedia. Override to 10000 for full FT.")
+    p.add_argument("--warmup-steps", type=int, default=100)
+    p.add_argument("--save-steps", type=int, default=500)
     p.add_argument("--logging-steps", type=int, default=50)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--llm-dtype", default="bfloat16")
     p.add_argument("--gradient-checkpointing", action="store_true")
     p.add_argument("--seed", type=int, default=42)
     # Resume: default ON. HF Trainer auto-detects the latest checkpoint-*
-    # directory in --output-dir (model + optim + sched + RNG state).
+    # directory in --output-dir (model + optim + sched + RNG state, plus
+    # LoRA adapter state when training a PeftModel).
     p.add_argument("--resume", dest="resume", action="store_true", default=True,
                    help="Default. Resume from the latest checkpoint-* under "
                         "--output-dir if one exists.")
@@ -223,6 +251,30 @@ def main():
     _patch_attention_bidirectional(model.model)
     model.config.use_cache = False
 
+    # ---- LoRA wrapping (canonical LLM2Vec recipe) -------------------------
+    # Done AFTER the bidir patch — peft only rewires the linear projections
+    # (q/k/v/o/gate/up/down) and doesn't touch GemmaModel._update_causal_mask
+    # or per-attention-module is_causal flags, so the patch survives the
+    # PEFT wrap. The same GemmaModel instance lives at
+    # peft_model.base_model.model.model after wrapping; its patched methods
+    # are preserved (they're bound to the instance, not the class).
+    if args.use_lora:
+        from peft import LoraConfig, TaskType, get_peft_model
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=list(args.lora_target_modules),
+            bias="none",
+        )
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+        # PEFT silently switches off gradient on the base — keep that
+        # behaviour but explicitly disable cache (mirrors the line above
+        # for the non-LoRA branch).
+        model.base_model.model.config.use_cache = False
+
     shard_paths = download_dolma_shards(args.data_cache_dir, max_files=args.max_files)
     dataset = DolmaSentenceTokenStream(
         shard_paths, tokenizer,
@@ -289,6 +341,12 @@ def main():
     trainer.train(resume_from_checkpoint=resume_arg)
 
     out_dir = Path(args.output_dir)
+    # Merge LoRA into the base before saving so downstream stages (corruption,
+    # tagger, editor, eval) load a plain HF GemmaForCausalLM via
+    # AutoModelForCausalLM.from_pretrained — no PEFT-awareness needed.
+    if args.use_lora:
+        print("[llm2vec] merging LoRA adapter into base model...")
+        model = model.merge_and_unload()
     model.save_pretrained(out_dir, safe_serialization=False)
     tokenizer.save_pretrained(out_dir)
     (out_dir / "llm2vec_meta.json").write_text(json.dumps({
@@ -301,6 +359,13 @@ def main():
         "ins_token_id": tokenizer.convert_tokens_to_ids("[INS]"),
         "del_token_id": tokenizer.convert_tokens_to_ids("[DEL]"),
         "seed": args.seed,
+        "lora": ({
+            "r": int(args.lora_r),
+            "alpha": int(args.lora_alpha),
+            "dropout": float(args.lora_dropout),
+            "target_modules": list(args.lora_target_modules),
+            "merged": True,
+        } if args.use_lora else None),
         # # of Dolma shards (from URL-list head) consumed by training. Used
         # by `eval_llm2vec.py` to choose held-out shards via
         # `start_index=dolma_max_files`. `None` = streamed every available

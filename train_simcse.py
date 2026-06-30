@@ -98,21 +98,43 @@ def parse_args():
     p.add_argument("--temperature", type=float, default=0.05,
                    help="NT-Xent temperature τ. 0.05 is Gao et al. (2021).")
 
+    # ---- LoRA controls (canonical LLM2Vec stacks a NEW LoRA on top of the
+    # MNTP-merged base for SimCSE) -----------------------------------------
+    p.add_argument("--use-lora", dest="use_lora", action="store_true",
+                   default=True,
+                   help="Default — train a fresh LoRA adapter for SimCSE on "
+                        "top of the (already MNTP-merged) base. Merged into "
+                        "the saved checkpoint at the end.")
+    p.add_argument("--no-use-lora", dest="use_lora", action="store_false",
+                   help="Full fine-tune. Override --learning-rate down to "
+                        "~1e-6 — the LoRA default 3e-5 blows up otherwise.")
+    p.add_argument("--lora-r", type=int, default=16)
+    p.add_argument("--lora-alpha", type=int, default=32)
+    p.add_argument("--lora-dropout", type=float, default=0.05)
+    p.add_argument("--lora-target-modules", nargs="+",
+                   default=["q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj"])
+
     # Batch / steps. Larger per-device batch = more negatives = better SimCSE.
     # grad-accum does NOT help here (negatives come from the same forward pass,
     # not from accumulated micro-batches), so leave accum=1 unless you need
     # gradient stability.
-    p.add_argument("--per-device-batch-size", type=int, default=32)
+    p.add_argument("--per-device-batch-size", type=int, default=128,
+                   help="Canonical SimCSE recipe uses 128 in-batch negatives. "
+                        "Reduce to 32 if you OOM under full FT or on a small "
+                        "GPU; LoRA fits 128 comfortably on 80GB Gemma-2B.")
     p.add_argument("--grad-accum-steps", type=int, default=1,
                    help="Note: grad-accum does NOT increase SimCSE in-batch "
                         "negatives — those come only from per_device_batch. "
                         "Set >1 only for gradient noise smoothing.")
-    p.add_argument("--learning-rate", type=float, default=1e-6,
-                   help="Very low because we do FULL FT (vs canonical LoRA + "
-                        "3e-5). Mirrors MNTP's 5e-5 → 1e-5 lesson.")
-    p.add_argument("--max-steps", type=int, default=2000,
-                   help="SimCSE converges quickly; 1-2k optimizer steps is the "
-                        "typical paper recipe.")
+    p.add_argument("--learning-rate", type=float, default=3e-5,
+                   help="Default tuned for --use-lora (canonical LLM2Vec = "
+                        "3e-5 with LoRA). When passing --no-use-lora, "
+                        "override to ~1e-6 — the contrastive loss diverges "
+                        "at LoRA's LR under full FT.")
+    p.add_argument("--max-steps", type=int, default=1000,
+                   help="Canonical LLM2Vec SimCSE trains for ~1k LoRA steps "
+                        "on a Wikipedia subset.")
     p.add_argument("--warmup-steps", type=int, default=100)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -331,15 +353,17 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # ---- Decide load source: latest checkpoint-* or MNTP dir --------------
+    # ---- Always load the base from the MNTP-merged dir; LoRA adapters,
+    # if any, are stacked on top from the latest checkpoint-* -----------
     init_step = 0
-    init_source = args.llm2vec_dir
-    latest = _find_latest_ckpt_dir(out_dir) if args.resume else None
-    if latest is not None:
-        init_source, init_step = str(latest[0]), latest[1]
-        print(f"[simcse] RESUME: continuing from {init_source} (step {init_step})")
-    else:
-        print(f"[simcse] starting from MNTP ckpt: {init_source}")
+    ckpt_to_resume: Optional[Path] = None
+    if args.resume:
+        latest = _find_latest_ckpt_dir(out_dir)
+        if latest is not None:
+            ckpt_to_resume, init_step = latest[0], latest[1]
+            print(f"[simcse] RESUME: found {ckpt_to_resume} (step {init_step})")
+    if ckpt_to_resume is None:
+        print(f"[simcse] starting from MNTP ckpt: {args.llm2vec_dir}")
 
     # ---- Load model (AutoModelForCausalLM so the LM head — needed by ------
     # corruption.py for PPL — survives) -------------------------------------
@@ -348,17 +372,74 @@ def main():
         "float16": torch.float16,
         "float32": torch.float32,
     }[args.llm_dtype]
-    model = AutoModelForCausalLM.from_pretrained(
-        init_source,
+    base_model = AutoModelForCausalLM.from_pretrained(
+        args.llm2vec_dir,
         torch_dtype=dtype,
         attn_implementation="sdpa",
     )
     # Re-apply the bidirectional patch — it's not persisted as part of the
     # HF save (it's a monkey-patch on instance methods + flags).
-    _patch_attention_bidirectional(model.model)
-    model.config.use_cache = False
+    _patch_attention_bidirectional(base_model.model)
+    base_model.config.use_cache = False
 
-    # ---- Inject dropout into every attention module -----------------------
+    # ---- Wrap with LoRA (or resume an existing LoRA adapter) -------------
+    is_peft = False
+    if args.use_lora:
+        from peft import LoraConfig, PeftModel, TaskType, get_peft_model
+        if (ckpt_to_resume is not None
+                and (ckpt_to_resume / "adapter_config.json").exists()):
+            model = PeftModel.from_pretrained(
+                base_model, str(ckpt_to_resume), is_trainable=True,
+            )
+            print(f"[simcse] RESUME: loaded LoRA adapter from {ckpt_to_resume}")
+            is_peft = True
+        else:
+            if ckpt_to_resume is not None:
+                # The checkpoint exists but isn't a LoRA adapter — must be
+                # from a previous --no-use-lora run. Switching modes mid-
+                # training is unsupported; fail loudly so the user picks a
+                # fresh output dir or rolls back the flag.
+                raise RuntimeError(
+                    f"[simcse] found {ckpt_to_resume} but no adapter_config.json. "
+                    "Mixing --use-lora and --no-use-lora runs in the same "
+                    "--output-dir is not supported. Use a fresh --output-dir "
+                    "or pass --no-use-lora to match the existing checkpoint."
+                )
+            lora_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+                target_modules=list(args.lora_target_modules),
+                bias="none",
+            )
+            model = get_peft_model(base_model, lora_config)
+            print("[simcse] wrapped base with fresh LoRA adapter "
+                  f"(r={args.lora_r}, alpha={args.lora_alpha})")
+            is_peft = True
+        model.print_trainable_parameters()
+    else:
+        if ckpt_to_resume is not None:
+            if (ckpt_to_resume / "adapter_config.json").exists():
+                raise RuntimeError(
+                    f"[simcse] found a LoRA adapter at {ckpt_to_resume} but "
+                    "--no-use-lora was passed. Mixing modes is not supported."
+                )
+            # Full-FT resume: overwrite base weights with the checkpoint.
+            sd_path = ckpt_to_resume / "pytorch_model.bin"
+            if not sd_path.exists():
+                raise RuntimeError(
+                    f"[simcse] full-FT checkpoint {ckpt_to_resume} missing "
+                    "pytorch_model.bin"
+                )
+            base_model.load_state_dict(
+                torch.load(sd_path, map_location="cpu", weights_only=False)
+            )
+            print(f"[simcse] RESUME: loaded full state from {sd_path}")
+        model = base_model
+
+    # ---- Inject dropout into every attention module (post-LoRA so we hit
+    # the same Gemma attention instances PEFT wraps internally) -----------
     # Gemma-2 stores attention_dropout as a float on each attention module
     # (used by the SDPA path: dropout_p=self.attention_dropout if training).
     # The default is 0.0 → identical forwards → SimCSE collapses to log(B).
@@ -369,8 +450,9 @@ def main():
         ):
             module.attention_dropout = float(args.dropout)
             n_dropout_patched += 1
-    if hasattr(model.config, "attention_dropout"):
-        model.config.attention_dropout = float(args.dropout)
+    inner_cfg = base_model.config
+    if hasattr(inner_cfg, "attention_dropout"):
+        inner_cfg.attention_dropout = float(args.dropout)
     print(f"[simcse] dropout = {args.dropout}  ({n_dropout_patched} attention modules patched)")
     if n_dropout_patched == 0:
         print(
@@ -583,6 +665,11 @@ def _write_final(out_dir, model, tokenizer, args, final_step: int):
     block, so the same dir is a drop-in replacement.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Merge the LoRA adapter into the base so downstream stages load a
+    # plain HF GemmaForCausalLM via AutoModelForCausalLM.from_pretrained.
+    if args.use_lora and hasattr(model, "merge_and_unload"):
+        print("[simcse] merging LoRA adapter into base model...")
+        model = model.merge_and_unload()
     model.save_pretrained(out_dir, safe_serialization=False)
     tokenizer.save_pretrained(out_dir)
 
@@ -609,6 +696,13 @@ def _write_final(out_dir, model, tokenizer, args, final_step: int):
         "loss": "nt_xent (symmetric, in-batch negatives)",
         "augmentation": "dropout-as-augmentation (two stochastic forwards)",
         "dolma_max_files": (int(args.max_files) if args.max_files is not None else None),
+        "lora": ({
+            "r": int(args.lora_r),
+            "alpha": int(args.lora_alpha),
+            "dropout": float(args.lora_dropout),
+            "target_modules": list(args.lora_target_modules),
+            "merged": True,
+        } if args.use_lora else None),
     }
     # Track the largest shard range consumed by any training stage so
     # eval_llm2vec can pick `start_index = dolma_max_files` and read held-out

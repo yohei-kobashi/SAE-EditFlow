@@ -91,12 +91,21 @@ SEED=${SEED:-42}
 
 DOLMA_MAX_FILES=${DOLMA_MAX_FILES:-32}
 SAE_MAX_SENTS=${SAE_MAX_SENTS:-100000}
-LLM2VEC_STEPS=${LLM2VEC_STEPS:-10000}
+# Canonical LLM2Vec uses LoRA. Defaults below match the McGill-NLP recipe
+# (r=16, alpha=32, MNTP 1k @ 3e-4, SimCSE 1k @ 3e-5, batch 128).
+# For full-FT ablation: USE_LORA=0 LLM2VEC_STEPS=10000 LLM2VEC_LR=1e-5
+# SIMCSE_STEPS=2000 SIMCSE_LR=1e-6 SIMCSE_BATCH=32.
+USE_LORA=${USE_LORA:-1}
+LORA_R=${LORA_R:-16}
+LORA_ALPHA=${LORA_ALPHA:-32}
+LORA_DROPOUT=${LORA_DROPOUT:-0.05}
+LLM2VEC_STEPS=${LLM2VEC_STEPS:-1000}
 LLM2VEC_BATCH=${LLM2VEC_BATCH:-8}
 LLM2VEC_ACCUM=${LLM2VEC_ACCUM:-4}
-SIMCSE_STEPS=${SIMCSE_STEPS:-2000}
-SIMCSE_BATCH=${SIMCSE_BATCH:-32}
-SIMCSE_LR=${SIMCSE_LR:-1e-6}
+LLM2VEC_LR=${LLM2VEC_LR:-3e-4}
+SIMCSE_STEPS=${SIMCSE_STEPS:-1000}
+SIMCSE_BATCH=${SIMCSE_BATCH:-128}
+SIMCSE_LR=${SIMCSE_LR:-3e-5}
 SIMCSE_TEMP=${SIMCSE_TEMP:-0.05}
 SIMCSE_DROPOUT=${SIMCSE_DROPOUT:-0.1}
 SIMCSE_MAX_SEQ_LEN=${SIMCSE_MAX_SEQ_LEN:-128}
@@ -347,6 +356,20 @@ fi
 if [[ -f "$LLM2VEC_DIR/llm2vec_meta.json" ]]; then
     skip_stage "01_train_llm2vec" "exists at $LLM2VEC_DIR"
 else
+    LLM2VEC_EXTRA=()
+    if [[ "$USE_LORA" == "1" ]]; then
+        LLM2VEC_EXTRA+=(--use-lora
+                        --lora-r "$LORA_R"
+                        --lora-alpha "$LORA_ALPHA"
+                        --lora-dropout "$LORA_DROPOUT")
+        # LoRA recipe: shorter warmup + save, since max_steps default is 1k.
+        LLM2VEC_WARMUP_ARG=100
+        LLM2VEC_SAVE_ARG=500
+    else
+        LLM2VEC_EXTRA+=(--no-use-lora)
+        LLM2VEC_WARMUP_ARG=1000
+        LLM2VEC_SAVE_ARG=1000
+    fi
     run_stage "01_train_llm2vec" \
         python train_llm2vec.py \
             --llm "$LLM" \
@@ -354,13 +377,15 @@ else
             --max-files "$DOLMA_MAX_FILES" \
             --output-dir "$LLM2VEC_DIR" \
             --max-steps "$LLM2VEC_STEPS" \
-            --warmup-steps 1000 \
+            --warmup-steps "$LLM2VEC_WARMUP_ARG" \
+            --learning-rate "$LLM2VEC_LR" \
             --per-device-batch-size "$LLM2VEC_BATCH" \
             --grad-accum-steps "$LLM2VEC_ACCUM" \
-            --save-steps 1000 \
+            --save-steps "$LLM2VEC_SAVE_ARG" \
             --logging-steps 50 \
             --num-workers "$NUM_WORKERS" \
             --seed "$SEED" \
+            "${LLM2VEC_EXTRA[@]}" \
             $RESUME_FLAG
 fi
 
@@ -382,6 +407,14 @@ else
     SIMCSE_EXTRA=()
     if [[ "$SIMCSE_GRAD_CKPT" == "1" ]]; then
         SIMCSE_EXTRA+=(--gradient-checkpointing)
+    fi
+    if [[ "$USE_LORA" == "1" ]]; then
+        SIMCSE_EXTRA+=(--use-lora
+                        --lora-r "$LORA_R"
+                        --lora-alpha "$LORA_ALPHA"
+                        --lora-dropout "$LORA_DROPOUT")
+    else
+        SIMCSE_EXTRA+=(--no-use-lora)
     fi
     run_stage "01b_train_simcse" \
         python train_simcse.py \

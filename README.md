@@ -239,10 +239,11 @@ Sparse top-L SAE features per LLM token over the sentence-segmented Dolma sample
 
 ### 6.1 LLM2Vec Encoder — `train_llm2vec.py`
 
-MNTP training to turn causal Gemma into a bidirectional encoder. Follows the canonical LLM2Vec recipe (McGill-NLP), with two ingredients:
+MNTP training to turn causal Gemma into a bidirectional encoder. Follows the canonical LLM2Vec recipe (McGill-NLP) — **LoRA-based by default** (matches paper), with a `--no-use-lora` full-FT fallback for ablation:
 
 1. **Bidirectional attention patch.** The inner `GemmaModel`'s `_update_causal_mask` is overridden to return a padding-only 4D mask (no triangular `-inf`), and every self-attention module's `is_causal` flag is set to `False`. The model is loaded with `attn_implementation="sdpa"` for speed. Gemma's SDPA path computes `is_causal = q_len > 1 and attention_mask is None and module.is_causal`; both of the latter two conjuncts are False after the patch, so SDPA falls through to bidirectional with the explicit mask. (Canonical LLM2Vec forces `eager` only because it uses a subclass-level override that registers a single attention class; we monkey-patch the existing module, so all kernels work.) Lives in `model._patch_attention_bidirectional` and is reused at inference by `BidirectionalLLM`.
 2. **MNTP objective (predict-at-i-1).** Token-level masking via HF's `DataCollatorForLanguageModeling` (15% / 80-10-10), then `GemmaForCausalLM.forward(labels=labels)` whose built-in `+1` shift gives `loss = CE(logits[..., :-1, :], labels[..., 1:])`. Combined with the bidirectional attention, the masked token at position `i` is predicted from the bidirectionally-contextualized hidden state at position `i-1` — exactly the LLM2Vec objective. The LM head's pretrained "next-token" mapping is reused without retraining.
+3. **LoRA adapter (canonical).** Applied AFTER the bidir patch (peft only rewires linear projections — q/k/v/o/gate/up/down — so the patched `_update_causal_mask` survives). Defaults `r=16, α=32, dropout=0.05` match the McGill-NLP `train_configs`. Training runs for ~1k optimizer steps at `LR=3e-4`. At save time `merge_and_unload()` bakes the adapter into the base, so downstream stages load a plain HF `GemmaForCausalLM` via `AutoModelForCausalLM.from_pretrained` — they remain peft-unaware. Full-FT (1e-5 / 10k steps) is also supported via `--no-use-lora`; empirically full-FT converges to MNTP loss ≈ 4.6 and STS-B Spearman 0.43 (no better than base LM), whereas the LoRA recipe reaches the paper's range.
 
 `train_llm2vec.py` adds `[MASK]` (if absent), `[INS]`, and `[DEL]` to the tokenizer before any training step, then resizes the LLM's embedding table so MNTP trains the new rows jointly with the rest of the model (§5). The MNTP'd Gemma is the **encoder backbone** of both the editor and the tagger, and is also the **causal PPL scorer** in `corruption.py` (re-loaded with the causal mask intact, no bidir patch). It is not used as the corruption MLM (§6.2) — corruption operates at the text level and uses a separate, swappable MLM.
 
@@ -255,8 +256,8 @@ Canonical LLM2Vec finishes with an **unsupervised contrastive** step on top of B
 1. **NT-Xent loss with dropout-as-augmentation.** Each batch sentence is forwarded through the Bi+MNTP encoder **twice** with independent dropout masks; the two embeddings form a positive pair; all other in-batch sentences are negatives. Loss is the symmetric InfoNCE / NT-Xent at temperature `τ = 0.05`.
 2. **Dropout injection.** Gemma-2's default `attention_dropout = 0.0` would make the two stochastic forwards identical — the loss collapses to `log B`. `train_simcse.py` injects `attention_dropout = 0.1` on every attention module before training so the two forwards differ.
 3. **Pooling.** Mean over non-pad positions of the final-layer hidden state (matches `eval_llm2vec.py`'s default).
-4. **Full FT, very low LR.** Canonical LLM2Vec SimCSE uses LoRA with `LR = 3e-5`; we do full FT, so `LR = 1e-6`. Same lesson as the MNTP `5e-5 → 1e-5` story.
-5. **Output is a drop-in `--llm2vec-dir`.** The SimCSE output dir contains a `GemmaForCausalLM` HF checkpoint (so the LM head — needed by `corruption.py` for causal PPL scoring — survives) plus an `llm2vec_meta.json` with a `simcse:` block. Downstream stages (`corruption`, `tagger`, `editor`, `length_head`, `eval`) consume this dir unchanged.
+4. **LoRA on top of MNTP-merged base.** Canonical recipe: load the MNTP-merged checkpoint as a plain HF model, re-apply the bidir patch, then wrap with a **new** LoRA adapter (not the MNTP one). Defaults `r=16, α=32, LR=3e-5, batch=128, 1k steps`. At save time `merge_and_unload()` bakes the SimCSE adapter into the base — so the saved checkpoint has both MNTP and SimCSE changes baked in and downstream stays peft-unaware.
+5. **Output is a drop-in `--llm2vec-dir`.** The SimCSE output dir contains a `GemmaForCausalLM` HF checkpoint (so the LM head — needed by `corruption.py` for causal PPL scoring — survives) plus an `llm2vec_meta.json` with a `simcse:` block (including `lora.merged: true`). Downstream stages (`corruption`, `tagger`, `editor`, `length_head`, `eval`) consume this dir unchanged.
 
 `scripts/run_production.sh` runs SimCSE between stage 01 (MNTP) and stage 02 (corruption) by default. Pass `SKIP_SIMCSE=1` to skip it — useful for ablating "Bi+MNTP only" vs "Bi+MNTP+SimCSE" on downstream editor quality.
 
@@ -700,39 +701,60 @@ sae_layer: 12
 sae_top_l: 128
 k_train: 64                       # top-K for SAE pool max in conditioning
 
-# stage 1 — LLM2Vec MNTP (canonical recipe)
+# stage 1 — LLM2Vec MNTP (canonical recipe via LoRA + PEFT)
 mntp:
   mlm_probability:    0.15          # 15% / 80-10-10 (DataCollatorForLanguageModeling)
   objective:          predict_i_from_h_im1   # +1 shift via GemmaForCausalLM.forward(labels=...)
-  # LR / warmup for FULL fine-tune of Gemma-2B in bf16. The canonical
-  # LLM2Vec recipe uses LoRA + LR=3e-4; we are not, so we run at the
-  # full-FT-stable range. 5e-5 with 500-step warmup blew up at the LR
-  # peak (loss 4.3 → 5.4 then stuck at ≈ 5.0). 1e-5 with 1000-step
-  # warmup keeps the loss curve monotonic-ish through the LR peak.
-  learning_rate:      1e-5
-  warmup_steps:       1000          # ≈ 10% of max_steps; canonical large-warmup config
+  # Canonical LLM2Vec uses LoRA. We tried full-FT first (LR 1e-5, 10k
+  # steps) and it converged to MNTP loss ≈ 4.6 with STS-B Spearman 0.43
+  # — no better than the base LM. Switching to LoRA matches the paper's
+  # numbers without the LR fragility.
+  use_lora:           true
+  lora_r:             16            # LLM2Vec paper default
+  lora_alpha:         32
+  lora_dropout:       0.05
+  lora_target_modules:              # Gemma-2 attention + MLP linear projs
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  learning_rate:      3e-4          # LLM2Vec paper default with LoRA
+  max_steps:          1000          # paper trains MNTP for ~1k LoRA steps
+  warmup_steps:       100           # ≈ 10% of max_steps
   bidir_patch:
     attn_implementation: sdpa       # 3-5x faster than eager; Gemma SDPA respects module.is_causal=False + explicit mask
     is_causal:        false         # set on every self-attention module
     update_causal_mask: padding_only  # patched _update_causal_mask (no triu)
+  save:               merged        # merge_and_unload before save_pretrained
+                                     # → downstream loads a plain HF GemmaForCausalLM
+  # Full-FT ablation (CLI override): --no-use-lora --learning-rate 1e-5
+  #   --max-steps 10000 --warmup-steps 1000
 
-# stage 1b — SimCSE (canonical LLM2Vec contrastive)
+# stage 1b — SimCSE (canonical LLM2Vec contrastive, LoRA on top of merged MNTP)
 simcse:
   loss:               nt_xent_symmetric  # F.cross_entropy on (B,B) sim matrix, both directions
   temperature:        0.05               # Gao et al. 2021
   dropout:            0.1                # injected attention_dropout — Gemma-2 default is 0.0
                                           # and SimCSE collapses without dropout > 0
   pooling:            mean               # over non-pad positions
-  # LR for FULL FT (canonical SimCSE uses LoRA + 3e-5). Same lesson as MNTP:
-  # full-FT-stable range is ~1 order of magnitude lower than the LoRA recipe.
-  learning_rate:      1e-6
-  max_steps:          2000               # canonical 1-2k steps
+  use_lora:           true               # NEW LoRA adapter stacked on the MNTP-merged base
+  lora_r:             16
+  lora_alpha:         32
+  lora_dropout:       0.05
+  learning_rate:      3e-5               # LLM2Vec paper default
+  max_steps:          1000               # paper recipe (1 epoch on a wiki subset)
   warmup_steps:       100
-  per_device_batch:   32                 # in-batch negatives — larger is strictly better,
-                                          # bounded only by GPU memory at this seq_len
+  per_device_batch:   128                # in-batch negatives — canonical SimCSE batch
+                                          # LoRA fits 128 on 80GB Gemma-2B comfortably
   grad_accum_steps:   1                  # accum does NOT increase negatives — leave at 1
   max_seq_length:     128                # SimCSE works at short seqs; Gemma activations
                                           # are quadratic, keep this lower than MNTP
+  save:               merged             # merge_and_unload before save_pretrained
+  # Full-FT ablation (CLI override): --no-use-lora --learning-rate 1e-6
+  #   --max-steps 2000 --per-device-batch-size 32
 
 # sentence segmentation
 sentence_splitter: pysbd          # or nltk_punkt

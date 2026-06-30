@@ -101,19 +101,27 @@ SEED=${SEED:-42}
 
 LLM=${LLM:-"google/gemma-2-2b"}
 DOLMA_MAX_FILES=${DOLMA_MAX_FILES:-32}
-LLM2VEC_STEPS=${LLM2VEC_STEPS:-10000}
+# Canonical LLM2Vec uses LoRA. The defaults below match the McGill-NLP
+# train_configs (r=16, alpha=32, MNTP 1k steps @ 3e-4, SimCSE 1k steps @ 3e-5).
+# To reproduce the previous full-FT runs: USE_LORA=0 LLM2VEC_LR=1e-5
+# LLM2VEC_STEPS=10000 SIMCSE_LR=1e-6 SIMCSE_STEPS=2000.
+USE_LORA=${USE_LORA:-1}
+LORA_R=${LORA_R:-16}
+LORA_ALPHA=${LORA_ALPHA:-32}
+LORA_DROPOUT=${LORA_DROPOUT:-0.05}
+LLM2VEC_STEPS=${LLM2VEC_STEPS:-1000}
 LLM2VEC_BATCH=${LLM2VEC_BATCH:-8}
 LLM2VEC_ACCUM=${LLM2VEC_ACCUM:-4}
-LLM2VEC_LR=${LLM2VEC_LR:-1e-5}
-LLM2VEC_WARMUP=${LLM2VEC_WARMUP:-1000}
-LLM2VEC_SAVE_STEPS=${LLM2VEC_SAVE_STEPS:-1000}
+LLM2VEC_LR=${LLM2VEC_LR:-3e-4}
+LLM2VEC_WARMUP=${LLM2VEC_WARMUP:-100}
+LLM2VEC_SAVE_STEPS=${LLM2VEC_SAVE_STEPS:-500}
 NUM_WORKERS=${NUM_WORKERS:-4}
 MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH:-256}
 MLM_PROBABILITY=${MLM_PROBABILITY:-0.15}
 
-SIMCSE_STEPS=${SIMCSE_STEPS:-2000}
-SIMCSE_BATCH=${SIMCSE_BATCH:-32}
-SIMCSE_LR=${SIMCSE_LR:-1e-6}
+SIMCSE_STEPS=${SIMCSE_STEPS:-1000}
+SIMCSE_BATCH=${SIMCSE_BATCH:-128}
+SIMCSE_LR=${SIMCSE_LR:-3e-5}
 SIMCSE_WARMUP=${SIMCSE_WARMUP:-100}
 SIMCSE_TEMP=${SIMCSE_TEMP:-0.05}
 SIMCSE_DROPOUT=${SIMCSE_DROPOUT:-0.1}
@@ -266,6 +274,15 @@ if [[ "$SKIP_TRAIN" == "1" ]]; then
 elif [[ -f "$LLM2VEC_DIR/llm2vec_meta.json" ]]; then
     skip_stage "01_train_llm2vec" "exists at $LLM2VEC_DIR (FORCE_FRESH=1 で再学習)"
 else
+    LLM2VEC_EXTRA=()
+    if [[ "$USE_LORA" == "1" ]]; then
+        LLM2VEC_EXTRA+=(--use-lora
+                        --lora-r "$LORA_R"
+                        --lora-alpha "$LORA_ALPHA"
+                        --lora-dropout "$LORA_DROPOUT")
+    else
+        LLM2VEC_EXTRA+=(--no-use-lora)
+    fi
     run_stage "01_train_llm2vec" \
         python train_llm2vec.py \
             --llm "$LLM" \
@@ -283,6 +300,7 @@ else
             --mlm-probability "$MLM_PROBABILITY" \
             --num-workers "$NUM_WORKERS" \
             --seed "$SEED" \
+            "${LLM2VEC_EXTRA[@]}" \
             $RESUME_FLAG
 fi
 
@@ -304,6 +322,14 @@ else
     SIMCSE_EXTRA=()
     if [[ "$SIMCSE_GRAD_CKPT" == "1" ]]; then
         SIMCSE_EXTRA+=(--gradient-checkpointing)
+    fi
+    if [[ "$USE_LORA" == "1" ]]; then
+        SIMCSE_EXTRA+=(--use-lora
+                        --lora-r "$LORA_R"
+                        --lora-alpha "$LORA_ALPHA"
+                        --lora-dropout "$LORA_DROPOUT")
+    else
+        SIMCSE_EXTRA+=(--no-use-lora)
     fi
     run_stage "02_train_simcse" \
         python train_simcse.py \
