@@ -270,12 +270,21 @@ def parse_args():
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--skip-sentences", type=int, default=0,
-                   help="Skip the first N Dolma sentences before sampling. "
-                        "Use this to generate a held-out DEV cache disjoint "
-                        "from a training cache: pass the training run's "
-                        "`sentences_seen` (from its meta.json) with the SAME "
-                        "--seed so the sentence stream order matches and the "
-                        "dev sources start where training stopped.")
+                   help="Skip the first N length-eligible Dolma sentences "
+                        "before sampling. Use this to generate a held-out "
+                        "DEV cache disjoint from a training cache: pass the "
+                        "training run's `sentences_seen` (from its meta.json) "
+                        "with the SAME --seed so the sentence stream order "
+                        "matches and the dev sources start where training "
+                        "stopped.")
+    # Parallel generation: N processes on one GPU, each taking sentences
+    # where sent_idx % stride == offset (disjoint, complete partition).
+    # Driven by scripts/corruption_parallel.sh.
+    p.add_argument("--sentence-stride", type=int, default=1,
+                   help="Process only sentences whose index satisfies "
+                        "idx %% stride == offset (for parallel workers).")
+    p.add_argument("--sentence-offset", type=int, default=0,
+                   help="This worker's residue class (< --sentence-stride).")
     # Resume: default ON. Counts samples in existing shards under --out-dir,
     # advances the Dolma stream past the source_sent_id of the last written
     # sample, and continues writing until target_samples is reached. RNG
@@ -1674,6 +1683,11 @@ def _str_dtype(s: str) -> torch.dtype:
 
 def main():
     args = parse_args()
+    if args.sentence_stride < 1:
+        raise SystemExit("[corruption] --sentence-stride must be >= 1")
+    if not (0 <= args.sentence_offset < args.sentence_stride):
+        raise SystemExit("[corruption] --sentence-offset must be in "
+                         "[0, --sentence-stride)")
     set_seed(args.seed)
     rng = random.Random(args.seed)
     out_dir = Path(args.out_dir)
@@ -1885,10 +1899,19 @@ def main():
     )
 
     # Advance the Dolma stream past sentences already represented in the
-    # existing shards (resume) before entering the main loop.
+    # existing shards (resume) before entering the main loop. Count only
+    # LENGTH-ELIGIBLE sentences while skipping — `sent_idx` (and therefore
+    # `source_sent_id` / `sentences_seen`) only increments for eligible
+    # sentences, so skipping raw sentences would land short of the intended
+    # position and re-corrupt sources already in the cache.
     if skip_n_sentences > 0:
-        for _ in range(skip_n_sentences):
-            if next(sent_iter, None) is None:
+        _skipped = 0
+        for _sent in sent_iter:
+            _tc = len(gemma_tok(_sent, add_special_tokens=False).input_ids)
+            if not (args.sent_min_tokens <= _tc <= args.sent_max_tokens):
+                continue
+            _skipped += 1
+            if _skipped >= skip_n_sentences:
                 break
 
     for sent in sent_iter:
@@ -1898,6 +1921,13 @@ def main():
         if not (args.sent_min_tokens <= gemma_token_count <= args.sent_max_tokens):
             continue
         sent_idx += 1
+
+        # Parallel-worker partition: sent_idx increments for EVERY eligible
+        # sentence (all workers see the same stream and count identically),
+        # so residue classes are disjoint and complete across workers.
+        if args.sentence_stride > 1 and \
+                (sent_idx % args.sentence_stride) != args.sentence_offset:
+            continue
 
         if args.force_n is not None:
             N_forced = max(0, min(int(args.force_n), int(args.n_max)))
@@ -2050,6 +2080,9 @@ def main():
         "sae_path": args.sae_path,
         "sae_layer": int(args.sae_layer),
         "seed": int(args.seed),
+        "skip_sentences": int(args.skip_sentences),
+        "sentence_stride": int(args.sentence_stride),
+        "sentence_offset": int(args.sentence_offset),
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
     print(f"[corruption] done: {written} samples in {shard_idx} shards → {out_dir}")

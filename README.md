@@ -695,6 +695,7 @@ A sharded JSON-lines (or binary) file with one record per training sample:
 | `intervene.py` | intervention spec helpers |
 | `data.py` | data loading utilities |
 | `scripts/smoke_pipeline.sh` | end-to-end smoke driver; with `MEASURE_COMPOUND_N=1` also runs per-N corruption sweep + `scripts/analyze_compound_n.py` to produce a per-N report (§13.4) |
+| `scripts/corruption_parallel.sh` | run stage 02 as N corruption.py workers on one GPU (the stage is latency-bound at batch 1, so N workers ≈ N× throughput). Partitions the sentence stream by `--sentence-stride/--sentence-offset`, keeps pre-existing shards, resumes per worker, and merges into a normal corruption cache when done |
 | `scripts/run_production.sh` | production-scale end-to-end driver (Stage 0 → SimCSE → corruption → editor → tagger → length head → evaluate; the tagger warm-starts from the editor checkpoint). Resume by default; `FORCE_FRESH=1` wipes the run dir; `SKIP_SIMCSE=1` ablates the SimCSE stage |
 | `scripts/train_eval_llm2vec.sh` | LLM2Vec-only pipeline: MNTP → SimCSE → eval. Useful for tuning the bidir encoder in isolation before running the full pipeline |
 | `scripts/eval_llm2vec.sh` | thin shell wrapper around `eval_llm2vec.py` (§13.3) |
