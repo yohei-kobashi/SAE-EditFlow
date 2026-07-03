@@ -18,7 +18,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import shutil
+import tempfile
 from pathlib import Path
 
 import torch
@@ -77,10 +80,35 @@ def main():
     print(f"[add-specials] added {missing}; vocab {old_vocab} → "
           f"{model.config.vocab_size} (new rows mean-of-existing init)")
 
-    # Gemma ties lm_head to embed_tokens; safetensors refuses tied tensors,
-    # so use the legacy format (same as mcgill_merge_and_expand.py).
-    model.save_pretrained(out_dir, safe_serialization=False)
-    tokenizer.save_pretrained(out_dir)
+    # NEVER save straight into the source directory: transformers mmap-loads
+    # the .bin shards, and save_pretrained writing over the very files that
+    # back the live tensors dies with SIGBUS mid-write, corrupting the
+    # checkpoint. Save to a temp dir on the same filesystem, free the model
+    # (and with it the mmaps), then swap the files in.
+    tmp_dir = Path(tempfile.mkdtemp(prefix=".add_specials_tmp_",
+                                    dir=str(out_dir.parent)))
+    try:
+        # Gemma ties lm_head to embed_tokens; safetensors refuses tied
+        # tensors, so use the legacy format (same as mcgill_merge_and_expand).
+        model.save_pretrained(tmp_dir, safe_serialization=False)
+        tokenizer.save_pretrained(tmp_dir)
+        print(f"[add-specials] wrote {tmp_dir}; swapping into {out_dir}")
+
+        del model
+        gc.collect()
+
+        # Remove stale weight files in the destination (the shard layout may
+        # differ from the source's), then move the fresh files in.
+        if out_dir.exists():
+            for pat in ("pytorch_model*.bin", "model*.safetensors",
+                        "*.index.json"):
+                for stale in out_dir.glob(pat):
+                    stale.unlink()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for src in tmp_dir.iterdir():
+            shutil.move(str(src), str(out_dir / src.name))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     meta_p = out_dir / "llm2vec_meta.json"
     if meta_p.exists():
