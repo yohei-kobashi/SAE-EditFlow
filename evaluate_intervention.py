@@ -80,13 +80,16 @@ def parse_args():
     return p.parse_args()
 
 
+class TemplateBudgetExceeded(RuntimeError):
+    """Slot enumeration would exceed --max-templates editor forwards."""
+
+
 @torch.no_grad()
 def edit_once(
     *,
     text: str,
-    spec: List[FeatureSpec],
-    strength: float,
-    mu: np.ndarray,
+    z_amp_full: torch.Tensor,        # (d_sae,) non-negative intervention
+    z_sup_full: torch.Tensor,        # (d_sae,)
     tagger,
     editor,
     ranker: Ranker,
@@ -95,10 +98,8 @@ def edit_once(
     device: str,
     ins_threshold: float = 0.5,
     max_templates: int = 256,
+    verbose: bool = True,
 ) -> str:
-    d_sae = int(mu.shape[0])
-    z_amp_full, z_sup_full = build_intervention_vectors(spec, mu, strength)
-
     enc = tokenizer(text, return_tensors="pt", add_special_tokens=True).to(device)
     input_ids = enc.input_ids                         # (1, T)
     attn = enc.attention_mask
@@ -129,12 +130,13 @@ def edit_once(
         mask_token_id=mask_id, ins_token_id=ins_id,
     )
 
-    from collections import Counter
-    op_counts = Counter("KEEP" if o == 0 else ("REPL" if o == 1 else "DEL")
-                        for o in op3)
-    n_gaps = int(sum(ins_before))
-    print(f"[edit] tagger: {dict(op_counts)}  ins_gaps={n_gaps} "
-          f"(ins_threshold={ins_threshold})")
+    if verbose:
+        from collections import Counter
+        op_counts = Counter("KEEP" if o == 0 else ("REPL" if o == 1 else "DEL")
+                            for o in op3)
+        print(f"[edit] tagger: {dict(op_counts)}  "
+              f"ins_gaps={int(sum(ins_before))} "
+              f"(ins_threshold={ins_threshold})")
 
     # 3. enumerate INS slot counts
     G = len(ed_in.ins_gaps)
@@ -143,7 +145,7 @@ def edit_once(
     else:
         n_templates = l_max ** G
         if n_templates > max_templates:
-            raise SystemExit(
+            raise TemplateBudgetExceeded(
                 f"[edit] enumeration would need {n_templates} editor "
                 f"forwards (l_max={l_max} ^ G={G} gaps) > "
                 f"--max-templates {max_templates}. Raise --ins-threshold "
@@ -221,12 +223,16 @@ def main():
     ranker = Ranker(extractor, causal, bid, RankerWeights(), device=args.device)
 
     specs = [FeatureSpec.parse(s) for s in args.spec]
-    out = edit_once(
-        text=args.text, spec=specs, strength=args.strength, mu=mu,
-        tagger=tagger, editor=editor, ranker=ranker, tokenizer=tokenizer,
-        l_max=args.l_max, device=args.device,
-        ins_threshold=args.ins_threshold, max_templates=args.max_templates,
-    )
+    z_amp_full, z_sup_full = build_intervention_vectors(specs, mu, args.strength)
+    try:
+        out = edit_once(
+            text=args.text, z_amp_full=z_amp_full, z_sup_full=z_sup_full,
+            tagger=tagger, editor=editor, ranker=ranker, tokenizer=tokenizer,
+            l_max=args.l_max, device=args.device,
+            ins_threshold=args.ins_threshold, max_templates=args.max_templates,
+        )
+    except TemplateBudgetExceeded as e:
+        raise SystemExit(str(e))
     print("== edited ==")
     print(out)
 
