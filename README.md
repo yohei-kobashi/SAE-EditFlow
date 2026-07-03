@@ -517,7 +517,17 @@ The damping exponent `γ` trades exactness against robustness. Full inversion (`
 w = (REPL 0.60, INS 0.34, DEL 0.06)
 ```
 
-which is the default in `corruption.py` and the `OP_WEIGHT_{REPL,INS,DEL}` default in `scripts/corruption_parallel.sh`. The exact weights are not load-bearing: what matters is that the *accepted* mix approaches the LinguaLens target. Because the acceptance factors `a_op` depend on the gate threshold, the corruption MLM, and the SAE/encoder, the weights are **re-verified on the first pilot shard of any run** and re-tuned if a configuration change shifts `a_op` — the same self-consistency principle as the SLOR calibration in §6.2.6.
+which is the default in `corruption.py` and the `OP_WEIGHT_{REPL,INS,DEL}` default in `scripts/corruption_parallel.sh`.
+
+**Measured outcome — proposal reweighting saturates.** The full production run (100k samples, 133,350 accepted ops) under `w = (0.60, 0.34, 0.06)` yields an accepted mix of
+
+```
+q = (REPL 0.705, INS 0.074, DEL 0.221)
+```
+
+Near-doubling the INS proposal weight (0.18 → 0.34) moved the accepted INS share by only +1.4 points (0.060 → 0.074), and halving the DEL weight barely moved DEL (0.251 → 0.221). The two operating points give a log–log sensitivity of accepted-INS share to its proposal weight of ≈ 0.33; at that slope, reaching the 0.18 target would require `w_INS > 1`, which is infeasible. The mechanism is the `K_BUDGET` first-accept loop (§6.3.2): a rejected INS proposal releases its attempt slot to the next draw — usually an easily-accepted REPL or DEL — so the accepted mix is governed by the per-op gate pass rates far more than by the proposal weights. Equivalently, the acceptance factors `a_op` are not constants: they fall as `w_op` rises (measured `a_INS`: 0.33 → 0.22 when `w_INS` went 0.18 → 0.34), making the correction self-limiting. Proposal reweighting can therefore only *partially* close a gate-induced gap.
+
+We keep `w = (0.60, 0.34, 0.06)` as the operating point — it maximises the INS share within the feasible range without starving DEL — and report the accepted distribution as measured rather than claiming a match to the LinguaLens target. The residual gap (INS 0.074 vs 0.18, DEL 0.221 vs 0.12) is a property of the fluency gate, not of the sampler: closing it would require changing the data-generating process itself, e.g. an op-conditional SLOR allowance for INS (defensible, since deleting a natural word lowers fluency *by construction*, so a uniform threshold implicitly penalises the op type rather than the sample quality) or a fluency-aware INS span proposer. We leave that as an explicit design decision rather than folding it silently into the weights; class-weighted losses in Phase A (§6.3) absorb the remaining imbalance on the training side. Because the acceptance factors depend on the gate threshold, the corruption MLM, and the SAE/encoder, the accepted mix is **re-measured on the first shards of any run** after a configuration change — the same self-consistency principle as the SLOR calibration in §6.2.6.
 
 This calibration is orthogonal to the two other distributional controls: §6.2.6 sets *how many* compounds pass at each N (per-N yield), §6.3.1 sets the *N* distribution (op-count per sample), and this step sets the op-*type* distribution within accepted compounds. All three are calibrated on the same Dolma + MLM source the editor trains on.
 
@@ -543,7 +553,7 @@ Bucket selection is implemented as **rejection on N after sampling**: a fresh se
 | Variable | Range | Distribution |
 | --- | --- | --- |
 | `N_total` per sample | 0..N_MAX (default 5) | truncated geometric, p ≈ 0.4 |
-| op type within compound (proposal) | {REPL, INS, DEL} | (0.60, 0.34, 0.06) — pre-gate weights; accepted mix ≈ LinguaLens 0.70 / 0.18 / 0.12 (§6.2.7) |
+| op type within compound (proposal) | {REPL, INS, DEL} | (0.60, 0.34, 0.06) — pre-gate weights; accepted mix measured 0.705 / 0.074 / 0.221, gate-limited (§6.2.7) |
 | `p_high` (INS HIGH-priority bias) | 0.85 | flat |
 | `ins_span_length` per INS op | 1..L_MAX | log-uniform |
 | `del_span_length` per DEL op | 1..L_MAX_DEL | log-uniform (typically L_MAX_DEL ≤ L_MAX) |
@@ -823,12 +833,14 @@ compound:
   op_weights:                     # PROPOSAL weights (pre-gate). The gates
     # of §6.2.6 are not op-type-neutral (SLOR rejects INS's natural-word
     # deletions hardest, passes DEL's MLM-plausible insertions easiest), so
-    # these differ from the TARGET accepted mix. Calibrated per §6.2.7 so
-    # the ACCEPTED op-type ratio matches LinguaLens English (REPL 70.0% /
-    # INS 18.2% / DEL 11.8%). Override via OP_WEIGHT_{REPL,INS,DEL}.
-    repl:                0.60     # accepted ≈ 0.70
-    ins:                 0.34     # accepted ≈ 0.18
-    del:                 0.06     # accepted ≈ 0.12
+    # these differ from the accepted mix. Calibrated per §6.2.7 toward the
+    # LinguaLens English target (0.70 / 0.18 / 0.12); the accepted mix is
+    # gate-limited and saturates below the INS target — measured on the
+    # 100k production run: REPL 0.705 / INS 0.074 / DEL 0.221.
+    # Override via OP_WEIGHT_{REPL,INS,DEL}.
+    repl:                0.60     # accepted ≈ 0.705
+    ins:                 0.34     # accepted ≈ 0.074 (gate-limited ceiling)
+    del:                 0.06     # accepted ≈ 0.221
   k_budget:              6        # first-accept rejection attempts per source sentence
   apply_order:           "right_to_left"
 
