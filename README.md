@@ -182,6 +182,7 @@ INT_sup = Proj_A(z_sup) + type_emb[2]
 
 - `mu[f]` is the per-feature mean activation, precomputed in `mu.npy` by `precompute_sae.py`.
 - Non-negative inputs keep `Proj_A`'s input distribution aligned with the frozen SAE's output distribution.
+- **`Proj_A` is grounded in the SAE decoder (v3.1, default `wdec-frozen`).** v3 probes showed the conditioning being USED but random feature indices working almost as well as the true ones (OPAQUE-FLAG): with 16,384 features and only ~10 conditioning occurrences per feature in a 100k-record cache, a random-init linear `Proj_A` cannot learn per-feature identity. But identity does not need to be learned — `W_dec` row `f` IS feature `f`'s direction in the LLM's residual stream, a representation the (same-model) Gemma backbone natively interprets. Modes: `wdec-frozen` (default) fixes `Proj_A = W_dec` and trains only a rank-32 correction `B·A` on top (`B = 0` init → exact `W_dec` at step 0; identity can never be washed out); `wdec-init` uses `W_dec` as a trainable init; `learned` is the pre-v3.1 random-init ablation. This also strengthens identity property #3: the intervention enters the model literally as the amplified/suppressed features' residual-stream directions.
 - `type_emb[1]` / `type_emb[2]` mark amp / sup conditioning tokens. `type_emb[0]` is reserved for text tokens but intentionally NOT added to them — adding a constant learned offset to every text embedding of a frozen encoder only risks pushing it off distribution; the two prefix tokens are already distinguishable by their own type embeddings.
 - **Scale calibration.** `Proj_A`'s raw output magnitude tracks `‖z‖`, which varies per sample by orders of magnitude (SAE activation deltas are feature-dependent), and Gemma multiplies all `inputs_embeds` by `sqrt(d_model) ≈ 48` internally. Each conditioning vector is therefore RMS-normalized to the median token-embedding row RMS of the checkpoint, times a learnable scalar gain `cond_scale` (init 1.0), before `type_emb` is added. This keeps the prefix from either vanishing against `type_emb` or blowing the frozen encoder off distribution.
 - **Prefix layout is `[INT_amp, INT_sup, <bos>, text…]`** — the two soft tokens are prepended in embedding space to token ids that already begin with `<bos>`. With RoPE's relative positions this preserves the exact `<bos>`↔text geometry the LLM2Vec encoder saw during MNTP/SimCSE; placing `<bos>` first instead would shift every text token +2 relative to `<bos>`, which is more out-of-distribution for the frozen encoder.
@@ -960,6 +961,9 @@ empty_conditioning_prob: 0.0   # retired — §6.2.8 null records supervise z = 
 # Phase A training
 warmup_proj_a_frozen_fraction: 0.05
 keep_loss_weight:       0.2       # CE weight on template copy positions
+proj_a:                           # SAE-decoder grounding (§4.1)
+  mode:                 wdec-frozen   # learned | wdec-init | wdec-frozen
+  rank:                 32            # low-rank correction on the frozen W_dec map
 lora:                             # per-model backbone adapter (C1); r 0 = frozen ablation
   r:                    16
   alpha:                32
@@ -1035,6 +1039,7 @@ ranker_weights:
 | `uniform-ins-position` | Disable priority-biased INS position selection; use uniform random word positions. Tests whether the priority bias is needed to keep the compound distribution close to natural sentence variation. |
 | `fixed-thresholds` | Replace N-dependent gates with constant `ppl_max_ratio` and `sae_shift_threshold` (no `sqrt(N)` scaling). Tests whether N-dependent calibration is required, and whether the resulting distribution shift in compound N actually hurts the editor. |
 | `length-predictor` | Replace enumeration with length-head + `±1`. Quantifies the efficiency / quality trade-off. |
+| `proj-a-learned` | Train with `--proj-a-mode learned` (random-init Proj_A, the pre-v3.1 configuration). Isolates the contribution of W_dec grounding to feature-identity use — the Δ(true−random) probe. |
 | `no-partial-records` | Regenerate with `--emit-partial 0 --emit-null 0` (v2-style cache) and retrain. Isolates the contribution of condition-selective records to conditioning causality — the central v3 claim. |
 | `frozen-backbone` | Train tagger and editor with `--lora-r 0` (no backbone adaptation; only Proj_A / heads / delta rows learn — the pre-LoRA configuration). Tests whether backbone adaptation is required for the models to *use* the conditioning: with everything frozen, the only trainable path from the prefix to the edit positions is the linear `Proj_A`, and held-out probes under that configuration scored the editor conditioning-IGNORED. |
 

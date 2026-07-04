@@ -137,6 +137,24 @@ def load_sae(sae_type: str, sae_repo: str, sae_path: str,
     raise ValueError(f"unknown sae_type: {sae_type!r}")
 
 
+def load_sae_w_dec(sae_repo: str, sae_path: str) -> torch.Tensor:
+    """Load ONLY the SAE decoder matrix W_dec, shape (d_sae, d_llm), fp32.
+
+    Used to ground Proj_A in the SAE geometry (README §4.1): row f of W_dec
+    is feature f's direction in the LLM's residual stream, so
+    `Proj_A(z) = z @ W_dec` hands the frozen backbone a representation it
+    natively understands — feature IDENTITY is inherited instead of being
+    learned from ~10 gradient hits per feature. Gemma Scope npz layout
+    (JumpReLU); d_llm equals Gemma-2-2B's hidden size, so no reshaping.
+    """
+    local = hf_hub_download(repo_id=sae_repo, filename=sae_path)
+    npz = np.load(local)
+    if "W_dec" not in npz:
+        raise ValueError(f"{sae_path} has no W_dec key (topk state file? "
+                         f"only Gemma Scope npz checkpoints are supported)")
+    return torch.tensor(npz["W_dec"], dtype=torch.float32)
+
+
 # ---------------------------------------------------------------------------
 # Frozen LLM + SAE → per-LLM-token sparse features
 # ---------------------------------------------------------------------------

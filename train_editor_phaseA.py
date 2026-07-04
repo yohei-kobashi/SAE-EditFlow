@@ -31,6 +31,7 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup, set_see
 from data import CorruptionCollator, CorruptionDataset
 from editor import SAEEditor
 from intervene import diff_to_sparse
+from model import load_sae_w_dec
 from resume_utils import (
     add_resume_args, find_latest_ckpt,
     load_train_state, save_train_state,
@@ -56,6 +57,21 @@ def parse_args():
     p.add_argument("--lora-dropout", type=float, default=0.05)
     p.add_argument("--backbone-lr", type=float, default=1e-4,
                    help="LR for the backbone LoRA parameter group.")
+    # Proj_A grounding in the SAE decoder (README §4.1). "wdec-frozen" is
+    # the default: v3 probes showed conditioning USED but random features
+    # working as well as true ones (OPAQUE-FLAG) — with 16k features and
+    # ~10 conditioning occurrences each, a random-init linear Proj_A cannot
+    # learn per-feature identity. W_dec rows ARE each feature's residual-
+    # stream direction, which the Gemma backbone natively interprets.
+    p.add_argument("--proj-a-mode", default="wdec-frozen",
+                   choices=["learned", "wdec-init", "wdec-frozen"])
+    p.add_argument("--proj-a-rank", type=int, default=32,
+                   help="Rank of the trainable correction on the frozen "
+                        "W_dec map (wdec-frozen only).")
+    p.add_argument("--sae-repo", default="google/gemma-scope-2b-pt-res",
+                   help="Where to fetch W_dec for the wdec proj_a modes.")
+    p.add_argument("--sae-path",
+                   default="layer_12/width_16k/average_l0_82/params.npz")
     p.add_argument("--max-steps", type=int, default=20000)
     p.add_argument("--warmup-steps", type=int, default=500)
     p.add_argument("--proj-a-freeze-steps", type=int, default=1000,
@@ -116,15 +132,24 @@ def main():
     # appears anywhere in the editor's input or output (deletion is the
     # tagger's decision; DEL tokens are removed from the template), so its
     # delta row is gone.
+    w_dec = None
+    if args.proj_a_mode != "learned":
+        print(f"[phase-a] loading W_dec from {args.sae_repo}/{args.sae_path}")
+        w_dec = load_sae_w_dec(args.sae_repo, args.sae_path)
     editor = SAEEditor(
         args.llm2vec_dir, d_sae=d_sae, dtype=dtype,
         train_token_ids={"[INS]": ins_id, "[SEP]": sep_id, "[MASK]": mask_id},
         lora_r=args.lora_r, lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
+        proj_a_mode=args.proj_a_mode, proj_a_rank=args.proj_a_rank,
+        w_dec=w_dec,
     ).to(args.device)
+    print(f"[phase-a] proj_a_mode={args.proj_a_mode}"
+          + (f" rank={args.proj_a_rank}" if args.proj_a_mode == "wdec-frozen" else ""))
 
-    # Initial freeze of Proj_A
-    for p in editor.proj_a.parameters():
+    # Initial freeze of Proj_A (in wdec-frozen mode this freezes the
+    # low-rank correction; the W_dec base is permanently frozen).
+    for p in editor.proj_a_trainable_parameters():
         p.requires_grad_(False)
 
     lora_params = [p for n, p in editor.named_parameters() if "lora_" in n]
@@ -174,7 +199,7 @@ def main():
 
     proj_a_unfrozen = step >= args.proj_a_freeze_steps
     if proj_a_unfrozen:
-        for p in editor.proj_a.parameters():
+        for p in editor.proj_a_trainable_parameters():
             p.requires_grad_(True)
     loss_window = []
     pbar = tqdm(total=args.max_steps, initial=step,
@@ -185,7 +210,7 @@ def main():
             break
 
         if not proj_a_unfrozen and step >= args.proj_a_freeze_steps:
-            for p in editor.proj_a.parameters():
+            for p in editor.proj_a_trainable_parameters():
                 p.requires_grad_(True)
             proj_a_unfrozen = True
             print(f"[phase-a] step={step} unfroze Proj_A")

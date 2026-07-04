@@ -34,6 +34,7 @@ markers.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -56,6 +57,9 @@ class SAETagger(nn.Module):
         lora_r: int = 0,
         lora_alpha: float = 32.0,
         lora_dropout: float = 0.05,
+        proj_a_mode: str = "learned",
+        proj_a_rank: int = 32,
+        w_dec: torch.Tensor = None,
     ):
         super().__init__()
         self.encoder = BidirectionalLLM(llm2vec_dir, dtype=dtype)
@@ -77,10 +81,33 @@ class SAETagger(nn.Module):
         self.d_model = int(d_model)
         self.d_sae = int(d_sae)
 
-        # Proj_A (own copy; checkpoints can be tied to editor's at deployment).
+        # Proj_A (own copy; warm-started from the editor's). See SAEEditor
+        # for the proj_a_mode semantics ("wdec-frozen" grounds the map in
+        # the SAE decoder geometry with a trainable low-rank correction).
+        if proj_a_mode not in ("learned", "wdec-init", "wdec-frozen"):
+            raise ValueError(f"unknown proj_a_mode {proj_a_mode!r}")
+        self.proj_a_mode = proj_a_mode
+        self.proj_a_rank = int(proj_a_rank)
         self.proj_a = nn.Linear(d_sae, d_model, bias=True)
         nn.init.normal_(self.proj_a.weight, std=0.02)
         nn.init.zeros_(self.proj_a.bias)
+        if proj_a_mode != "learned" and w_dec is not None:
+            if tuple(w_dec.shape) != (d_sae, d_model):
+                raise ValueError(f"W_dec shape {tuple(w_dec.shape)} != "
+                                 f"({d_sae}, {d_model})")
+            self.proj_a.weight.data.copy_(w_dec.t().to(self.proj_a.weight.dtype))
+            nn.init.zeros_(self.proj_a.bias)
+        if proj_a_mode == "wdec-frozen":
+            for p in self.proj_a.parameters():
+                p.requires_grad_(False)
+            self.proj_a_corr_A = nn.Parameter(
+                torch.empty(self.proj_a_rank, d_sae, dtype=torch.float32))
+            nn.init.kaiming_uniform_(self.proj_a_corr_A, a=math.sqrt(5))
+            self.proj_a_corr_B = nn.Parameter(
+                torch.zeros(d_model, self.proj_a_rank, dtype=torch.float32))
+        else:
+            self.proj_a_corr_A = None
+            self.proj_a_corr_B = None
 
         self.type_emb = nn.Embedding(3, d_model)
         nn.init.normal_(self.type_emb.weight, std=0.02)
@@ -114,9 +141,21 @@ class SAETagger(nn.Module):
         rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
         return x / rms * (self.cond_target_rms * self.cond_scale)
 
+    def _proj(self, z: torch.Tensor) -> torch.Tensor:
+        x = self.proj_a(z)
+        if self.proj_a_corr_A is not None:
+            x = x + (z @ self.proj_a_corr_A.t()) @ self.proj_a_corr_B.t()
+        return x
+
+    def proj_a_trainable_parameters(self):
+        """Parameters governed by the Proj_A freeze/unfreeze schedule."""
+        if self.proj_a_mode == "wdec-frozen":
+            return [self.proj_a_corr_A, self.proj_a_corr_B]
+        return list(self.proj_a.parameters())
+
     def cond_embeds(self, z_amp: torch.Tensor, z_sup: torch.Tensor) -> torch.Tensor:
-        amp = self._calibrate_cond(self.proj_a(z_amp.to(self.proj_a.weight.dtype)))
-        sup = self._calibrate_cond(self.proj_a(z_sup.to(self.proj_a.weight.dtype)))
+        amp = self._calibrate_cond(self._proj(z_amp.to(self.proj_a.weight.dtype)))
+        sup = self._calibrate_cond(self._proj(z_sup.to(self.proj_a.weight.dtype)))
         amp = amp + self.type_emb(torch.full((amp.shape[0],), 1, device=amp.device, dtype=torch.long))
         sup = sup + self.type_emb(torch.full((sup.shape[0],), 2, device=sup.device, dtype=torch.long))
         return torch.stack([amp, sup], dim=1)
@@ -203,6 +242,9 @@ class SAETagger(nn.Module):
             sd[f"op_head.{k}"] = v.detach().cpu()
         for k, v in self.ins_head.state_dict().items():
             sd[f"ins_head.{k}"] = v.detach().cpu()
+        if self.proj_a_corr_A is not None:
+            sd["proj_a_corr_A"] = self.proj_a_corr_A.detach().cpu()
+            sd["proj_a_corr_B"] = self.proj_a_corr_B.detach().cpu()
         if self.lora_cfg is not None:
             for n, t in lora_state_dict(self.encoder.backbone).items():
                 sd[f"lora::{n}"] = t
@@ -222,6 +264,14 @@ class SAETagger(nn.Module):
         self.op_head.load_state_dict(op_sd)
         ins_sd = {k[len("ins_head."):]: v for k, v in sd.items() if k.startswith("ins_head.")}
         self.ins_head.load_state_dict(ins_sd)
+        if "proj_a_corr_A" in sd:
+            if self.proj_a_corr_A is None:
+                raise ValueError(
+                    "checkpoint has a Proj_A low-rank correction but the "
+                    "model was built with proj_a_mode != 'wdec-frozen' — "
+                    "use load_tagger_from_checkpoint")
+            self.proj_a_corr_A.data.copy_(sd["proj_a_corr_A"])
+            self.proj_a_corr_B.data.copy_(sd["proj_a_corr_B"])
         lora_sd = {k[len("lora::"):]: v for k, v in sd.items()
                    if k.startswith("lora::")}
         if lora_sd and self.lora_cfg is None:
@@ -239,6 +289,8 @@ class SAETagger(nn.Module):
             "d_sae": int(self.d_sae),
             "d_model": int(self.d_model),
             "lora": self.lora_cfg,
+            "proj_a_mode": self.proj_a_mode,
+            "proj_a_rank": int(self.proj_a_rank),
         }, path)
 
 
@@ -253,6 +305,8 @@ def load_tagger_from_checkpoint(
         lora_r=int(lora.get("r", 0)),
         lora_alpha=float(lora.get("alpha", 32.0)),
         lora_dropout=float(lora.get("dropout", 0.05)),
+        proj_a_mode=blob.get("proj_a_mode", "learned"),
+        proj_a_rank=int(blob.get("proj_a_rank", 32)),
     )
     tagger.load_trainable(blob["trainable"])
     return tagger

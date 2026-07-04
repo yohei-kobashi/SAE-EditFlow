@@ -24,6 +24,7 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup, set_see
 from data import CorruptionCollator, CorruptionDataset
 from intervene import diff_to_sparse
 from lewis_ops import NUM_OPS3, OP3_NAMES
+from model import load_sae_w_dec
 from resume_utils import (
     add_resume_args, find_latest_ckpt,
     load_train_state, save_train_state,
@@ -51,6 +52,16 @@ def parse_args():
     p.add_argument("--lora-dropout", type=float, default=0.05)
     p.add_argument("--backbone-lr", type=float, default=1e-4,
                    help="LR for the backbone LoRA parameter group.")
+    # Proj_A grounding (README §4.1). When --init-proj-a-from is given the
+    # mode/rank are ADOPTED from the editor checkpoint (shared conditioning
+    # interface, C2); these flags matter only when training without a
+    # warm-start.
+    p.add_argument("--proj-a-mode", default="wdec-frozen",
+                   choices=["learned", "wdec-init", "wdec-frozen"])
+    p.add_argument("--proj-a-rank", type=int, default=32)
+    p.add_argument("--sae-repo", default="google/gemma-scope-2b-pt-res")
+    p.add_argument("--sae-path",
+                   default="layer_12/width_16k/average_l0_82/params.npz")
     p.add_argument("--max-steps", type=int, default=10000)
     p.add_argument("--warmup-steps", type=int, default=500)
     p.add_argument("--proj-a-freeze-steps", type=int, default=500)
@@ -135,24 +146,47 @@ def main():
 
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16,
              "float32": torch.float32}[args.llm_dtype]
+
+    # When warm-starting, adopt the editor's proj_a mode/rank (C2: shared
+    # conditioning interface) and skip the W_dec download — the editor's
+    # trained Proj_A (which already contains W_dec in the wdec modes) is
+    # copied below.
+    proj_a_mode, proj_a_rank = args.proj_a_mode, args.proj_a_rank
+    warm_blob = None
+    if args.init_proj_a_from:
+        warm_blob = torch.load(args.init_proj_a_from, map_location="cpu",
+                               weights_only=False)
+        proj_a_mode = warm_blob.get("proj_a_mode", "learned")
+        proj_a_rank = int(warm_blob.get("proj_a_rank", 32))
+        if proj_a_mode != args.proj_a_mode:
+            print(f"[tagger] adopting proj_a_mode={proj_a_mode} "
+                  f"(rank={proj_a_rank}) from the editor checkpoint")
+    w_dec = None
+    if warm_blob is None and proj_a_mode != "learned":
+        print(f"[tagger] loading W_dec from {args.sae_repo}/{args.sae_path}")
+        w_dec = load_sae_w_dec(args.sae_repo, args.sae_path)
+
     tagger = SAETagger(
         args.llm2vec_dir, d_sae=d_sae, dtype=dtype,
         lora_r=args.lora_r, lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
+        proj_a_mode=proj_a_mode, proj_a_rank=proj_a_rank, w_dec=w_dec,
     ).to(args.device)
 
     # Warm-start the conditioning interface from the trained editor. The
     # editor's all-position CE through the LM head gives Proj_A a much
     # richer gradient than the tagger's small-head losses, so we train the
     # editor first and initialize the tagger's copy from it.
-    if args.init_proj_a_from:
-        blob = torch.load(args.init_proj_a_from, map_location="cpu", weights_only=False)
-        sd = blob["trainable"]
+    if warm_blob is not None:
+        sd = warm_blob["trainable"]
         tagger.proj_a.weight.data.copy_(sd["proj_a.weight"].to(tagger.proj_a.weight.dtype))
         tagger.proj_a.bias.data.copy_(sd["proj_a.bias"].to(tagger.proj_a.bias.dtype))
         tagger.type_emb.weight.data.copy_(sd["type_emb.weight"].to(tagger.type_emb.weight.dtype))
         if "cond_scale" in sd:
             tagger.cond_scale.data.copy_(sd["cond_scale"].to(tagger.cond_scale.dtype))
+        if "proj_a_corr_A" in sd and tagger.proj_a_corr_A is not None:
+            tagger.proj_a_corr_A.data.copy_(sd["proj_a_corr_A"])
+            tagger.proj_a_corr_B.data.copy_(sd["proj_a_corr_B"])
         print(f"[tagger] warm-started Proj_A/type_emb/cond_scale from "
               f"{args.init_proj_a_from}")
 
@@ -228,10 +262,10 @@ def main():
 
     proj_a_unfrozen = step >= args.proj_a_freeze_steps
     if proj_a_unfrozen:
-        for p in tagger.proj_a.parameters():
+        for p in tagger.proj_a_trainable_parameters():
             p.requires_grad_(True)
     else:
-        for p in tagger.proj_a.parameters():
+        for p in tagger.proj_a_trainable_parameters():
             p.requires_grad_(False)
     loss_window = []
     pbar = tqdm(total=args.max_steps, initial=step,
@@ -242,7 +276,7 @@ def main():
             break
 
         if not proj_a_unfrozen and step >= args.proj_a_freeze_steps:
-            for p in tagger.proj_a.parameters():
+            for p in tagger.proj_a_trainable_parameters():
                 p.requires_grad_(True)
             proj_a_unfrozen = True
             print(f"[tagger] step={step} unfroze Proj_A")

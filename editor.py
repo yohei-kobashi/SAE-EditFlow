@@ -31,6 +31,7 @@ ranker then scores each template's argmax output.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -53,6 +54,9 @@ class SAEEditor(nn.Module):
         lora_r: int = 0,
         lora_alpha: float = 32.0,
         lora_dropout: float = 0.05,
+        proj_a_mode: str = "learned",
+        proj_a_rank: int = 32,
+        w_dec: Optional[torch.Tensor] = None,
     ):
         """
         Parameters
@@ -70,6 +74,19 @@ class SAEEditor(nn.Module):
             embeddings and LM head stay frozen). 0 disables LoRA — the
             frozen-backbone ablation. LEWIS fine-tunes its generator's
             backbone; see lora.py.
+        proj_a_mode : str
+            "learned"     — random-init trainable Proj_A (pre-v3.1);
+            "wdec-init"   — Proj_A initialized from the SAE decoder W_dec
+                            (feature f ↦ its residual-stream direction),
+                            then trained;
+            "wdec-frozen" — Proj_A fixed to W_dec plus a trainable rank-
+                            `proj_a_rank` correction: feature identity is
+                            inherited from the SAE geometry and can never
+                            be washed out (the OPAQUE-FLAG fix, §4.1).
+        w_dec : Optional[Tensor]
+            (d_sae, d_model) SAE decoder (model.load_sae_w_dec). Required
+            for the wdec modes at TRAINING time; may be None when the
+            weights are about to be overwritten by load_trainable.
         """
         super().__init__()
         self.encoder = BidirectionalLLM(llm2vec_dir, dtype=dtype)
@@ -97,10 +114,35 @@ class SAEEditor(nn.Module):
         self.d_model = int(d_model)
         self.d_sae = int(d_sae)
 
-        # Trainable Proj_A: d_sae → d_model. Float32 for stability.
+        # Proj_A: d_sae → d_model. Float32 for stability. See proj_a_mode.
+        if proj_a_mode not in ("learned", "wdec-init", "wdec-frozen"):
+            raise ValueError(f"unknown proj_a_mode {proj_a_mode!r}")
+        self.proj_a_mode = proj_a_mode
+        self.proj_a_rank = int(proj_a_rank)
         self.proj_a = nn.Linear(d_sae, d_model, bias=True)
         nn.init.normal_(self.proj_a.weight, std=0.02)
         nn.init.zeros_(self.proj_a.bias)
+        if proj_a_mode != "learned" and w_dec is not None:
+            if tuple(w_dec.shape) != (d_sae, d_model):
+                raise ValueError(f"W_dec shape {tuple(w_dec.shape)} != "
+                                 f"({d_sae}, {d_model})")
+            self.proj_a.weight.data.copy_(w_dec.t().to(self.proj_a.weight.dtype))
+            nn.init.zeros_(self.proj_a.bias)
+        if proj_a_mode == "wdec-frozen":
+            for p in self.proj_a.parameters():
+                p.requires_grad_(False)
+            # Low-rank correction on top of the frozen W_dec map: adapts the
+            # layer-12-residual geometry to the encoder's embedding space
+            # without ever losing per-feature identity. B = 0 → exact W_dec
+            # at step 0.
+            self.proj_a_corr_A = nn.Parameter(
+                torch.empty(self.proj_a_rank, d_sae, dtype=torch.float32))
+            nn.init.kaiming_uniform_(self.proj_a_corr_A, a=math.sqrt(5))
+            self.proj_a_corr_B = nn.Parameter(
+                torch.zeros(d_model, self.proj_a_rank, dtype=torch.float32))
+        else:
+            self.proj_a_corr_A = None
+            self.proj_a_corr_B = None
 
         # type_emb[0..2]: text / amp / sup
         self.type_emb = nn.Embedding(3, d_model)
@@ -165,11 +207,26 @@ class SAEEditor(nn.Module):
         rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
         return x / rms * (self.cond_target_rms * self.cond_scale)
 
+    def _proj(self, z: torch.Tensor) -> torch.Tensor:
+        """Apply Proj_A (+ the low-rank correction in wdec-frozen mode)."""
+        x = self.proj_a(z)
+        if self.proj_a_corr_A is not None:
+            x = x + (z @ self.proj_a_corr_A.t()) @ self.proj_a_corr_B.t()
+        return x
+
+    def proj_a_trainable_parameters(self):
+        """The parameters the Proj_A freeze/unfreeze schedule governs:
+        proj_a itself (learned / wdec-init) or the low-rank correction
+        (wdec-frozen — the W_dec base stays frozen forever)."""
+        if self.proj_a_mode == "wdec-frozen":
+            return [self.proj_a_corr_A, self.proj_a_corr_B]
+        return list(self.proj_a.parameters())
+
     def cond_embeds(self, z_amp: torch.Tensor, z_sup: torch.Tensor) -> torch.Tensor:
         """Build the (B, 2, d_model) prefix conditioning tensor."""
         # Proj_A in float32; cast back to encoder dtype at the boundary.
-        amp = self._calibrate_cond(self.proj_a(z_amp.to(self.proj_a.weight.dtype)))  # (B, d_model)
-        sup = self._calibrate_cond(self.proj_a(z_sup.to(self.proj_a.weight.dtype)))
+        amp = self._calibrate_cond(self._proj(z_amp.to(self.proj_a.weight.dtype)))  # (B, d_model)
+        sup = self._calibrate_cond(self._proj(z_sup.to(self.proj_a.weight.dtype)))
         # Add type embeddings
         type_amp = self.type_emb(torch.full((amp.shape[0],), 1, device=amp.device, dtype=torch.long))
         type_sup = self.type_emb(torch.full((sup.shape[0],), 2, device=sup.device, dtype=torch.long))
@@ -256,6 +313,9 @@ class SAEEditor(nn.Module):
         }
         if self.delta_emb.numel() > 0:
             sd["delta_emb"] = self.delta_emb.detach().cpu()
+        if self.proj_a_corr_A is not None:
+            sd["proj_a_corr_A"] = self.proj_a_corr_A.detach().cpu()
+            sd["proj_a_corr_B"] = self.proj_a_corr_B.detach().cpu()
         if self.lora_cfg is not None:
             for n, t in lora_state_dict(self.encoder.backbone).items():
                 sd[f"lora::{n}"] = t
@@ -269,6 +329,14 @@ class SAEEditor(nn.Module):
             self.cond_scale.data.copy_(state_dict["cond_scale"])
         if "delta_emb" in state_dict and self.delta_emb.numel() > 0:
             self.delta_emb.data.copy_(state_dict["delta_emb"])
+        if "proj_a_corr_A" in state_dict:
+            if self.proj_a_corr_A is None:
+                raise ValueError(
+                    "checkpoint has a Proj_A low-rank correction but the "
+                    "model was built with proj_a_mode != 'wdec-frozen' — "
+                    "use load_editor_from_checkpoint")
+            self.proj_a_corr_A.data.copy_(state_dict["proj_a_corr_A"])
+            self.proj_a_corr_B.data.copy_(state_dict["proj_a_corr_B"])
         lora_sd = {k[len("lora::"):]: v for k, v in state_dict.items()
                    if k.startswith("lora::")}
         if lora_sd and self.lora_cfg is None:
@@ -288,6 +356,8 @@ class SAEEditor(nn.Module):
             "d_model": int(self.d_model),
             "train_token_ids": self.train_token_ids,
             "lora": self.lora_cfg,
+            "proj_a_mode": self.proj_a_mode,
+            "proj_a_rank": int(self.proj_a_rank),
         }, path)
 
 
@@ -303,6 +373,9 @@ def load_editor_from_checkpoint(
         lora_r=int(lora.get("r", 0)),
         lora_alpha=float(lora.get("alpha", 32.0)),
         lora_dropout=float(lora.get("dropout", 0.05)),
+        proj_a_mode=blob.get("proj_a_mode", "learned"),
+        proj_a_rank=int(blob.get("proj_a_rank", 32)),
+        # w_dec omitted: proj_a.weight is restored from the checkpoint.
     )
     editor.load_trainable(blob["trainable"])
     return editor
