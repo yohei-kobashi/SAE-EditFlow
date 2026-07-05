@@ -2340,7 +2340,17 @@ def main():
             if not props:
                 ttype_counts["no_proposal"] += 1
             if props:
-                prop = props[rng.randrange(len(props))]
+                # Family-balanced sampling: pooled-uniform lets
+                # high-applicability families (DEGREE:+very fires on any
+                # adjective) crowd out the rare structural ones (pilot:
+                # 20% of transform records were DEG:+very). Pick a family
+                # uniformly first, then a proposal within it.
+                by_fam: Dict[str, list] = {}
+                for pr in props:
+                    by_fam.setdefault(pr.family, []).append(pr)
+                fams = sorted(by_fam)
+                fam_props = by_fam[fams[rng.randrange(len(fams))]]
+                prop = fam_props[rng.randrange(len(fam_props))]
                 ttype_counts[f"prop:{prop.t_type}"] += 1
                 if not roundtrip_ok(stage.spacy_full, prop, sent, rng):
                     ttype_counts[f"rtfail:{prop.family}"] += 1
