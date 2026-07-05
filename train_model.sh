@@ -3,7 +3,7 @@
 #------ qsub option --------#
 #PBS -q short-g
 #PBS -l select=1
-#PBS -l walltime=24:00:00
+#PBS -l walltime=8:00:00
 #PBS -W group_list=gj26
 #PBS -j oe
 
