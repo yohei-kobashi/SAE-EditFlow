@@ -12,6 +12,7 @@ activations (`mu`, from precompute_sae.py) into the two sparse vectors
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Iterable, List, Sequence, Tuple
 
@@ -55,22 +56,37 @@ def build_intervention_vectors(
 
 
 def parse_k_spec(spec) -> tuple:
-    """Conditioning-count spec: 'LO-HI' (uniform inclusive) or a fixed int.
+    """Conditioning-count spec → ("uniform"|"log", lo, hi).
 
-    Shared by training (--k-amp/--k-sup, default '1-8') and evaluation
+      'LO-HI'     : uniform inclusive
+      'log:LO-HI' : log-uniform inclusive — most mass on sparse specs
+                    (the realistic user regime) with a dense tail for
+                    robustness (log:1-32 puts ~70% of draws at k ≤ 8)
+      'K'         : fixed
+
+    Shared by training (--k-amp/--k-sup) and evaluation
     (eval_tagger_editor.py / scripts/sweep_eval_hparams.py) so both sides
     draw from the same distribution family.
     """
     s = str(spec)
+    mode = "uniform"
+    if s.startswith("log:"):
+        mode = "log"
+        s = s[4:]
     if "-" in s:
         lo, hi = s.split("-", 1)
-        return int(lo), int(hi)
+        return mode, int(lo), int(hi)
     v = int(s)
-    return v, v
+    return mode, v, v
 
 
-def draw_k(rng, spec_lohi: tuple) -> int:
-    lo, hi = spec_lohi
+def draw_k(rng, spec: tuple) -> int:
+    mode, lo, hi = spec
+    if lo >= hi:
+        return int(lo)
+    if mode == "log":
+        u = rng.uniform(math.log(lo), math.log(hi + 1))
+        return int(min(hi, math.floor(math.exp(u))))
     return int(rng.integers(lo, hi + 1))
 
 

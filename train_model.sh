@@ -13,7 +13,9 @@ cd ~/SAE-LEWIS
 
 set -eo pipefail
 
-# v5 run: v4d transform families + composition + k-draw 1-8.
+# v5 run: v4d transform families + composition + K-robust conditioning
+# (train k ~ log-uniform{1..32} from a top-32 pool; the post-training
+# sweep then locates the inference-time optimum on the robust model).
 # The +200k top-up is generated in a FRESH dir (corruption_v5topup) — the
 # v4 cache's meta.json makes corruption_parallel.sh treat the old dir as
 # complete, and merging new worker shards into it would collide with the
@@ -80,13 +82,28 @@ RUN_DIR=$V5 \
 EDITOR_STEPS=100000 TAGGER_STEPS=30000 \
 DEV_CORRUPTION_DIR=$V4/corruption_seldev \
 DEV_BATCHES=384 \
-K_DRAW=1-8 \
+K_TOP=32 K_DRAW=log:1-32 \
 LLM2VEC_DIR=$LLM2VEC \
 SIMCSE_DIR=$LLM2VEC \
 bash scripts/run_production.sh
 
-# 2. Evaluation at the swept operating point (k_top=8, k=8, ins 0.9;
-#    confirmed on the v4 reporting dev — sweep_report.md).
+# 2a. K sweep on the K-robust model (SELECTION split): the optimum found
+#     on the v4 model (k_top=8, k=8) may shift now that training saw
+#     dense specs. Confirm the winner on corruption_dev before adopting.
+python scripts/sweep_eval_hparams.py \
+    --corruption-dir "$V4/corruption_seldev" \
+    --llm2vec-dir "$LLM2VEC" \
+    --tagger-ckpt "$V5/tagger/tagger-final.pt" \
+    --editor-ckpt "$V5/editor/editor-final.pt" \
+    --output-dir "$V5/hparam_sweep" \
+    --grid-k-top 4,8,16,32,64 \
+    --grid-k 2,4,8,16,32,64 \
+    --ins-thresholds 0.5,0.7,0.8,0.9 \
+    --max-samples 1000
+
+# 2b. Fixed-point evaluation at the v4 operating point (k_top=8, k=8,
+#     ins 0.9) for cross-version comparability; re-run at the sweep's
+#     winner if it differs.
 python eval_tagger_editor.py \
     --corruption-dir "$V4/corruption_dev" \
     --llm2vec-dir "$LLM2VEC" \

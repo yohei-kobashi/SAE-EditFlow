@@ -135,6 +135,7 @@ if [[ -n "$DEV_CORRUPTION_DIR" ]]; then
 fi
 
 K_DRAW=${K_DRAW:-"1-8"}
+K_TOP=${K_TOP:-8}
 EXCLUDE_FAMILIES=${EXCLUDE_FAMILIES:-""}
 LOFO_ARGS=()
 if [[ -n "$EXCLUDE_FAMILIES" ]]; then
@@ -513,7 +514,7 @@ else
             --max-steps "$EDITOR_STEPS" \
             --warmup-steps 500 \
             --proj-a-freeze-steps 1000 \
-            --k-amp "$K_DRAW" --k-sup "$K_DRAW" \
+            --k-top "$K_TOP" --k-amp "$K_DRAW" --k-sup "$K_DRAW" \
             "${LOFO_ARGS[@]}" \
             --batch-size "$EDITOR_BATCH" \
             --num-workers "$NUM_WORKERS" \
@@ -540,7 +541,7 @@ else
             --max-steps "$TAGGER_STEPS" \
             --warmup-steps 500 \
             --proj-a-freeze-steps 500 \
-            --k-amp "$K_DRAW" --k-sup "$K_DRAW" \
+            --k-top "$K_TOP" --k-amp "$K_DRAW" --k-sup "$K_DRAW" \
             "${LOFO_ARGS[@]}" \
             --batch-size "$TAGGER_BATCH" \
             --num-workers "$NUM_WORKERS" \

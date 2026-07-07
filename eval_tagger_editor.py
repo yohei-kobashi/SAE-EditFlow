@@ -54,7 +54,7 @@ from transformers import AutoTokenizer, set_seed
 
 from data import CorruptionCollator, CorruptionDataset
 from editor import load_editor_from_checkpoint
-from intervene import diff_to_sparse, parse_k_spec
+from intervene import diff_to_sparse, draw_k, parse_k_spec
 from lewis_ops import NUM_OPS3, OP3_NAMES
 from tagger import load_tagger_from_checkpoint
 
@@ -120,8 +120,8 @@ def build_conditions(
     `conditions` are built (hyperparameter sweeps use ["true"] alone).
     """
     conditions = list(CONDITIONS) if conditions is None else list(conditions)
-    amp_lo, amp_hi = _parse_k_spec(k_amp_spec)
-    sup_lo, sup_hi = _parse_k_spec(k_sup_spec)
+    amp_spec = parse_k_spec(k_amp_spec)
+    sup_spec = parse_k_spec(k_sup_spec)
     B, d_sae = z_X.shape
     amp_t = torch.zeros_like(z_X)
     sup_t = torch.zeros_like(z_X)
@@ -129,8 +129,8 @@ def build_conditions(
     sup_r = torch.zeros_like(z_X)
 
     for b in range(B):
-        k_amp = int(rng.integers(amp_lo, amp_hi + 1))
-        k_sup = int(rng.integers(sup_lo, sup_hi + 1))
+        k_amp = draw_k(rng, amp_spec)
+        k_sup = draw_k(rng, sup_spec)
         a, s = diff_to_sparse(
             z_X[b], z_X_prime[b],
             k_top=k_top, k_amp=k_amp, k_sup=k_sup,
