@@ -7,6 +7,7 @@
 #PBS -W group_list=gj26
 #PBS -j oe
 
+cd ~/
 source start_gpu_nodes.sh
 cd ~/SAE-LEWIS
 
