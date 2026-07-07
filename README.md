@@ -1108,6 +1108,8 @@ python eval_tagger_editor.py \
 | Δ(true − random) ≪ Δ(true − empty) | OPAQUE-FLAG warning — conditioning works as a generic "something changed" cue, not SAE feature identity; the `random-conditioning` ablation (§13.2) would fail |
 | both gaps clearly positive | conditioning is used AND SAE-grounded |
 
+**Conditioning-density sweep (`scripts/sweep_eval_hparams.py`).** The eval-time conditioning hyperparameters are tunable: `--k-top` (diff candidate pool), `--k-amp`/`--k-sup` (`'LO-HI'` uniform draw or fixed int) and the INS threshold. Sweep on the SELECTION split (`corruption_seldev`), confirm the chosen setting with a full three-condition run on the reporting dev split. v4 finding: **`k_top=8, k=8` (take all top-8 diff features deterministically, INS threshold 0.9) dominates the training-matched draw (`k~U{1..4}`, threshold 0.5)** — dev-confirmed tagger macro-F1 0.752→0.797, INS F1 0.499→0.694, editor repl_top1 0.566→0.778, ins_top1 0.544→0.651, with the causality gaps *growing* (e.g. editor repl Δ(t−r) 0.31→0.53). Widening `k_top` beyond 8 hurts: the k features are sampled from the pool, so a larger pool dilutes the draw with weak diff features. Report both the training-matched and best-k settings; the mismatch also motivates widening the training-time draw to `U{1..8}` at the next retraining.
+
 Diagnostics reported alongside: `cond_scale`, `‖Proj_A.W‖`, and per-token `delta_emb` norms. Outputs `eval_report.md` + `eval_metrics.json`.
 
 ## 14. References
