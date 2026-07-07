@@ -59,6 +59,10 @@ MLM_MODEL=${MLM_MODEL:-"modernbert-base"}
 SPACY_MODEL=${SPACY_MODEL:-"en_core_web_sm"}
 DEVICE=${DEVICE:-cuda}
 SEED=${SEED:-42}
+# Floor for --skip-sentences (top-up into a FRESH dir: pass the previous
+# cache's meta.json "sentences_seen" so the new run continues the Dolma
+# stream instead of re-corrupting it from the start).
+SKIP_SENTENCES=${SKIP_SENTENCES:-0}
 # Per-op-type PROPOSAL weights (defaults match corruption.py argparse).
 # Acceptance is not type-neutral (e.g. the SLOR gate hits INS's natural-word
 # deletions harder than MLM-proposed REPL/DEL edits), so bump a type's weight
@@ -112,6 +116,10 @@ for p in sorted(out.glob("shard-*.jsonl.gz")):
 print(n, last)
 PY
 )
+if (( SKIP_SENTENCES > LAST_SID )); then
+    LAST_SID=$SKIP_SENTENCES
+    echo "[parallel] skip-sentences floor applied: $LAST_SID"
+fi
 REMAINING=$(( CORRUPTION_SAMPLES - EXISTING ))
 echo "[parallel] existing samples=$EXISTING (last source sentence $LAST_SID); remaining=$REMAINING"
 if (( REMAINING <= 0 )); then
