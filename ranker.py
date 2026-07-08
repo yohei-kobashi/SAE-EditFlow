@@ -6,7 +6,16 @@ SAE-aware candidate ranker (see README §4.4).
               + γ · content_preservation(input, c)
               − η · num_INS_slots(c)
 
-- sae_align: cosine of pool-max SAE features with z_amp minus with z_sup
+- sae_align: magnitude-weighted satisfaction of the commanded feature
+  DELTAS: how far the candidate MOVES each commanded feature from the
+  input, clamped per-feature to the commanded magnitude, normalised to
+  [-1, 1]. The identity candidate scores exactly 0; a candidate that
+  fully realises every commanded shift scores 1. (Earlier versions used
+  cosine(pool-max(cand), z_amp) − cosine(·, z_sup); with a 16k-dim
+  candidate vector and a k-sparse spec the denominator is dominated by
+  thousands of unrelated features, compressing the component to a
+  ±0.005 range that no weight setting can rescue — the v5 LinguaLens
+  run picked identity on 100/100 pairs.)
 - fluency:   min(0, tanh(meanLL(c) − meanLL(input))) under frozen causal
   Gemma. A DELTA, not the absolute mean log-likelihood: absolute meanLL
   sits at −3..−5 nats/token, where tanh is saturated at ≈ −1.0 for every
@@ -62,9 +71,12 @@ class Ranker:
         # input (0.0 = off). Compared in tanh space in combine().
         self.fluency_gate = float(fluency_gate)
         # component_scores is called once per candidate with the SAME
-        # input_ids; memoize the input's meanLL (one entry is enough).
+        # input_ids; memoize the input's meanLL and pool-max SAE vector
+        # (one entry each is enough).
         self._input_ll_key: tuple = ()
         self._input_ll_val: float = 0.0
+        self._input_z_key: tuple = ()
+        self._input_z_val: torch.Tensor | None = None
 
     @torch.no_grad()
     def _sae_pool_max(self, token_ids: List[int]) -> torch.Tensor:
@@ -101,11 +113,36 @@ class Ranker:
         Exposed separately so weight calibration can grid-search
         RankerWeights offline over cached components
         (scripts/calibrate_ranker.py) without re-running the three models.
+        NOTE: dumps written before the directional sae_align (2026-07)
+        hold cosine-based values on a ±0.005 scale — do not mix them with
+        new dumps when calibrating.
         """
         z_cand = self._sae_pool_max(cand_ids).to(z_amp.device)
         eps = 1e-8
-        sa_amp = torch.dot(z_cand, z_amp) / (z_cand.norm() * z_amp.norm() + eps)
-        sa_sup = torch.dot(z_cand, z_sup) / (z_cand.norm() * z_sup.norm() + eps)
+        z_key = tuple(input_ids)
+        if z_key != self._input_z_key or self._input_z_val is None:
+            self._input_z_key = z_key
+            self._input_z_val = self._sae_pool_max(input_ids).to(z_amp.device)
+        delta = z_cand - self._input_z_val
+
+        # Directional satisfaction of the commanded deltas. Per commanded
+        # feature the credit is the candidate's actual movement, clamped
+        # to the commanded magnitude (clamp(delta, -a, a) == a * clamp(
+        # delta/a, -1, 1)); normalising by the total commanded magnitude
+        # keeps the score in [-1, 1] and magnitude-weighted, so with a
+        # dense k=64 spec the top features carry the signal instead of
+        # averaging it away over the tail.
+        amp_mask = z_amp > 0
+        sup_mask = z_sup > 0
+        total = float(z_amp[amp_mask].sum() + z_sup[sup_mask].sum())
+        if total > 0:
+            gain = torch.clamp(delta[amp_mask],
+                               -z_amp[amp_mask], z_amp[amp_mask]).sum()
+            gain = gain + torch.clamp(-delta[sup_mask],
+                                      -z_sup[sup_mask], z_sup[sup_mask]).sum()
+            sae_align = float(gain) / (total + eps)
+        else:
+            sae_align = 0.0
 
         key = tuple(input_ids)
         if key != self._input_ll_key:
@@ -118,7 +155,7 @@ class Ranker:
         content = float((e_in @ e_cd) / (e_in.norm() * e_cd.norm() + eps))
 
         return {
-            "sae_align": float(sa_amp - sa_sup),
+            "sae_align": sae_align,
             # tanh-bounded meanLL DELTA vs input, CLIPPED at 0: fluency is
             # a constraint, not an objective. Rewarding fluency GAINS turns
             # the ranker into a generic "make it more fluent" editor that
