@@ -55,7 +55,8 @@ from transformers import AutoTokenizer                             # noqa: E402
 
 from editor import load_editor_from_checkpoint                     # noqa: E402
 from eval_lingualens import (                                      # noqa: E402
-    _peek_d_sae, diff_intervention, pair_metrics,
+    _peek_d_sae, diff_intervention, edit_char_ranges, local_pool_topk,
+    pair_metrics, sae_z_with_offsets,
 )
 from model import SAEFeatureExtractor                              # noqa: E402
 
@@ -163,62 +164,9 @@ def build_gold_template(
 
 
 # ---------------------------------------------------------------------------
-# Edit-local conditioning (training parity — corruption.py cond_scope=local)
-# ---------------------------------------------------------------------------
-@torch.no_grad()
-def sae_z_with_offsets(extractor, text: str, device: str):
-    """Per-token SAE activations + char offsets (extractor's tokenizer).
-    Mirrors corruption.sae_encode_with_offsets without needing a Stage."""
-    enc = extractor.llm_tokenizer(
-        text, return_tensors="pt", truncation=True, max_length=256,
-        return_offsets_mapping=True, add_special_tokens=True,
-    )
-    offsets = [tuple(o) for o in enc["offset_mapping"][0].tolist()]
-    inp = {k: v.to(device) for k, v in enc.items()
-           if k in ("input_ids", "attention_mask")}
-    out = extractor.llm(**inp, output_hidden_states=True, use_cache=False)
-    h = out.hidden_states[extractor.layer_idx][0]
-    z = extractor.sae.encode(h.to(extractor.sae.W_enc.dtype))
-    return offsets, z                                      # (T, d_sae)
-
-
-def edit_char_ranges(opcodes, src_off, tgt_off):
-    """Char ranges touched by the alignment, per side (skips specials)."""
-    src_r, tgt_r = [], []
-    for tag, i1, i2, j1, j2 in opcodes:
-        if tag == "equal":
-            continue
-        if i2 > i1:
-            spans = [src_off[i] for i in range(i1, min(i2, len(src_off)))
-                     if src_off[i] != (0, 0)]
-            if spans:
-                src_r.append((spans[0][0], spans[-1][1]))
-        if j2 > j1:
-            spans = [tgt_off[j] for j in range(j1, min(j2, len(tgt_off)))
-                     if tgt_off[j] != (0, 0)]
-            if spans:
-                tgt_r.append((spans[0][0], spans[-1][1]))
-    return src_r, tgt_r
-
-
-def local_pool_topk(z, offsets, char_ranges, k, blocklist=None):
-    """Pool-max over tokens overlapping char_ranges, blocklist-mask, keep
-    top-k. Falls back to global pooling when no position matches."""
-    pos = [ti for ti, (ts, te) in enumerate(offsets)
-           if not (ts == 0 and te == 0)
-           and any(ts < ce and te > cs for cs, ce in char_ranges)]
-    zp = (z[pos] if pos else z).max(dim=0).values.float()
-    if blocklist is not None:
-        zp[blocklist.to(zp.device)] = 0.0
-    out = torch.zeros_like(zp)
-    v, i = zp.topk(min(k, zp.numel()))
-    keep = v > 0
-    out[i[keep]] = v[keep]
-    return out.cpu()
-
-
-# ---------------------------------------------------------------------------
 # Decode modes
+# (edit-local conditioning helpers live in eval_lingualens.py — shared with
+#  the end-to-end pipeline so the two cannot diverge)
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def fill_template(

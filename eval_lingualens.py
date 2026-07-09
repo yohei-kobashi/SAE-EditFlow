@@ -91,6 +91,26 @@ def parse_args():
     p.add_argument("--k-sup", type=int, default=4)
     p.add_argument("--pool-topk", type=int, default=64,
                    help="Sentence pool-max top-K before diffing (= K_train).")
+    p.add_argument("--cond-scope", choices=["global", "local"],
+                   default="global",
+                   help="Conditioning extraction. 'local' pools each side "
+                        "over only the s1↔s2 alignment's edited tokens — "
+                        "TRAINING parity (corruption.py cond_scope=local "
+                        "since v4) and the primary fix for the OOD "
+                        "conditioning-ignored failure (§13.6). Same oracle "
+                        "access level as z(s2), which the protocol already "
+                        "grants.")
+    p.add_argument("--blocklist", default="",
+                   help="blocklist.npy masked before the conditioning "
+                        "top-k, as in training.")
+    p.add_argument("--steer-lambda", type=float, default=0.0,
+                   help="A-1 logit-lens fill bias: add λ·std-norm(W_U · "
+                        "(z_amp − z_sup)W_dec) to the editor's template "
+                        "logits — the SAE's own feature→token dictionary. "
+                        "Knee ≈ 1–2 with local scope (§13.6); 0 = off. "
+                        "Applied per condition (empty stays unbiased; "
+                        "random gets its random features' bias — part of "
+                        "the causality control).")
     p.add_argument("--conditions", default="true,empty",
                    help=f"Comma list from {CONDITIONS_ALL}.")
 
@@ -175,6 +195,89 @@ def randomize_intervention(
     for i, v in zip(idx, vals):
         out[int(i)] = float(v)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Edit-local conditioning extraction (training parity — README §13.6).
+# Training conditioning has been edit-local + blocklist-masked since v4;
+# feeding whole-sentence global diffs at eval was the primary cause of the
+# OOD "conditioning ignored for content" failure (fill top-1 0.13→0.21 on
+# the gold-template probe from the scope fix alone).
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def sae_z_with_offsets(extractor, text: str, device: str):
+    """Per-token SAE activations + char offsets (extractor's tokenizer)."""
+    enc = extractor.llm_tokenizer(
+        text, return_tensors="pt", truncation=True, max_length=256,
+        return_offsets_mapping=True, add_special_tokens=True,
+    )
+    offsets = [tuple(o) for o in enc["offset_mapping"][0].tolist()]
+    inp = {k: v.to(device) for k, v in enc.items()
+           if k in ("input_ids", "attention_mask")}
+    out = extractor.llm(**inp, output_hidden_states=True, use_cache=False)
+    h = out.hidden_states[extractor.layer_idx][0]
+    z = extractor.sae.encode(h.to(extractor.sae.W_enc.dtype))
+    return offsets, z                                      # (T, d_sae)
+
+
+def edit_char_ranges(opcodes, src_off, tgt_off):
+    """Char ranges touched by the alignment, per side (skips specials)."""
+    src_r, tgt_r = [], []
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == "equal":
+            continue
+        if i2 > i1:
+            spans = [src_off[i] for i in range(i1, min(i2, len(src_off)))
+                     if src_off[i] != (0, 0)]
+            if spans:
+                src_r.append((spans[0][0], spans[-1][1]))
+        if j2 > j1:
+            spans = [tgt_off[j] for j in range(j1, min(j2, len(tgt_off)))
+                     if tgt_off[j] != (0, 0)]
+            if spans:
+                tgt_r.append((spans[0][0], spans[-1][1]))
+    return src_r, tgt_r
+
+
+def local_pool_topk(z, offsets, char_ranges, k, blocklist=None):
+    """Pool-max over tokens overlapping char_ranges, blocklist-mask, keep
+    top-k. Falls back to global pooling when no position matches."""
+    pos = [ti for ti, (ts, te) in enumerate(offsets)
+           if not (ts == 0 and te == 0)
+           and any(ts < ce and te > cs for cs, ce in char_ranges)]
+    zp = (z[pos] if pos else z).max(dim=0).values.float()
+    if blocklist is not None:
+        zp[blocklist.to(zp.device)] = 0.0
+    out = torch.zeros_like(zp)
+    v, i = zp.topk(min(k, zp.numel()))
+    keep = v > 0
+    out[i[keep]] = v[keep]
+    return out.cpu()
+
+
+def pair_z(extractor, tokenizer, a: str, b: str, pool_topk: int,
+           device: str, blocklist=None, scope: str = "local"):
+    """(z_a, z_b) pooled per `scope`: 'local' pools each side over only the
+    tokens its a↔b alignment marks as edited; 'global' pools everything
+    (still applying the blocklist)."""
+    if scope == "local":
+        ids_a = tokenizer(a, add_special_tokens=True).input_ids
+        ids_b = tokenizer(b, add_special_tokens=True).input_ids
+        om_a = [tuple(o) for o in tokenizer(
+            a, add_special_tokens=True,
+            return_offsets_mapping=True)["offset_mapping"]]
+        om_b = [tuple(o) for o in tokenizer(
+            b, add_special_tokens=True,
+            return_offsets_mapping=True)["offset_mapping"]]
+        opcodes = difflib.SequenceMatcher(
+            None, ids_a, ids_b, autojunk=False).get_opcodes()
+        ra, rb = edit_char_ranges(opcodes, om_a, om_b)
+    else:
+        ra, rb = [], []
+    off_a, z_a = sae_z_with_offsets(extractor, a, device)
+    off_b, z_b = sae_z_with_offsets(extractor, b, device)
+    return (local_pool_topk(z_a, off_a, ra, pool_topk, blocklist),
+            local_pool_topk(z_b, off_b, rb, pool_topk, blocklist))
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +377,28 @@ def main():
     ranker = Ranker(extractor, causal, bid, rw, device=args.device,
                     fluency_gate=args.fluency_gate)
 
+    blk = None
+    if args.blocklist:
+        blk = torch.as_tensor(np.asarray(np.load(args.blocklist),
+                                         dtype=np.int64))
+        print(f"[lingua-eval] blocklist: {len(blk)} features masked")
+    w_dec = head_w = None
+    if args.steer_lambda > 0:
+        from model import load_sae_w_dec
+        w_dec = load_sae_w_dec(args.sae_repo, args.sae_path).to(args.device)
+        head_w = editor.lm_head.weight.detach().float().to(args.device)
+        print(f"[lingua-eval] lens fill bias: λ={args.steer_lambda:g}")
+
+    def lens_bias(za, zs):
+        if w_dec is None:
+            return None
+        d = (za.to(args.device) - zs.to(args.device)) @ w_dec
+        lb = head_w @ d
+        s = float(lb.std())
+        if s < 1e-6:
+            return None                       # empty spec → no bias
+        return args.steer_lambda * lb / s
+
     rng = np.random.default_rng(args.seed)
     records: List[Dict] = []
     agg = {c: defaultdict(list) for c in conditions}
@@ -288,10 +413,15 @@ def main():
         src, tgt = ex["sentence1"], ex["sentence2"]
 
         with torch.no_grad():
-            z_src = extractor.pool_max_topk(extractor.encode_text(src),
-                                            args.pool_topk).float().cpu()
-            z_tgt = extractor.pool_max_topk(extractor.encode_text(tgt),
-                                            args.pool_topk).float().cpu()
+            if args.cond_scope == "local" or blk is not None:
+                z_src, z_tgt = pair_z(extractor, tokenizer, src, tgt,
+                                      args.pool_topk, args.device, blk,
+                                      scope=args.cond_scope)
+            else:
+                z_src = extractor.pool_max_topk(extractor.encode_text(src),
+                                                args.pool_topk).float().cpu()
+                z_tgt = extractor.pool_max_topk(extractor.encode_text(tgt),
+                                                args.pool_topk).float().cpu()
         z_amp_t, z_sup_t = diff_intervention(z_src, z_tgt, args.k_amp, args.k_sup)
         variants = {}
         if "true" in conditions:
@@ -320,11 +450,18 @@ def main():
                         # Remaining gap to the SAME target feature state;
                         # achieved features drop out of the spec.
                         with torch.no_grad():
-                            z_cur = extractor.pool_max_topk(
-                                extractor.encode_text(cur), args.pool_topk,
-                            ).float().cpu()
+                            if args.cond_scope == "local" or blk is not None:
+                                z_cur, z_tgt_p = pair_z(
+                                    extractor, tokenizer, cur, tgt,
+                                    args.pool_topk, args.device, blk,
+                                    scope=args.cond_scope)
+                            else:
+                                z_cur = extractor.pool_max_topk(
+                                    extractor.encode_text(cur),
+                                    args.pool_topk).float().cpu()
+                                z_tgt_p = z_tgt
                         za, zs = diff_intervention(
-                            z_cur, z_tgt, args.k_amp, args.k_sup)
+                            z_cur, z_tgt_p, args.k_amp, args.k_sup)
                     result = edit_once(
                         text=cur, z_amp_full=za, z_sup_full=zs,
                         tagger=tagger, editor=editor, ranker=ranker,
@@ -335,6 +472,7 @@ def main():
                         max_templates=args.max_templates,
                         fill_topk=args.fill_topk,
                         max_fill_variants=args.max_fill_variants,
+                        logit_bias=lens_bias(za, zs),
                         return_details=args.dump_details,
                         verbose=False,
                     )
@@ -417,7 +555,10 @@ def main():
              f"dataset: `{args.dataset}` (language={args.language}), "
              f"sample={len(chosen)} (seed={args.seed}), scored="
              f"{summary['n_scored']}, enumeration-skipped={skipped}", "",
-             f"intervention: diff-based, k_amp={args.k_amp} k_sup={args.k_sup} "
+             f"intervention: diff-based, scope={args.cond_scope} "
+             f"blocklist={'yes' if blk is not None else 'no'} "
+             f"steer_lambda={args.steer_lambda:g} "
+             f"k_amp={args.k_amp} k_sup={args.k_sup} "
              f"pool_topk={args.pool_topk}; l_max={args.l_max} "
              f"ins_threshold={args.ins_threshold}; refine_passes="
              f"{args.refine_passes}"

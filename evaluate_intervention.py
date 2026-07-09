@@ -126,6 +126,7 @@ def edit_once(
     max_templates: int = 256,
     fill_topk: int = 5,
     max_fill_variants: int = 32,
+    logit_bias: Optional[torch.Tensor] = None,
     return_details: bool = False,
     verbose: bool = True,
 ):
@@ -158,6 +159,12 @@ def edit_once(
     attn = enc.attention_mask
     z_amp_dev = z_amp_full.unsqueeze(0).to(device)
     z_sup_dev = z_sup_full.unsqueeze(0).to(device)
+    # A-1 lens fill bias (README §13.6): a (V,)-shaped logit offset from
+    # the SAE's own feature→token dictionary, added at every template
+    # position before argmax/top-k. Computed by the caller from the same
+    # (z_amp, z_sup) spec, so it needs no learned readout.
+    if logit_bias is not None:
+        logit_bias = logit_bias.to(device)
 
     mask_id = int(tokenizer.mask_token_id)
     ins_id = int(tokenizer.convert_tokens_to_ids("[INS]"))
@@ -246,6 +253,8 @@ def edit_once(
             )
             logits = out["logits"][0, tpl_start:]           # template segment
             logits[:, marker_ids] = float("-inf")           # never emit markers
+            if logit_bias is not None:
+                logits = logits + logit_bias.to(logits.dtype)
             argmax = logits.argmax(dim=-1).cpu().numpy()
             decoded = decode_editor_output(
                 np.asarray(tpl_ids[offset:], dtype=np.int64), argmax,
@@ -284,6 +293,8 @@ def edit_once(
             )
             logits = out["logits"][0, meta["tpl_start"]:]
             logits[:, marker_ids] = float("-inf")
+            if logit_bias is not None:
+                logits = logits + logit_bias.to(logits.dtype)
             parent = candidates[edited_best]
             dec_off = 1 if meta["offset"] else 0   # parent has <bos> prepended
             n_var = 0
