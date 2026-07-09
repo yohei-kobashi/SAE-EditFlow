@@ -145,7 +145,10 @@ classifier-free guidance と同型の**毎ステップガイダンス**として
 ## 温存する代替(この計画が外れた場合)
 
 - **Edit Flows / DiffusER 型への全面移行**: 編集操作の CTMC/拡散。tagger との分離を
-  失うため、C1/A2 のゲートが連続して不成立の場合にのみ検討。
+  失うため、C1/A2 のゲートが連続して不成立の場合に本命へ昇格。
+  **具体化計画は EDIT_FLOWS_PLAN.md**(SAE-EF: 凍結 Gemma + λ/Q ヘッド、
+  キャッシュのペアをカップリング教師に流用、CFG を λ/Q に独立適用、
+  C1 との同予算直接対決で判定)。
 - **Gemma-2-9B + Gemma Scope 65k へのスケール**: 全課題に効くが再構築コスト最大。
   v7 の後の判断。
 - **LinguaLens FT(premise protection 付き)**: ベンチマーク特化の最終手段。
