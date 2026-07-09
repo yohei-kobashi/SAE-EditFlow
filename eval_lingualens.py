@@ -422,6 +422,18 @@ def main():
                                                 args.pool_topk).float().cpu()
                 z_tgt = extractor.pool_max_topk(extractor.encode_text(tgt),
                                                 args.pool_topk).float().cpu()
+        # Metric-side vectors stay GLOBAL regardless of cond_scope:
+        # sae_shift measures whole-output movement toward the target, and
+        # mixing a global z(out) with local z_src/z_tgt makes the metric
+        # incoherent (empty-condition copies scored −0.53 instead of 0).
+        with torch.no_grad():
+            if args.cond_scope == "local" or blk is not None:
+                z_src_g = extractor.pool_max_topk(
+                    extractor.encode_text(src), args.pool_topk).float().cpu()
+                z_tgt_g = extractor.pool_max_topk(
+                    extractor.encode_text(tgt), args.pool_topk).float().cpu()
+            else:
+                z_src_g, z_tgt_g = z_src, z_tgt
         z_amp_t, z_sup_t = diff_intervention(z_src, z_tgt, args.k_amp, args.k_sup)
         variants = {}
         if "true" in conditions:
@@ -492,10 +504,10 @@ def main():
                         extractor.encode_text(out_text), args.pool_topk,
                     ).float().cpu()
                 eps = 1e-8
-                cos_out = float(torch.dot(z_out, z_tgt)
-                                / (z_out.norm() * z_tgt.norm() + eps))
-                cos_src = float(torch.dot(z_src, z_tgt)
-                                / (z_src.norm() * z_tgt.norm() + eps))
+                cos_out = float(torch.dot(z_out, z_tgt_g)
+                                / (z_out.norm() * z_tgt_g.norm() + eps))
+                cos_src = float(torch.dot(z_src_g, z_tgt_g)
+                                / (z_src_g.norm() * z_tgt_g.norm() + eps))
                 m["sae_shift"] = cos_out - cos_src
                 for key, v in m.items():
                     agg[c][key].append(v)
