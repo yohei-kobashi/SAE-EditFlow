@@ -1,6 +1,8 @@
 # Edit Flows 案(SAE-EF)— 具体化計画
 
 位置づけ: V7_PLAN(C→A ハイブリッド)の**並行トラック / 昇格候補**。
+ゼロベース再設計(SAE/corruption/LLM2Vec のみ継承、Z1–Z5 差分)は
+**EDIT_FLOWS_ZERO.md** — 本計画のプロトタイプを flow 核として共有する上位互換パス。
 Havasi et al., *Edit Flows: Flow Matching with Edit Operations*(arXiv:2506.09018,
 NeurIPS 2025)を、SAE 条件付き編集(x′ → x、minimal edit)の regime に適合させる。
 レビュー結論(2026-07): 多サイト・可変長の尾部で最有力、主成分(1–3 編集)では
