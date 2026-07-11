@@ -39,7 +39,8 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup, set_see
 from data import CorruptionDataset, _dense_topk
 from editflow import SAEEditFlow
 from editflow_ops import (
-    KIND_INS, KIND_SUB, align_pair, build_xt, kappa, slot_ops, w_weight,
+    KIND_INS, KIND_SUB, align_pair, build_xt, cache_slots, kappa, slot_ops,
+    w_weight,
 )
 from intervene import diff_to_sparse, draw_k, parse_k_spec
 from model import load_sae_w_dec
@@ -57,6 +58,29 @@ def parse_args():
                    help="v6 SAEEditor checkpoint: warm-start the "
                         "conditioning stack (Proj_A correction, type_emb, "
                         "cond_scale) and the LoRA adapters.")
+    p.add_argument("--init-from-editflow", default=None,
+                   help="SAE-EF checkpoint: warm-start across Z variants "
+                        "(missing/extra heads skipped). Applied AFTER "
+                        "--init-from-editor if both are given.")
+
+    # Z1 (EDIT_FLOWS_ZERO.md)
+    p.add_argument("--t-film", action="store_true",
+                   help="Z1a: FiLM(t) on the λ head input — fixes the "
+                        "pilot's rate saturation (λ≈0.25 while w(t)→9; "
+                        "README §13.8).")
+    p.add_argument("--rate-head-lr", type=float, default=3e-3,
+                   help="Z1a: separate LR for the rate head (lam_head + "
+                        "lam_film) — 10x the small-params LR by default.")
+    p.add_argument("--cond-mode", default="pooled",
+                   choices=["pooled", "feature-tokens"],
+                   help="Z1b: 'feature-tokens' = one prefix token per "
+                        "commanded feature (W_dec base + sign + magnitude) "
+                        "instead of the pooled 2-vector prefix.")
+    p.add_argument("--true-align", action="store_true",
+                   help="Z2: build slots from the cache's editor artifacts "
+                        "(the ops that GENERATED the pair) instead of "
+                        "difflib; falls back per record when they don't "
+                        "reconstruct (x0, x1).")
 
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--num-workers", type=int, default=2)
@@ -114,6 +138,8 @@ class EditFlowCollator:
         return {
             "x0": [list(map(int, r["x_prime_token_ids"])) for r in batch],
             "x1": [list(map(int, r["x_token_ids"])) for r in batch],
+            "ei": [r.get("editor_input_token_ids") for r in batch],
+            "et": [r.get("editor_target_token_ids") for r in batch],
             "z_X": torch.stack([_dense_topk(r["z_X_topk"], self.d_sae)
                                 for r in batch]),
             "z_X_prime": torch.stack([_dense_topk(r["z_X_prime_topk"],
@@ -133,7 +159,12 @@ def build_batch(batch: Dict, rng: np.random.Generator, args,
         x0, x1 = batch["x0"][b], batch["x1"][b]
         if max(len(x0), len(x1)) > args.max_len:
             continue
-        slots = align_pair(x0, x1)
+        slots = None
+        if getattr(args, "true_align", False) and batch["ei"][b] is not None:
+            slots = cache_slots(x0, x1, batch["ei"][b], batch["et"][b],
+                                args._mask_id, args._ins_id, args._del_id)
+        if slots is None:
+            slots = align_pair(x0, x1)
         ops = slot_ops(slots)
         t = float(fixed_t[len(xs) % len(fixed_t)]) if fixed_t \
             else float(rng.random())
@@ -260,6 +291,9 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.llm2vec_dir)
     pad_id = tokenizer.pad_token_id or 0
+    args._mask_id = int(tokenizer.mask_token_id)
+    args._ins_id = int(tokenizer.convert_tokens_to_ids("[INS]"))
+    args._del_id = int(tokenizer.convert_tokens_to_ids("[DEL]"))
 
     meta = json.loads((Path(args.corruption_dir) / "meta.json").read_text())
     d_sae = int(meta["d_sae"])
@@ -272,20 +306,31 @@ def main():
         args.llm2vec_dir, d_sae=d_sae, dtype=dtype,
         lora_r=args.lora_r, lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout, proj_a_rank=args.proj_a_rank,
-        w_dec=w_dec,
+        w_dec=w_dec, t_film=args.t_film, cond_mode=args.cond_mode,
     )
     if args.init_from_editor:
         model.init_from_editor(args.init_from_editor)
+    if args.init_from_editflow:
+        model.init_from_editflow(args.init_from_editflow)
     model = model.to(args.device)
+    print(f"[editflow] t_film={args.t_film} cond_mode={args.cond_mode} "
+          f"true_align={args.true_align}")
 
     lora_params = [p for n, p in model.named_parameters() if "lora_" in n]
+    rate_names = ("lam_head.", "lam_film.")
+    rate_params = [p for n, p in model.named_parameters()
+                   if n.startswith(rate_names) and p.requires_grad]
     small_params = [p for n, p in model.named_parameters()
-                    if "lora_" not in n and p.requires_grad]
+                    if "lora_" not in n and not n.startswith(rate_names)
+                    and p.requires_grad]
     print(f"[editflow] trainable: small="
           f"{sum(p.numel() for p in small_params):,} "
+          f"rate={sum(p.numel() for p in rate_params):,} "
+          f"@ {args.rate_head_lr:g} "
           f"lora={sum(p.numel() for p in lora_params):,}")
     optim = torch.optim.AdamW([
         {"params": small_params, "lr": args.learning_rate},
+        {"params": rate_params, "lr": args.rate_head_lr},
         {"params": lora_params, "lr": args.backbone_lr},
     ])
     sched = get_linear_schedule_with_warmup(

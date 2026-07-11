@@ -61,7 +61,17 @@ class SAEEditFlow(nn.Module):
         w_dec: Optional[torch.Tensor] = None,
         t_dim: int = 128,
         lam_bias_init: float = -4.0,
+        t_film: bool = False,
+        cond_mode: str = "pooled",
     ):
+        """t_film (Z1a): modulate the λ head's input with FiLM(t) — the
+        pilot showed rates saturate ≈0.25 instead of tracking w(t)'s growth
+        (README §13.8); a prefix token alone is too weak for magnitude.
+        cond_mode (Z1b): 'pooled' = the editor-style 2-vector prefix;
+        'feature-tokens' = one prefix token PER commanded feature —
+        W_dec[f] base (frozen, stored in proj_a) + type_emb sign + a
+        magnitude projection — so attention can bind individual features
+        to individual edit sites (essential problem #1)."""
         super().__init__()
         self.encoder = BidirectionalLLM(llm2vec_dir, dtype=dtype)
         self.encoder.eval()
@@ -87,6 +97,10 @@ class SAEEditFlow(nn.Module):
         self.d_sae = int(d_sae)
         self.proj_a_rank = int(proj_a_rank)
         self.t_dim = int(t_dim)
+        if cond_mode not in ("pooled", "feature-tokens"):
+            raise ValueError(f"unknown cond_mode {cond_mode!r}")
+        self.cond_mode = cond_mode
+        self.t_film = bool(t_film)
 
         # Conditioning — identical structure to SAEEditor (wdec-frozen mode)
         # so a v6 editor checkpoint initializes it 1:1.
@@ -127,6 +141,20 @@ class SAEEditFlow(nn.Module):
         nn.init.constant_(self.lam_head.bias, float(lam_bias_init))
         self.sub_shift = nn.Parameter(torch.zeros(d_model, dtype=torch.float32))
         self.ins_shift = nn.Parameter(torch.zeros(d_model, dtype=torch.float32))
+        # Z1a: FiLM(t) on the λ head input. Zero-init → exact identity at
+        # step 0; trained with the boosted rate-head LR group.
+        self.lam_film = None
+        if self.t_film:
+            self.lam_film = nn.Linear(self.t_dim, 2 * d_model)
+            nn.init.zeros_(self.lam_film.weight)
+            nn.init.zeros_(self.lam_film.bias)
+        # Z1b: magnitude projection for feature tokens. Zero-init → the
+        # token starts as pure W_dec direction + sign embedding.
+        self.mag_proj = None
+        if self.cond_mode == "feature-tokens":
+            self.mag_proj = nn.Linear(1, d_model)
+            nn.init.zeros_(self.mag_proj.weight)
+            nn.init.zeros_(self.mag_proj.bias)
 
     # ------------------------------------------------------------------
     def _calibrate(self, x: torch.Tensor, scale: bool = True) -> torch.Tensor:
@@ -153,7 +181,39 @@ class SAEEditFlow(nn.Module):
         emb = self.t_proj(feat)
         return self._calibrate(emb, scale=False).unsqueeze(1)   # (B, 1, d)
 
-    N_PREFIX = 3                                        # amp, sup, t
+    def feature_token_embeds(self, z_amp: torch.Tensor, z_sup: torch.Tensor):
+        """(B, P, d) prefix + (B, P) mask: one token per commanded feature.
+        Base = W_dec[f] (frozen, = proj_a.weight column), + type_emb sign
+        (amp=1 / sup=2, warm-startable from the editor), + mag_proj of
+        log1p(value). Right-padded; an empty spec yields P=1 all-masked."""
+        B = z_amp.shape[0]
+        W = self.proj_a.weight                          # (d_model, d_sae)
+        device = z_amp.device
+        rows, counts = [], []
+        for b in range(B):
+            toks = []
+            for z, sign in ((z_amp[b], 1), (z_sup[b], 2)):
+                nz = torch.nonzero(z > 0).flatten()
+                if nz.numel() == 0:
+                    continue
+                base = W[:, nz].t().to(torch.float32)   # (n, d)
+                mag = self.mag_proj(
+                    torch.log1p(z[nz]).unsqueeze(-1).to(torch.float32))
+                sgn = self.type_emb(torch.full((nz.numel(),), sign,
+                                               device=device,
+                                               dtype=torch.long))
+                toks.append(self._calibrate(base) + sgn + mag)
+            rows.append(torch.cat(toks, dim=0) if toks
+                        else torch.zeros(0, self.d_model, device=device))
+            counts.append(rows[-1].shape[0])
+        P = max(1, max(counts))
+        out = torch.zeros(B, P, self.d_model, device=device)
+        mask = torch.zeros(B, P, dtype=torch.long, device=device)
+        for b, r in enumerate(rows):
+            if r.shape[0]:
+                out[b, :r.shape[0]] = r
+                mask[b, :r.shape[0]] = 1
+        return out, mask
 
     # ------------------------------------------------------------------
     def forward(
@@ -167,18 +227,31 @@ class SAEEditFlow(nn.Module):
         B, T = input_ids.shape
         with torch.no_grad():
             tok = self.encoder.get_input_embeddings()(input_ids)
-        cond = self.cond_embeds(z_amp, z_sup).to(tok.dtype)
+        if self.cond_mode == "feature-tokens":
+            cond, cond_mask = self.feature_token_embeds(z_amp, z_sup)
+            cond = cond.to(tok.dtype)
+        else:
+            cond = self.cond_embeds(z_amp, z_sup).to(tok.dtype)
+            cond_mask = torch.ones(B, 2, dtype=attention_mask.dtype,
+                                   device=input_ids.device)
         temb = self.time_embeds(t).to(tok.dtype)
         full = torch.cat([cond, temb, tok], dim=1)
         full_mask = torch.cat([
-            torch.ones(B, self.N_PREFIX, dtype=attention_mask.dtype,
+            cond_mask.to(attention_mask.dtype),
+            torch.ones(B, 1, dtype=attention_mask.dtype,
                        device=input_ids.device),
             attention_mask,
         ], dim=1)
+        n_prefix = cond.shape[1] + 1
         h = self.encoder(inputs_embeds=full,
                          attention_mask=full_mask).last_hidden_state
-        h_text = h[:, self.N_PREFIX:, :]                # (B, T, d)
-        lam = F.softplus(self.lam_head(h_text.float())) # (B, T, 3) float32
+        h_text = h[:, n_prefix:, :]                     # (B, T, d)
+        lam_in = h_text.float()
+        if self.lam_film is not None:
+            gb = self.lam_film(timestep_features(t, self.t_dim))  # (B, 2d)
+            gamma, beta = gb.chunk(2, dim=-1)
+            lam_in = lam_in * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+        lam = F.softplus(self.lam_head(lam_in))         # (B, T, 3) float32
         lam = lam * attention_mask.unsqueeze(-1).float()
         return {"lambda": lam, "hidden": h_text}
 
@@ -231,21 +304,50 @@ class SAEEditFlow(nn.Module):
             "sub_shift": self.sub_shift.detach().cpu(),
             "ins_shift": self.ins_shift.detach().cpu(),
         }
+        if self.lam_film is not None:
+            sd["lam_film.weight"] = self.lam_film.weight.detach().cpu()
+            sd["lam_film.bias"] = self.lam_film.bias.detach().cpu()
+        if self.mag_proj is not None:
+            sd["mag_proj.weight"] = self.mag_proj.weight.detach().cpu()
+            sd["mag_proj.bias"] = self.mag_proj.bias.detach().cpu()
         if self.lora_cfg is not None:
             for n, tns in lora_state_dict(self.encoder.backbone).items():
                 sd[f"lora::{n}"] = tns
         return sd
 
-    def load_trainable(self, sd: Dict[str, torch.Tensor]):
-        for name in ("proj_a.weight", "proj_a.bias", "proj_a_corr_A",
-                     "proj_a_corr_B", "type_emb.weight", "cond_scale",
-                     "t_proj.weight", "t_proj.bias", "lam_head.weight",
-                     "lam_head.bias", "sub_shift", "ins_shift"):
+    _TRAINABLE_KEYS = (
+        "proj_a.weight", "proj_a.bias", "proj_a_corr_A", "proj_a_corr_B",
+        "type_emb.weight", "cond_scale", "t_proj.weight", "t_proj.bias",
+        "lam_head.weight", "lam_head.bias", "sub_shift", "ins_shift",
+        "lam_film.weight", "lam_film.bias", "mag_proj.weight",
+        "mag_proj.bias",
+    )
+
+    def load_trainable(self, sd: Dict[str, torch.Tensor],
+                       strict: bool = True):
+        """strict=False tolerates keys missing on either side (warm-start
+        across Z variants: a pilot checkpoint has no lam_film/mag_proj; a
+        pooled model has no mag_proj to receive)."""
+        skipped = []
+        for name in self._TRAINABLE_KEYS:
             obj = self
             *path, leaf = name.split(".")
             for part in path:
-                obj = getattr(obj, part)
-            getattr(obj, leaf).data.copy_(sd[name])
+                obj = getattr(obj, part, None)
+                if obj is None:
+                    break
+            tensor = getattr(obj, leaf, None) if obj is not None else None
+            if tensor is None or name not in sd:
+                if strict and (name in sd) != (tensor is not None):
+                    raise KeyError(f"trainable key mismatch: {name} "
+                                   f"(in ckpt: {name in sd}, in model: "
+                                   f"{tensor is not None})")
+                if name in sd or tensor is not None:
+                    skipped.append(name)
+                continue
+            tensor.data.copy_(sd[name])
+        if skipped:
+            print(f"[editflow] load_trainable: skipped {skipped}")
         lora_sd = {k[len("lora::"):]: v for k, v in sd.items()
                    if k.startswith("lora::")}
         if lora_sd:
@@ -253,6 +355,13 @@ class SAEEditFlow(nn.Module):
                 raise ValueError("checkpoint has LoRA but model built with "
                                  "lora_r=0 — use load_editflow_from_checkpoint")
             load_lora_state_dict(self.encoder.backbone, lora_sd)
+
+    def init_from_editflow(self, ckpt_path: str):
+        """Warm start from another SAE-EF checkpoint, tolerating Z-variant
+        differences (missing/extra heads are skipped, LoRA transfers)."""
+        blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        self.load_trainable(blob["trainable"], strict=False)
+        print(f"[editflow] init from editflow ckpt {ckpt_path}")
 
     def save(self, path: str):
         path = Path(path)
@@ -264,6 +373,8 @@ class SAEEditFlow(nn.Module):
             "lora": self.lora_cfg,
             "proj_a_rank": int(self.proj_a_rank),
             "t_dim": int(self.t_dim),
+            "t_film": bool(self.t_film),
+            "cond_mode": self.cond_mode,
         }, path)
 
 
@@ -280,6 +391,8 @@ def load_editflow_from_checkpoint(
         lora_dropout=float(lora.get("dropout", 0.05)),
         proj_a_rank=int(blob.get("proj_a_rank", 32)),
         t_dim=int(blob.get("t_dim", 128)),
+        t_film=bool(blob.get("t_film", False)),
+        cond_mode=blob.get("cond_mode", "pooled"),
     )
     model.load_trainable(blob["trainable"])
     return model

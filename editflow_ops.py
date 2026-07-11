@@ -101,6 +101,39 @@ def x0_of(slots) -> List[int]:
     return [int(a0) for a0, _ in slots if a0 is not None]
 
 
+def cache_slots(x0, x1, editor_input, editor_target,
+                mask_id: int, ins_id: int, del_id: int):
+    """TRUE-alignment slots from the corruption cache's editor artifacts
+    (Z2, EDIT_FLOWS_ZERO.md): the cache encodes the ops that GENERATED the
+    pair — [MASK] at REPL (target = gold token), [INS] slots (target =
+    inserted token), DEL kept in place with a [DEL] target — so the slot
+    list can be reconstructed exactly instead of re-derived with difflib
+    (which can misalign repeated tokens). Returns None when the artifacts
+    don't reconstruct (x0, x1) — caller falls back to align_pair."""
+    slots: List[Tuple[Optional[int], Optional[int]]] = []
+    i = 0
+    for j in range(len(editor_input)):
+        tin, tt = int(editor_input[j]), int(editor_target[j])
+        if tin == ins_id:
+            slots.append((None, tt))
+        else:
+            if i >= len(x0):
+                return None
+            tok0 = int(x0[i])
+            i += 1
+            if tt == del_id:
+                slots.append((tok0, None))
+            else:
+                slots.append((tok0, tt))
+    if i != len(x0):
+        return None
+    if x0_of(slots) != [int(v) for v in x0]:
+        return None
+    if apply_all(slots) != [int(v) for v in x1]:
+        return None
+    return slots
+
+
 # ---------------------------------------------------------------------------
 # Forward process / training targets
 # ---------------------------------------------------------------------------
