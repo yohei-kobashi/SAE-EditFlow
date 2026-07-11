@@ -164,13 +164,16 @@ def decode_flow(
         lam[0, KIND_SUB] = 0.0
 
         flat = lam.reshape(-1)                       # (L*3,)
-        # Stall exit: rates this small can never fire anything real; six
-        # consecutive dead steps (empty / satisfied conditioning) end the
-        # decode instead of burning the remaining forwards.
+        # Stall exit — LATE HALF ONLY (t > 0.5). The rates are hazards
+        # (they grow with t by construction: target w(t) ≈ 0 near t=0),
+        # so early quiet steps are normal, not dead; counting them killed
+        # every decode at t≈0.12 in the first recal run. Dead rates after
+        # t=0.5 mean nothing is coming (empty / satisfied conditioning).
         if float(flat.max()) < 0.02:
-            stall += 1
-            if stall >= 6:
-                break
+            if t > 0.5:
+                stall += 1
+                if stall >= 6:
+                    break
             continue
         stall = 0
         if mode == "det":

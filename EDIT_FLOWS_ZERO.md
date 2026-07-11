@@ -9,10 +9,15 @@ flow 核(演算・κ・損失・tau-leaping)は実装済みのものを共有す
 「ゼロベース」は実際には**載せ替え可能な差分 Z1–Z5 の集合**である。
 
 パイロット実測(README §13.8)による前提更新: **共有最大未知だった
-「λ の OOD localization」は肯定済み**(λ-IoU 0.73 vs tagger ~0.30、
-empty 0.20 / random 0.30、premise protection は random 指令まで完全)。
-残る故障はレート絶対値の較正のみ。よって本計画は「賭け」ではなく
-「実証済みの WHERE 機構を伸ばす投資」に格上げされた。
+「λ の OOD localization」は肯定済み**(λ-IoU 0.7337、empty 0.20 /
+random 0.30、premise protection は random 指令まで完全)。
+recal で判明した重要な訂正: 同一ペアの **tagger count-oracle は 0.7472 =
+ランキング能力はパリティ**。e2e の 0.30 は「知識」ではなく「決定較正 +
+パイプライン段の損失」であり、EF の優位性の根拠は「決定経路が単一の
+較正可能スカラーであること」(パイプラインの多段カスケードとの対比)に
+更新される。もう1つの実測: **λ は t に伴う成長を追従しない**
+(目標比 0.119@t=0.3 → 0.027@t=0.9、λ≈0.25 で飽和)— t トークン1個では
+強度変調が弱い。→ Z1 に t 注入強化を含める。
 
 ---
 
@@ -57,8 +62,13 @@ F(f,±,v) = W_dec[f](凍結) + sign_emb(±) + mag_mlp(log(1+v))
   同予算 30k で再学習し、同じ probe で λ-IoU / exact を直接比較。
   editor からの Proj_A 継承は形が合わないため不可 — ただし LoRA は
   **パイロット EF checkpoint から**温めれば良い。
-- 実装: editflow.py(cond_embeds を可変長プレフィクスに、N_PREFIX 動的化)、
-  train_editflow.py(z_amp/z_sup 疎ベクトル → (f,±,v) リスト変換)。
+- **t 注入強化を同梱**(recal 実測: λ が w(t) 成長を追従せず ≈0.25 で飽和 —
+  プレフィクス 1 トークンでは強度変調が届かない): t の正弦特徴を
+  **λ ヘッドの入力に FiLM(scale/shift)で直接注入** + rate-head の LR を
+  小物パラメータ群から分離して増額。
+- 実装: editflow.py(cond_embeds を可変長プレフィクスに、N_PREFIX 動的化、
+  λ ヘッド FiLM)、train_editflow.py(z_amp/z_sup 疎ベクトル → (f,±,v)
+  リスト変換、rate-head LR 群)。
 
 ### Z2 — 真アラインメント教師(difflib 事後推定の廃止)
 
