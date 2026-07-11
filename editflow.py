@@ -63,15 +63,25 @@ class SAEEditFlow(nn.Module):
         lam_bias_init: float = -4.0,
         t_film: bool = False,
         cond_mode: str = "pooled",
+        rate_param: str = "free",
+        w_max: float = 20.0,
     ):
-        """t_film (Z1a): modulate the λ head's input with FiLM(t) — the
-        pilot showed rates saturate ≈0.25 instead of tracking w(t)'s growth
-        (README §13.8); a prefix token alone is too weak for magnitude.
+        """t_film (Z1a): modulate the λ head's input with FiLM(t) — REFUTED
+        + premise-breaking (README §13.8 Z1 verdict; the additive β(t) is an
+        input-independent rate path). Kept for checkpoint compat only.
         cond_mode (Z1b): 'pooled' = the editor-style 2-vector prefix;
         'feature-tokens' = one prefix token PER commanded feature —
         W_dec[f] base (frozen, stored in proj_a) + type_emb sign + a
         magnitude projection — so attention can bind individual features
-        to individual edit sites (essential problem #1)."""
+        to individual edit sites (essential problem #1).
+        rate_param (S1, EDIT_FLOWS_ZERO §5): 'free' = λ = softplus(head) —
+        the paper's generic CTMC head; 'hazard' = λ = w(t)·sigmoid(head).
+        In the editing regime κ is known and each op fires once, so the
+        target rate is exactly w(t)·1[pending]: give the hazard factor
+        analytically and learn ONLY P(pending). Magnitude tracking becomes
+        exact by construction, the thr{F} decode reads as p ≥ F (a
+        calibrated probability), and there is no input-independent rate
+        path to leak premise protection."""
         super().__init__()
         self.encoder = BidirectionalLLM(llm2vec_dir, dtype=dtype)
         self.encoder.eval()
@@ -101,6 +111,10 @@ class SAEEditFlow(nn.Module):
             raise ValueError(f"unknown cond_mode {cond_mode!r}")
         self.cond_mode = cond_mode
         self.t_film = bool(t_film)
+        if rate_param not in ("free", "hazard"):
+            raise ValueError(f"unknown rate_param {rate_param!r}")
+        self.rate_param = rate_param
+        self.w_max = float(w_max)
 
         # Conditioning — identical structure to SAEEditor (wdec-frozen mode)
         # so a v6 editor checkpoint initializes it 1:1.
@@ -251,9 +265,22 @@ class SAEEditFlow(nn.Module):
             gb = self.lam_film(timestep_features(t, self.t_dim))  # (B, 2d)
             gamma, beta = gb.chunk(2, dim=-1)
             lam_in = lam_in * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
-        lam = F.softplus(self.lam_head(lam_in))         # (B, T, 3) float32
+        logits3 = self.lam_head(lam_in)                 # (B, T, 3) float32
+        if self.rate_param == "hazard":
+            # λ = w(t)·P(pending): analytic hazard × learned probability.
+            tt = t.float().clamp(0.0, 1.0)
+            w = (3.0 * tt * tt / (1.0 - tt ** 3).clamp_min(1e-9)
+                 ).clamp(max=self.w_max)                # (B,)
+            p = torch.sigmoid(logits3)
+            lam = w.view(-1, 1, 1) * p
+        else:
+            p = None
+            lam = F.softplus(logits3)
         lam = lam * attention_mask.unsqueeze(-1).float()
-        return {"lambda": lam, "hidden": h_text}
+        out = {"lambda": lam, "hidden": h_text}
+        if p is not None:
+            out["p"] = p * attention_mask.unsqueeze(-1).float()
+        return out
 
     def q_logits(self, h_sel: torch.Tensor, kind: str) -> torch.Tensor:
         """Token distribution logits from selected hidden states (N, d).
@@ -375,6 +402,8 @@ class SAEEditFlow(nn.Module):
             "t_dim": int(self.t_dim),
             "t_film": bool(self.t_film),
             "cond_mode": self.cond_mode,
+            "rate_param": self.rate_param,
+            "w_max": float(self.w_max),
         }, path)
 
 
@@ -393,6 +422,8 @@ def load_editflow_from_checkpoint(
         t_dim=int(blob.get("t_dim", 128)),
         t_film=bool(blob.get("t_film", False)),
         cond_mode=blob.get("cond_mode", "pooled"),
+        rate_param=blob.get("rate_param", "free"),
+        w_max=float(blob.get("w_max", 20.0)),
     )
     model.load_trainable(blob["trainable"])
     return model

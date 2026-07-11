@@ -39,7 +39,7 @@ from transformers import AutoTokenizer                             # noqa: E402
 
 from editflow import load_editflow_from_checkpoint                 # noqa: E402
 from editflow_ops import (                                         # noqa: E402
-    KIND_DEL, KIND_INS, KIND_SUB, align_pair, apply_step_ops,
+    KIND_DEL, KIND_INS, KIND_SUB, align_pair, apply_step_ops, build_xt,
     gold_edit_positions, lambda_iou, slot_ops, w_weight,
 )
 from eval_lingualens import (                                      # noqa: E402
@@ -82,13 +82,16 @@ def parse_args():
 
     p.add_argument("--steps", type=int, default=48)
     p.add_argument("--decode", default="det,stoch",
-                   help="Comma list: det = expected-count top-rate ops per "
-                        "step; stoch = Bernoulli fires + temperature-1 Q "
-                        "samples (true condition only); thr{F} = fire ops "
-                        "whose rate ≥ F·w(t) — CALIBRATED thresholding "
-                        "against the training target (a pending op's "
-                        "optimal rate IS w(t)), robust to a globally "
-                        "under-scaled λ head. E.g. 'det,thr0.1,thr0.25'.")
+                   help="Comma list of BASE[@MOD...]: bases are det "
+                        "(expected-count top-rate ops), stoch (Bernoulli "
+                        "fires + Q samples; true-only), thr{F} (fire when "
+                        "λ ≥ F·w(t); for hazard models this reads p ≥ F), "
+                        "bo{K} (K stoch samples, pick by directional SAE "
+                        "achievement — the ranker's flow-native "
+                        "replacement; true-only). Modifiers: @cfg{S} "
+                        "(CFG scale on λ and Q, paper §CFG), @temp{T} "
+                        "(Q sampling temperature for stoch/bo). E.g. "
+                        "'det,det@cfg2,thr0.02@cfg2,bo4@temp0.7@cfg2'.")
     p.add_argument("--w-max", type=float, default=20.0,
                    help="w(t) clip — must match training --w-max.")
     p.add_argument("--tagger-ckpt", default="",
@@ -121,6 +124,34 @@ def _bucket(n: int) -> str:
     return "9+"
 
 
+def parse_decode(m: str) -> Dict:
+    """'BASE[@MOD...]' → spec dict. See --decode help."""
+    parts = m.split("@")
+    base = parts[0]
+    spec = {"name": m, "cfg": None, "temp": 1.0, "bo": 0, "frac": 0.0}
+    try:
+        if base in ("det", "stoch"):
+            spec["decode"] = base
+        elif base.startswith("thr"):
+            spec["decode"] = "thr"
+            spec["frac"] = float(base[3:])
+        elif base.startswith("bo"):
+            spec["decode"] = "stoch"
+            spec["bo"] = int(base[2:])
+        else:
+            raise ValueError(f"unknown base {base!r}")
+        for p in parts[1:]:
+            if p.startswith("cfg"):
+                spec["cfg"] = float(p[3:])
+            elif p.startswith("temp"):
+                spec["temp"] = float(p[4:])
+            else:
+                raise ValueError(f"unknown modifier {p!r}")
+    except ValueError as e:
+        raise SystemExit(f"bad decode spec {m!r}: {e}")
+    return spec
+
+
 @torch.no_grad()
 def rates(model, ids: List[int], za, zs, t: float, device: str):
     """One forward → (lam (L,3) float32, hidden (L,d))."""
@@ -136,7 +167,7 @@ def decode_flow(
     model, src_ids: List[int], za, zs, *,
     steps: int, device: str, mode: str = "det",
     thr_frac: float = 0.0, w_max: float = 20.0,
-    thr_abs_floor: float = 0.05,
+    thr_abs_floor: float = 0.05, temp: float = 1.0,
     lens_bias: Optional[torch.Tensor] = None,
     cfg_scale: float = 1.0,
     max_ops_per_step: int = 8, max_grow: int = 24,
@@ -239,11 +270,11 @@ def decode_flow(
                     logits[suppress_ids] = float("-inf")
                 if lens_bias is not None:
                     logits = logits + lens_bias
-                if mode == "det":
-                    tok = int(logits.argmax())
-                else:
-                    probs = torch.softmax(logits, dim=-1)
+                if mode == "stoch":
+                    probs = torch.softmax(logits / max(temp, 1e-3), dim=-1)
                     tok = int(torch.multinomial(probs, 1))
+                else:                                 # det / thr: argmax
+                    tok = int(logits.argmax())
                 if kind == KIND_SUB and tok == x[pos]:
                     continue                          # no-op substitution
             chosen.append({"kind": kind, "pos": pos, "tok": tok})
@@ -256,18 +287,9 @@ def decode_flow(
 def main():
     args = parse_args()
     conditions = [c.strip() for c in args.conditions.split(",") if c.strip()]
-    mode_specs = []                       # (name, decode_mode, thr_frac)
-    for m in args.decode.split(","):
-        m = m.strip()
-        if not m:
-            continue
-        if m in ("det", "stoch"):
-            mode_specs.append((m, m, 0.0))
-        elif m.startswith("thr"):
-            mode_specs.append((m, "thr", float(m[3:])))
-        else:
-            raise SystemExit(f"unknown decode mode {m!r}")
-    modes = [name for name, _, _ in mode_specs]
+    mode_specs = [parse_decode(m.strip())
+                  for m in args.decode.split(",") if m.strip()]
+    modes = [sp["name"] for sp in mode_specs]
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16,
@@ -409,6 +431,32 @@ def main():
 
         rec = {"idx": int(k), "src": src, "tgt": tgt, "n_ops": n_ops,
                "outputs": {}}
+
+        # best-of-K selection: directional SAE achievement of a candidate
+        # (the ranker's flow-native replacement — EDIT_FLOWS_ZERO §3).
+        z_in_global = None
+
+        def sae_gain(out_ids, za_v, zs_v):
+            nonlocal z_in_global
+            am, sm = za_v > 0, zs_v > 0
+            total = float(za_v[am].sum() + zs_v[sm].sum())
+            if total <= 0:
+                return 0.0
+            if z_in_global is None:
+                with torch.no_grad():
+                    z_in_global = extractor.pool_max_topk(
+                        extractor.encode_text(src),
+                        args.pool_topk).float().cpu()
+            text = tokenizer.decode(out_ids, skip_special_tokens=True)
+            with torch.no_grad():
+                z_out = extractor.pool_max_topk(
+                    extractor.encode_text(text),
+                    args.pool_topk).float().cpu()
+            delta = z_out - z_in_global
+            gain = torch.clamp(delta[am], -za_v[am], za_v[am]).sum()
+            gain = gain + torch.clamp(-delta[sm], -zs_v[sm], zs_v[sm]).sum()
+            return float(gain) / (total + 1e-8)
+
         for c in conditions:
             za = zvar[c][0].unsqueeze(0).to(args.device)
             zs = zvar[c][1].unsqueeze(0).to(args.device)
@@ -420,14 +468,28 @@ def main():
 
             if c == "true":
                 # rate-magnitude diagnostic: mean top-|gold| λ across t —
-                # compare against the training target w(t)
+                # compare against the training target w(t). CAVEAT: x0 at
+                # high t is OFF-distribution; the on-dist column samples a
+                # true z_t state, where the optimum is w(t)·P(pending) and
+                # ratios reflect the model's calibrated P.
                 rec["rate_diag"] = {}
+                rec["rate_diag_ondist"] = {}
+                ops_all = slot_ops(slots)
                 for td in T_DIAG:
                     lam_d, _ = rates(model, src_ids, za, zs, td,
                                      args.device)
                     tot = lam_d.sum(dim=-1)
                     topv = tot.topk(min(len(gold_pos), tot.shape[0])).values
                     rec["rate_diag"][str(td)] = float(topv.mean())
+                    fired = [prng.random() < td ** 3 for _ in ops_all]
+                    x_t, pend = build_xt(slots, ops_all, fired)
+                    if pend:
+                        lam_o, _ = rates(model, x_t, za, zs, td,
+                                         args.device)
+                        vals = [float(lam_o[op["pos"], op["kind"]])
+                                for op in pend]
+                        rec["rate_diag_ondist"][str(td)] = (
+                            sum(vals) / len(vals))
                 if tagger is not None:
                     x_in = torch.tensor([src_ids], dtype=torch.long,
                                         device=args.device)
@@ -446,17 +508,32 @@ def main():
 
             lb = lens_bias(zvar[c][0], zvar[c][1]) if c != "empty" else None
             rec["outputs"][c] = {"lambda_iou": iou}
-            for m, dmode, frac in mode_specs:
-                if m == "stoch" and c != "true":
+            for spec in mode_specs:
+                m = spec["name"]
+                if spec["decode"] == "stoch" and c != "true":
                     continue
-                out_ids = decode_flow(
-                    model, src_ids, za, zs, steps=args.steps,
-                    device=args.device, mode=dmode, thr_frac=frac,
-                    w_max=args.w_max, lens_bias=lb,
-                    cfg_scale=args.cfg_scale,
-                    max_ops_per_step=args.max_ops_per_step,
-                    max_grow=args.max_grow, suppress_ids=suppress,
-                    rng=srng)
+                cfg = spec["cfg"] if spec["cfg"] is not None \
+                    else args.cfg_scale
+                K = max(1, spec["bo"])
+                out_ids, best_gain = None, None
+                for ki in range(K):
+                    srng_k = random.Random(
+                        args.seed * 1000003 + int(k) * 37 + ki) \
+                        if K > 1 else srng
+                    cand = decode_flow(
+                        model, src_ids, za, zs, steps=args.steps,
+                        device=args.device, mode=spec["decode"],
+                        thr_frac=spec["frac"], w_max=args.w_max,
+                        temp=spec["temp"], lens_bias=lb, cfg_scale=cfg,
+                        max_ops_per_step=args.max_ops_per_step,
+                        max_grow=args.max_grow, suppress_ids=suppress,
+                        rng=srng_k)
+                    if K == 1:
+                        out_ids = cand
+                        break
+                    g = sae_gain(cand, zvar[c][0], zvar[c][1])
+                    if best_gain is None or g > best_gain:
+                        best_gain, out_ids = g, cand
                 out_text = tokenizer.decode(out_ids,
                                             skip_special_tokens=True)
                 pm = pair_metrics(out_text, src, tgt)
@@ -478,6 +555,7 @@ def main():
     iou_agg = {c: [] for c in conditions}
     tagger_iou_agg = []
     lam_diag = {t: [] for t in T_DIAG}
+    lam_diag_od = {t: [] for t in T_DIAG}
     bpair = {m: defaultdict(lambda: defaultdict(list)) for m in modes}
     for r in records:
         b = _bucket(int(r["n_ops"]))
@@ -487,6 +565,9 @@ def main():
             v = (r.get("rate_diag") or {}).get(str(td))
             if v is not None:
                 lam_diag[td].append(float(v))
+            vo = (r.get("rate_diag_ondist") or {}).get(str(td))
+            if vo is not None:
+                lam_diag_od[td].append(float(vo))
         for c in conditions:
             co = r["outputs"].get(c)
             if not co:
@@ -538,18 +619,26 @@ def main():
               "above is the apples-to-apples bar).", ""]
 
     lines += ["## Rate magnitude vs training target (condition = true)", "",
-              "λ head calibration: at a pending site the training optimum "
-              "is λ* = w(t). Ratios ≪ 1 mean the decode's expected-count "
-              "rule under-fires (use thr{F} decode or retrain with a "
-              "larger rate-head LR).", "",
-              "| t | w(t) target | mean top-|gold| λ | ratio |",
-              "|---|---|---|---|"]
+              "The training optimum at a pending site is λ* = "
+              "w(t)·P(pending | x_t). The x0 column feeds x0 at every t "
+              "(OFF-distribution at high t — ratios < 1 there are partly "
+              "CORRECT uncertainty); the on-dist column measures pending "
+              "sites on a sampled true z_t state, so its ratio reads as "
+              "the model's calibrated P(pending). For hazard-parameterized "
+              "models the on-dist ratio IS mean p.", "",
+              "| t | w(t) | top-|gold| λ @x0 | ratio | pending λ on-dist "
+              "| ratio |",
+              "|---|---|---|---|---|---|"]
     payload["rate_calibration"] = {}
     for td in T_DIAG:
         wt = w_weight(td, args.w_max)
         mv = float(np.mean(lam_diag[td])) if lam_diag[td] else float("nan")
-        payload["rate_calibration"][str(td)] = {"w": wt, "mean_top_lam": mv}
-        lines.append(f"| {td:g} | {wt:.3f} | {mv:.4f} | {mv / wt:.3f} |")
+        mo = float(np.mean(lam_diag_od[td])) if lam_diag_od[td] \
+            else float("nan")
+        payload["rate_calibration"][str(td)] = {
+            "w": wt, "mean_top_lam_x0": mv, "mean_pending_lam_ondist": mo}
+        lines.append(f"| {td:g} | {wt:.3f} | {mv:.4f} | {mv / wt:.3f} "
+                     f"| {mo:.4f} | {mo / wt:.3f} |")
     lines.append("")
 
     lines += ["## Decode quality (gates (b), (c))", "",

@@ -81,6 +81,12 @@ def parse_args():
                         "(the ops that GENERATED the pair) instead of "
                         "difflib; falls back per record when they don't "
                         "reconstruct (x0, x1).")
+    p.add_argument("--rate-param", default="free",
+                   choices=["free", "hazard"],
+                   help="S1 (EDIT_FLOWS_ZERO §5): 'hazard' = λ = "
+                        "w(t)·sigmoid(head) — analytic hazard factor, the "
+                        "head learns only P(pending). Magnitude tracking "
+                        "exact by construction; thr{F} decode = p ≥ F.")
 
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--num-workers", type=int, default=2)
@@ -307,6 +313,7 @@ def main():
         lora_r=args.lora_r, lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout, proj_a_rank=args.proj_a_rank,
         w_dec=w_dec, t_film=args.t_film, cond_mode=args.cond_mode,
+        rate_param=args.rate_param, w_max=args.w_max,
     )
     if args.init_from_editor:
         model.init_from_editor(args.init_from_editor)
@@ -314,7 +321,7 @@ def main():
         model.init_from_editflow(args.init_from_editflow)
     model = model.to(args.device)
     print(f"[editflow] t_film={args.t_film} cond_mode={args.cond_mode} "
-          f"true_align={args.true_align}")
+          f"true_align={args.true_align} rate_param={args.rate_param}")
 
     lora_params = [p for n, p in model.named_parameters() if "lora_" in n]
     rate_names = ("lam_head.", "lam_film.")
