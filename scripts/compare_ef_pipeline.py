@@ -31,6 +31,10 @@ def main():
     p.add_argument("--pipeline", required=True,
                    help="eval_lingualens records.jsonl")
     p.add_argument("--condition", default="true")
+    p.add_argument("--exclude", default="",
+                   help="records.jsonl whose idx set is DROPPED from the "
+                        "join — e.g. the 200-pair probe that selected the "
+                        "operating F, leaving a clean holdout")
     args = p.parse_args()
 
     ef = {r["idx"]: r for r in load_jsonl(args.ef)}
@@ -38,6 +42,11 @@ def main():
     common = sorted(set(ef) & set(pl))
     print(f"matched pairs: {len(common)} "
           f"(ef {len(ef)}, pipeline {len(pl)})")
+    if args.exclude:
+        drop = {r["idx"] for r in load_jsonl(args.exclude)}
+        common = [k for k in common if k not in drop]
+        print(f"after --exclude ({len(drop)} idx dropped): "
+              f"{len(common)} pairs")
     if not common:
         return
 
