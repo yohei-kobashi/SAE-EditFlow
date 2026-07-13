@@ -58,6 +58,17 @@ run_frr b2_prompt8_rnd  "$V6/prompt_baseline500/records.jsonl"      "prompt8" ra
 # empty rows are copies -> FRR trivially ~0, stated analytically.)
 run_frr b2_prompt8_empty "$V6/prompt_baseline500/records.jsonl"     "prompt8" empty
 
+# B1 (LinguaLens clamp) — THE system this metric exists for; rows are
+# skipped gracefully if run_ef_b1.sh has not produced records yet.
+if [ -f "$V6/clamp_baseline500/records.jsonl" ]; then
+    run_frr b1_clamp10     "$V6/clamp_baseline500/records.jsonl" "clamp10" true
+    run_frr b1_clampZ      "$V6/clamp_baseline500/records.jsonl" "clampZ"  true
+    run_frr b1_clamp10_rnd "$V6/clamp_baseline500/records.jsonl" "clamp10" random
+    run_frr b1_recon_empty "$V6/clamp_baseline500/records.jsonl" "recon"   empty
+else
+    echo "[frr] B1 records not found — run run_ef_b1.sh first, then rerun"
+fi
+
 echo "==================== FRR DONE ===================="
 echo "Reading: FRR = P(judged prominence moved in the gold direction),"
 echo "  pairs with judge-equal gold excluded; copies score unrealized"

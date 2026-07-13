@@ -119,7 +119,7 @@
 
 | ID | 手法 | 守る主張 | 状態 |
 |---|---|---|---|
-| B1 | **LinguaLens直接介入の適応**: 「Rewrite: {x0}」生成中に特徴デルタを全位置クランプ(z_amp→定数、z_sup→0)。Gemma-2-2B + Gemma Scopeで再実装(彼らのLlama-3.1-8Bのままでは SAE も語彙も違い比較不能)。クランプ値は掃引して最良を報告(藁人形回避)。empty=クランプなしRewrite。 | C1 | 未実装 |
+| B1 | **LinguaLens直接介入の忠実再現**(公式repo+OpenSAE精読済 2026-07-14): "set"介入(活性なら上書き、**非活性は最小スロット置換で強制挿入**)、**残差はSAE再構成で完全置換**(デルタ加算ではない)、prompt_only=False=全位置・全ステップ、**対照=multiply×1の再構成パススルー**(=empty `recon`モード、`raw`で再構成ダメージを分離)。Gemma-2-2b-it + Gemma Scope(base学習SAE+instructモデル=彼らのLlama構成と同型)。クランプ値{5,10,20}掃引(彼らは10)+ clampZ(指令量そのまま=best-shot)。z_amp強調とz_sup切除を同時適用。中立Rewriteプロンプト(特徴テキストなし — クランプが唯一の情報チャネル)、greedy。判定はexact+**FRR両輪**(FRRこそ彼らの手法が得点し得る指標)。 | C1 | 実装済・未実行(`run_ef_b1.sh`) |
 | B2 | **指示プロンプト書き換え(同一バックボーン)**: 同じ情報(amp/sup特徴の解釈ラベル)を自然言語に描画し、Gemma-2-2B-it に「この言語的変化を適用して書き換えよ」。容量を揃えた公平比較。**リスク最大 → 最初に測る**。 | C2 | **済・C2成立**: prompt8/16 とも exact 0.1242(EF 0.1904 の 65%)/ sim 0.6118。**empty copy 0.4770・random copy 0.2745 = 統制崩壊**(EF は empty 1.00 構造保証)。バケット逆転: 1-op 0.0909(EF の 1/4.3)vs 9+ 0.154(EF 超え)— 自由再生成はテールに強く最小編集に弱い。n_desc 8/16 で不感(ラベル情報は飽和) |
 | B3 | **Steering vector**: B1と同じRewrite枠で介入だけ差し替え — (a) ActAdd系(minimal pair活性の平均差ベクトル)、(b) SAE-TS系(目標特徴変化を達成するsteering vector)。「SAEすら不要では」への答え + commanded-deltaに最も近い連続手法。 | C1 | 未実装 |
 | B4 | **v6パイプライン**(tagger→enumeration→editor→ranker、refine・fluency gate込み) | C3 | **済(S4)** |
