@@ -39,8 +39,9 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup, set_see
 from data import CorruptionDataset, _dense_topk
 from editflow import SAEEditFlow
 from editflow_ops import (
-    KIND_INS, KIND_SUB, adj_counts, align_pair, build_xt, cache_slots,
-    edited_marks_xt, kappa, sample_localized_fired, slot_ops, w_weight,
+    KIND_INS, KIND_MOV, KIND_SUB, adj_counts, align_pair, build_xt,
+    cache_slots, edited_marks_xt, kappa, move_reinterpret,
+    sample_localized_fired, slot_ops, w_weight,
 )
 from intervene import diff_to_sparse, draw_k, parse_k_spec
 from model import load_sae_w_dec
@@ -93,6 +94,11 @@ def parse_args():
                         "w(t)·sigmoid(head) — analytic hazard factor, the "
                         "head learns only P(pending). Magnitude tracking "
                         "exact by construction; thr{F} decode = p ≥ F.")
+    p.add_argument("--move-ops", action="store_true",
+                   help="M1 (EDIT_FLOWS_ZERO §5): reinterpret content-"
+                        "identical DEL/INS run pairs as MOV ops (4th rate "
+                        "channel + insert-after pointer head). One firing "
+                        "replaces the DEL+INS+Q-regeneration product.")
 
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--num-workers", type=int, default=2)
@@ -178,6 +184,8 @@ def build_batch(batch: Dict, rng: np.random.Generator, args,
         if slots is None:
             slots = align_pair(x0, x1)
         ops = slot_ops(slots)
+        if getattr(args, "move_ops", False):
+            ops = move_reinterpret(slots, ops)
         t = float(fixed_t[len(xs) % len(fixed_t)]) if fixed_t \
             else float(rng.random())
         lam_prop = float(getattr(args, "lam_prop", 0.0))
@@ -255,7 +263,8 @@ def flow_loss(model, built: Dict, args, device: str,
 
     # Flat pending indices (t_idx = Q target token, -1 for DEL) and per-op
     # weights (w(t) in the factorized case; λ_eff under localized paths).
-    b_idx, p_idx, k_idx, t_idx, w_op = [], [], [], [], []
+    # d_idx = MOV pointer target (insert-after position; -1 otherwise).
+    b_idx, p_idx, k_idx, t_idx, w_op, d_idx = [], [], [], [], [], []
     for b, pend in enumerate(built["pending"]):
         for op, wt in zip(pend, built["pend_w"][b]):
             b_idx.append(b)
@@ -263,6 +272,7 @@ def flow_loss(model, built: Dict, args, device: str,
             k_idx.append(op["kind"])
             t_idx.append(-1 if op["tgt"] is None else int(op["tgt"]))
             w_op.append(float(wt))
+            d_idx.append(int(op.get("dst_pos", -1)))
 
     ce = torch.zeros(B, device=device)
     metrics = {}
@@ -293,8 +303,25 @@ def flow_loss(model, built: Dict, args, device: str,
                 metrics[f"q_{kind_name}_top1"] = float(
                     (logits.argmax(dim=-1) == tgt).float().mean())
 
+        # M1: MOV pointer term — CE of Q^mov(dst | src), same weighting
+        mov_rows = [i for i in range(n_pend)
+                    if k_idx[i] == KIND_MOV and d_idx[i] >= 0]
+        if mov_rows:
+            rb = torch.tensor([b_idx[i] for i in mov_rows], device=device)
+            rp = torch.tensor([p_idx[i] for i in mov_rows], device=device)
+            dst = torch.tensor([d_idx[i] for i in mov_rows], device=device)
+            rw = torch.tensor([w_op[i] for i in mov_rows], device=device)
+            ptr = model.mov_pointer_logits(
+                h, built["attention_mask"].to(device))     # (B, T, T)
+            logq = torch.log_softmax(ptr[rb, rp], dim=-1)  # (N, T)
+            logq_sel = logq.gather(1, dst.unsqueeze(1)).squeeze(1)
+            ce.index_add_(0, rb, rw * logq_sel)
+            if return_metrics:
+                metrics["q_mov_top1"] = float(
+                    (ptr[rb, rp].argmax(dim=-1) == dst).float().mean())
+
         if return_metrics:
-            # pending-kind accuracy: argmax over the 3 rates at the site
+            # pending-kind accuracy: argmax over the rates at the site
             metrics["kind_acc"] = float(
                 (lam[bi, pi].argmax(dim=-1) == ki).float().mean())
 
@@ -349,7 +376,7 @@ def main():
         lora_dropout=args.lora_dropout, proj_a_rank=args.proj_a_rank,
         w_dec=w_dec, t_film=args.t_film, cond_mode=args.cond_mode,
         rate_param=args.rate_param, w_max=args.w_max,
-        lam_prop=args.lam_prop,
+        lam_prop=args.lam_prop, move_ops=args.move_ops,
     )
     if args.lam_prop > 0 and args.rate_param != "hazard":
         raise SystemExit("--lam-prop requires --rate-param hazard (the "
@@ -361,7 +388,7 @@ def main():
     model = model.to(args.device)
     print(f"[editflow] t_film={args.t_film} cond_mode={args.cond_mode} "
           f"true_align={args.true_align} rate_param={args.rate_param} "
-          f"lam_prop={args.lam_prop:g}")
+          f"lam_prop={args.lam_prop:g} move_ops={args.move_ops}")
 
     lora_params = [p for n, p in model.named_parameters() if "lora_" in n]
     rate_names = ("lam_head.", "lam_film.")
@@ -466,6 +493,7 @@ def main():
               f"site_iou={m.get('site_iou', 0):.4f} "
               f"q_sub={m.get('q_sub_top1', 0):.4f} "
               f"q_ins={m.get('q_ins_top1', 0):.4f} "
+              f"q_mov={m.get('q_mov_top1', 0):.4f} "
               f"lam/tok={m.get('lam_per_tok', 0):.4f} "
               f"empty={m.get('lam_per_tok_empty', 0):.4f}"
               f" (best {best_dev:.4f}){marker}")

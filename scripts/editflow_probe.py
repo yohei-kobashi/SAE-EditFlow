@@ -39,9 +39,9 @@ from transformers import AutoTokenizer                             # noqa: E402
 
 from editflow import load_editflow_from_checkpoint                 # noqa: E402
 from editflow_ops import (                                         # noqa: E402
-    KIND_DEL, KIND_INS, KIND_SUB, adj_counts, align_pair, apply_step_ops,
-    build_xt, edited_marks_xt, gold_edit_positions, lambda_iou, slot_ops,
-    w_weight,
+    KIND_DEL, KIND_INS, KIND_MOV, KIND_SUB, adj_counts, align_pair,
+    apply_step_ops, build_xt, edited_marks_xt, gold_edit_positions,
+    lambda_iou, move_reinterpret, slot_ops, w_weight,
 )
 from eval_lingualens import (                                      # noqa: E402
     diff_intervention, edit_char_ranges, local_pool_topk, pair_metrics,
@@ -202,11 +202,14 @@ def decode_flow(
             lam_e, hid_e = rates(model, x, zae, zse, t, device, adj=adj_l)
             lam = torch.clamp(lam_e + cfg_scale * (lam - lam_e), min=0.0)
         L = lam.shape[0]
+        K = lam.shape[1]                             # 3, or 4 with MOV
         lam = lam.clone()
         lam[0, KIND_DEL] = 0.0                       # <bos> is structural
         lam[0, KIND_SUB] = 0.0
+        if K > KIND_MOV:
+            lam[0, KIND_MOV] = 0.0
 
-        flat = lam.reshape(-1)                       # (L*3,)
+        flat = lam.reshape(-1)                       # (L*K,)
         # Stall exit — LATE HALF ONLY (t > 0.5). The rates are hazards
         # (they grow with t by construction: target w(t) ≈ 0 near t=0),
         # so early quiet steps are normal, not dead; counting them killed
@@ -261,14 +264,26 @@ def decode_flow(
                 continue
 
         chosen, used_pos = [], set()
+        ptr = None                                   # lazy MOV pointer
         for fi in order:
             if len(chosen) >= n_fire:
                 break
-            pos, kind = fi // 3, fi % 3
+            pos, kind = fi // K, fi % K
             if pos in used_pos or float(flat[fi]) <= 0:
                 continue
             used_pos.add(pos)
             tok = None
+            if kind == KIND_MOV:
+                if ptr is None:
+                    attn1 = torch.ones(1, len(x), dtype=torch.long,
+                                       device=hid.device)
+                    ptr = model.mov_pointer_logits(
+                        hid.unsqueeze(0), attn1)[0]  # (L, L)
+                dst = int(ptr[pos].argmax())
+                if dst == pos:
+                    continue
+                chosen.append({"kind": KIND_MOV, "pos": pos, "dst": dst})
+                continue
             if kind in (KIND_SUB, KIND_INS):
                 logits = model.q_logits(
                     hid[pos].unsqueeze(0),
@@ -487,6 +502,8 @@ def main():
                 rec["rate_diag"] = {}
                 rec["rate_diag_ondist"] = {}
                 ops_all = slot_ops(slots)
+                if bool(getattr(model, "move_ops", False)):
+                    ops_all = move_reinterpret(slots, ops_all)
                 for td in T_DIAG:
                     lam_d, _ = rates(model, src_ids, za, zs, td,
                                      args.device)

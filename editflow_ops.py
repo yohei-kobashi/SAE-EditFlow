@@ -45,8 +45,8 @@ from __future__ import annotations
 import difflib
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-KIND_INS, KIND_DEL, KIND_SUB = 0, 1, 2
-KIND_NAMES = ["INS", "DEL", "SUB"]
+KIND_INS, KIND_DEL, KIND_SUB, KIND_MOV = 0, 1, 2, 3
+KIND_NAMES = ["INS", "DEL", "SUB", "MOV"]
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +95,82 @@ def slot_ops(slots) -> List[Dict]:
 def apply_all(slots) -> List[int]:
     """Fire every op → must reconstruct x1 exactly (roundtrip invariant)."""
     return [int(a1) for _, a1 in slots if a1 is not None]
+
+
+# ---------------------------------------------------------------------------
+# MOVE reinterpretation (M1): content-identical DEL/INS run pairs become
+# single MOV ops — one firing instead of the DEL-fire + INS-fire +
+# Q-regenerates-content product. Same rule as measure_move_headroom.py.
+# ---------------------------------------------------------------------------
+def del_ins_runs(slots) -> Tuple[List[Tuple[int, Tuple[int, ...]]],
+                                 List[Tuple[int, Tuple[int, ...]]]]:
+    """Maximal contiguous runs of pure-DEL / pure-INS slots, each as
+    (start_slot, content_tuple). SUB/KEEP slots break runs."""
+    d_runs, i_runs = [], []
+    kind_prev: Optional[str] = None
+    start = 0
+    buf: List[int] = []
+
+    def flush():
+        if buf:
+            (d_runs if kind_prev == "del" else i_runs).append(
+                (start, tuple(buf)))
+
+    for k, (a0, a1) in enumerate(slots):
+        if a0 is not None and a1 is None:
+            kind, tok = "del", int(a0)
+        elif a0 is None and a1 is not None:
+            kind, tok = "ins", int(a1)
+        else:
+            kind, tok = None, None
+        if kind != kind_prev:
+            flush()
+            buf, start, kind_prev = [], k, kind
+        if kind is not None:
+            buf.append(tok)
+    flush()
+    return d_runs, i_runs
+
+
+def match_move_runs(d_runs, i_runs) -> List[Tuple[int, int, Tuple[int, ...]]]:
+    """Greedy 1:1 pairing of DEL runs with content-identical INS runs,
+    longest content first. Returns (del_start, ins_start, content)."""
+    out = []
+    used = set()
+    for di in sorted(range(len(d_runs)), key=lambda i: -len(d_runs[i][1])):
+        d_start, d_content = d_runs[di]
+        for ii, (i_start, i_content) in enumerate(i_runs):
+            if ii in used or i_content != d_content:
+                continue
+            used.add(ii)
+            out.append((d_start, i_start, d_content))
+            break
+    return sorted(out)
+
+
+def move_reinterpret(slots, ops: List[Dict]) -> List[Dict]:
+    """Rewrite `ops`: each matched DEL/INS slot pair becomes one MOV op
+    {"slot": del_slot, "kind": KIND_MOV, "tgt": tok, "dst": ins_slot}
+    (per token — an n-token span move becomes n MOV ops with consecutive
+    src/dst slots); the paired INS ops are dropped. All other ops pass
+    through unchanged, order preserved by src slot."""
+    matches = match_move_runs(*del_ins_runs(slots))
+    dst_of: Dict[int, int] = {}
+    for d_start, i_start, content in matches:
+        for j in range(len(content)):
+            dst_of[d_start + j] = i_start + j
+    taken_ins = set(dst_of.values())
+    out: List[Dict] = []
+    for op in ops:
+        k = op["slot"]
+        if op["kind"] == KIND_DEL and k in dst_of:
+            out.append({"slot": k, "kind": KIND_MOV,
+                        "tgt": int(slots[k][0]), "dst": dst_of[k]})
+        elif op["kind"] == KIND_INS and k in taken_ins:
+            continue
+        else:
+            out.append(op)
+    return out
 
 
 def x0_of(slots) -> List[int]:
@@ -207,8 +283,13 @@ def edited_marks_xt(slots, ops: List[Dict], fired: Sequence[bool]) -> Tuple[Set[
     fired sub/ins mark their own x_t index; a fired del marks the nearest
     LEFT surviving index (the deletion boundary is invisible in tokens).
     Mirrors the decode-side tracking of apply_step_ops(..., edited=...).
-    Returns (marks, len(x_t))."""
-    fired_by_slot = {op["slot"]: bool(f) for op, f in zip(ops, fired)}
+    A fired MOV marks its landing position (like ins) plus the source's
+    left boundary (like del). Returns (marks, len(x_t))."""
+    fired_by_slot = {}
+    for op, f in zip(ops, fired):
+        fired_by_slot[op["slot"]] = bool(f)
+        if op["kind"] == KIND_MOV:
+            fired_by_slot[op["dst"]] = bool(f)
     pos_of_slot: List[Optional[int]] = []
     x_len = 0
     for k, (a0, a1) in enumerate(slots):
@@ -218,6 +299,13 @@ def edited_marks_xt(slots, ops: List[Dict], fired: Sequence[bool]) -> Tuple[Set[
         else:
             pos_of_slot.append(x_len)
             x_len += 1
+
+    def left_boundary(k):
+        for j in range(k - 1, -1, -1):
+            if pos_of_slot[j] is not None:
+                return pos_of_slot[j]
+        return None
+
     marks: Set[int] = set()
     for op, f in zip(ops, fired):
         if not f:
@@ -225,11 +313,11 @@ def edited_marks_xt(slots, ops: List[Dict], fired: Sequence[bool]) -> Tuple[Set[
         k = op["slot"]
         if op["kind"] in (KIND_SUB, KIND_INS):
             marks.add(pos_of_slot[k])
+        elif op["kind"] == KIND_MOV:
+            marks.add(pos_of_slot[op["dst"]])
+            marks.add(left_boundary(k))
         else:                                   # DEL — left boundary
-            for j in range(k - 1, -1, -1):
-                if pos_of_slot[j] is not None:
-                    marks.add(pos_of_slot[j])
-                    break
+            marks.add(left_boundary(k))
     marks.discard(None)
     return marks, x_len
 
@@ -253,6 +341,8 @@ def build_xt(slots, ops: List[Dict], fired: Sequence[bool]) -> Tuple[List[int], 
     fired_by_slot = {}
     for op, f in zip(ops, fired):
         fired_by_slot[op["slot"]] = (op, bool(f))
+        if op["kind"] == KIND_MOV:             # dst slot shares the flag
+            fired_by_slot[op["dst"]] = (op, bool(f))
 
     x_t: List[int] = []
     slot_state_pos: List[Optional[int]] = []   # per slot: x_t index or None
@@ -265,6 +355,12 @@ def build_xt(slots, ops: List[Dict], fired: Sequence[bool]) -> Tuple[List[int], 
             slot_state_pos.append(len(x_t))
             x_t.append(int(state))
 
+    def left_anchor(k):
+        for j in range(k - 1, -1, -1):
+            if slot_state_pos[j] is not None:
+                return slot_state_pos[j]
+        return None
+
     pending: List[Dict] = []
     used_ins_anchor: Set[int] = set()
     for oi, (op, f) in enumerate(zip(ops, fired)):
@@ -275,12 +371,15 @@ def build_xt(slots, ops: List[Dict], fired: Sequence[bool]) -> Tuple[List[int], 
             pos = slot_state_pos[k]           # a0 still present
             pending.append({"kind": op["kind"], "pos": pos,
                             "tgt": op["tgt"], "op": oi})
+        elif op["kind"] == KIND_MOV:           # src present; dst = anchor
+            dst_pos = left_anchor(op["dst"])
+            if dst_pos is None:
+                continue                       # cannot point — unsupervised
+            pending.append({"kind": KIND_MOV, "pos": slot_state_pos[k],
+                            "tgt": op["tgt"], "op": oi,
+                            "dst_pos": dst_pos})
         else:                                  # KIND_INS — left anchor
-            anchor = None
-            for j in range(k - 1, -1, -1):
-                if slot_state_pos[j] is not None:
-                    anchor = slot_state_pos[j]
-                    break
+            anchor = left_anchor(k)
             if anchor is None:
                 continue                       # no left token — unsupervised
             if anchor in used_ins_anchor:
@@ -341,32 +440,48 @@ def lambda_iou(lam_total: Sequence[float], gold: Set[int],
 def apply_step_ops(ids: List[int], chosen: List[Dict],
                    edited: Optional[List[bool]] = None):
     """Apply ops of one decode step. Each op: {"kind", "pos", "tok"} in the
-    CURRENT ids' coordinates (ins = insert AFTER pos). At most one op per
-    position (caller dedupes); applied right-to-left so indices stay valid.
+    CURRENT ids' coordinates (ins = insert AFTER pos; mov additionally has
+    "dst" = insert-after position for the moved token). At most one op per
+    position (caller dedupes). Implemented as a single left-to-right
+    rebuild over the ORIGINAL coordinates, so any op mix — including a mov
+    whose src and dst straddle other ops — stays index-valid.
     When `edited` (bool per current position, S3 adjacency tracking) is
-    given, it is kept in sync — sub marks its position, ins marks the new
-    token, del removes its flag and marks the left boundary — and the
+    given, it is kept in sync — sub marks its position, ins/mov mark the
+    new token, del/mov-src mark the left surviving boundary — and the
     return value becomes (out, edited_out)."""
-    out = list(ids)
-    ed = list(edited) if edited is not None else None
-    for op in sorted(chosen, key=lambda o: -o["pos"]):
+    n = len(ids)
+    sub_at: Dict[int, int] = {}
+    del_at: Set[int] = set()
+    ins_after: Dict[int, List[int]] = {}
+    for op in chosen:
         p = op["pos"]
-        if p < 0 or p >= len(out):
+        if p < 0 or p >= n:
             continue
         if op["kind"] == KIND_SUB:
-            out[p] = int(op["tok"])
-            if ed is not None:
-                ed[p] = True
+            sub_at[p] = int(op["tok"])
         elif op["kind"] == KIND_DEL:
-            del out[p]
+            del_at.add(p)
+        elif op["kind"] == KIND_INS:
+            ins_after.setdefault(p, []).append(int(op["tok"]))
+        elif op["kind"] == KIND_MOV:
+            q = op.get("dst", -1)
+            if 0 <= q < n and q != p and p not in del_at:
+                del_at.add(p)
+                ins_after.setdefault(q, []).append(int(ids[p]))
+    out: List[int] = []
+    ed: Optional[List[bool]] = [] if edited is not None else None
+    for i in range(n):
+        if i in del_at:
+            if ed is not None and ed:
+                ed[-1] = True                  # left boundary of the removal
+        else:
+            out.append(sub_at.get(i, int(ids[i])))
             if ed is not None:
-                del ed[p]
-                if p - 1 >= 0:
-                    ed[p - 1] = True
-        else:                                  # KIND_INS after p
-            out.insert(p + 1, int(op["tok"]))
+                ed.append(True if i in sub_at else bool(edited[i]))
+        for tok in ins_after.get(i, ()):
+            out.append(tok)
             if ed is not None:
-                ed.insert(p + 1, True)
+                ed.append(True)
     return (out, ed) if edited is not None else out
 
 
@@ -555,6 +670,97 @@ def _selftest():
     ], edited=[False] * 4)
     assert out == [1, 77, 12, 88] and len(ed) == len(out)
     assert ed == [False, True, False, True]   # sub@1 (del boundary also @1), ins 88
+
+    # 14) MOVE reinterpretation: particle-shift pair [1,2,3,4]->[1,3,4,2]
+    src, tgt = [1, 2, 3, 4], [1, 3, 4, 2]
+    slots = align_pair(src, tgt)
+    raw = slot_ops(slots)
+    assert [o["kind"] for o in raw] == [KIND_DEL, KIND_INS]
+    ops = move_reinterpret(slots, raw)
+    assert len(ops) == 1 and ops[0]["kind"] == KIND_MOV
+    assert ops[0]["tgt"] == 2 and slots[ops[0]["dst"]] == (None, 2)
+    # roundtrip both ways
+    xt, pend = build_xt(slots, ops, [True])
+    assert xt == tgt and pend == []
+    xt, pend = build_xt(slots, ops, [False])
+    assert xt == src
+    assert pend == [{"kind": KIND_MOV, "pos": 1, "tgt": 2, "op": 0,
+                     "dst_pos": 3}]           # move token@1 to after pos 3
+    # decode application + edited sync: landing marked, src left boundary
+    out, ed = apply_step_ops(src, [{"kind": KIND_MOV, "pos": 1, "dst": 3}],
+                             edited=[False] * 4)
+    assert out == tgt and ed == [True, False, False, True]
+    # train-side adjacency agrees with the decode-side tracking
+    marks, xl = edited_marks_xt(slots, ops, [True])
+    assert xl == 4 and marks == {0, 3}
+    # non-MOV pairs pass through move_reinterpret unchanged
+    s2 = align_pair([1, 10, 11], [1, 99, 11])
+    assert move_reinterpret(s2, slot_ops(s2)) == slot_ops(s2)
+
+    # 15) MOVE roundtrip + pending validity on random pairs (incl. span
+    #     moves and mixed edits); partial firing states stay consistent
+    rng3 = random.Random(3)
+    n_mov_pairs = 0
+    for _ in range(400):
+        n = rng3.randint(3, 14)
+        src = [1] + [rng3.randint(5, 15) for _ in range(n)]
+        tgt = list(src)
+        r = rng3.random()
+        if r < 0.5 and len(tgt) > 4:           # true move: cut a span, paste
+            a = rng3.randrange(1, len(tgt) - 1)
+            ln = min(rng3.randint(1, 2), len(tgt) - a - 1)
+            span = tgt[a:a + ln]
+            del tgt[a:a + ln]
+            b = rng3.randrange(1, len(tgt) + 1)
+            tgt[b:b] = span
+        for _ in range(rng3.randint(0, 2)):    # extra unrelated edits
+            rr = rng3.random()
+            if rr < 0.34 and len(tgt) > 2:
+                del tgt[rng3.randrange(1, len(tgt))]
+            elif rr < 0.67:
+                tgt.insert(rng3.randrange(1, len(tgt) + 1),
+                           rng3.randint(5, 15))
+            else:
+                tgt[rng3.randrange(1, len(tgt))] = rng3.randint(5, 15)
+        slots = align_pair(src, tgt)
+        ops = move_reinterpret(slots, slot_ops(slots))
+        if any(o["kind"] == KIND_MOV for o in ops):
+            n_mov_pairs += 1
+        # all fired -> x1 exactly, regardless of reinterpretation
+        xt1, p1 = build_xt(slots, ops, [True] * len(ops))
+        assert xt1 == tgt and p1 == [], (src, tgt)
+        # none fired -> x0; every pending mov's pos holds its token
+        xt0, p0 = build_xt(slots, ops, [False] * len(ops))
+        assert xt0 == src
+        for pe in p0:
+            if pe["kind"] == KIND_MOV:
+                assert xt0[pe["pos"]] == pe["tgt"]
+                assert 0 <= pe["dst_pos"] < len(xt0)
+        # random partial firing: states well-formed, pending movs valid
+        fired = [rng3.random() < 0.5 for _ in ops]
+        xtp, pp = build_xt(slots, ops, fired)
+        for pe in pp:
+            assert 0 <= pe["pos"] < len(xtp)
+            if pe["kind"] == KIND_MOV:
+                assert xtp[pe["pos"]] == pe["tgt"]
+                assert 0 <= pe["dst_pos"] < len(xtp)
+        marks, xl = edited_marks_xt(slots, ops, fired)
+        assert xl == len(xtp) and all(0 <= m < xl for m in marks)
+    assert n_mov_pairs > 50                    # the generator makes moves
+
+    # 16) one-pass apply matches decode semantics for a mov among other
+    #     ops in the same step (src right of dst and vice versa)
+    ids = [1, 10, 11, 12, 13]
+    out = apply_step_ops(ids, [
+        {"kind": KIND_MOV, "pos": 3, "dst": 0},       # 12 -> after 1
+        {"kind": KIND_SUB, "pos": 1, "tok": 77},
+    ])
+    assert out == [1, 12, 77, 11, 13], out
+    out = apply_step_ops(ids, [
+        {"kind": KIND_MOV, "pos": 1, "dst": 4},       # 10 -> after 13
+        {"kind": KIND_DEL, "pos": 2},
+    ])
+    assert out == [1, 12, 13, 10], out
 
     print("OK: editflow_ops self-test passed")
 

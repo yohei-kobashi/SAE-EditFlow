@@ -66,6 +66,8 @@ class SAEEditFlow(nn.Module):
         rate_param: str = "free",
         w_max: float = 20.0,
         lam_prop: float = 0.0,
+        move_ops: bool = False,
+        mov_bias_init: float = -6.0,
     ):
         """t_film (Z1a): modulate the λ head's input with FiLM(t) — REFUTED
         + premise-breaking (README §13.8 Z1 verdict; the additive β(t) is an
@@ -91,7 +93,14 @@ class SAEEditFlow(nn.Module):
         neighbors, 0..2) so λ = b·sigmoid(head) keeps p a probability and
         thr{F} ≡ p ≥ F. adj also enters the encoder via a zero-init
         embedding (deletion boundaries are invisible in x_t tokens
-        alone)."""
+        alone).
+        move_ops (M1, EDIT_FLOWS_ZERO §5): 4th rate channel λ^mov at the
+        source token + an insert-after pointer Q^mov(dst|src) from a
+        scaled bilinear over hidden states. One firing replaces the
+        DEL-fire × INS-fire × Q-regenerates-content product that made
+        reorderings a structural zero. The MOV head row inits with bias
+        mov_bias_init (−6 → p≈0.0025), so warm-starting from a 3-kind
+        checkpoint is effectively exact."""
         super().__init__()
         self.encoder = BidirectionalLLM(llm2vec_dir, dtype=dtype)
         self.encoder.eval()
@@ -126,6 +135,8 @@ class SAEEditFlow(nn.Module):
         self.rate_param = rate_param
         self.w_max = float(w_max)
         self.lam_prop = float(lam_prop)
+        self.move_ops = bool(move_ops)
+        self.n_kinds = 4 if self.move_ops else 3
 
         # Conditioning — identical structure to SAEEditor (wdec-frozen mode)
         # so a v6 editor checkpoint initializes it 1:1.
@@ -161,11 +172,22 @@ class SAEEditFlow(nn.Module):
 
         # Heads. λ bias init ≪ 0 → softplus ≈ 0 rates at step 0: the model
         # starts as "edit nothing" (premise-protection prior + stability).
-        self.lam_head = nn.Linear(d_model, 3)
+        self.lam_head = nn.Linear(d_model, self.n_kinds)
         nn.init.normal_(self.lam_head.weight, std=0.02)
         nn.init.constant_(self.lam_head.bias, float(lam_bias_init))
+        if self.move_ops:
+            self.lam_head.bias.data[3] = float(mov_bias_init)
         self.sub_shift = nn.Parameter(torch.zeros(d_model, dtype=torch.float32))
         self.ins_shift = nn.Parameter(torch.zeros(d_model, dtype=torch.float32))
+        # M1: insert-after pointer Q^mov(dst | src) — scaled bilinear.
+        self.mov_q = self.mov_k = None
+        self.d_ptr = 256
+        if self.move_ops:
+            self.mov_q = nn.Linear(d_model, self.d_ptr)
+            self.mov_k = nn.Linear(d_model, self.d_ptr)
+            for m in (self.mov_q, self.mov_k):
+                nn.init.normal_(m.weight, std=0.02)
+                nn.init.zeros_(m.bias)
         # Z1a: FiLM(t) on the λ head input. Zero-init → exact identity at
         # step 0; trained with the boosted rate-head LR group.
         self.lam_film = None
@@ -314,6 +336,20 @@ class SAEEditFlow(nn.Module):
         h = h_sel.float() + shift
         return self.lm_head(h.to(self.lm_head.weight.dtype)).float()
 
+    def mov_pointer_logits(self, h_text: torch.Tensor,
+                           attention_mask: torch.Tensor) -> torch.Tensor:
+        """Q^mov destination logits (B, T, T): row i = source position,
+        column j = 'insert after position j'. Padding columns and the
+        diagonal (insert after self = degenerate no-op) are masked."""
+        q = self.mov_q(h_text.float())                  # (B, T, dp)
+        k = self.mov_k(h_text.float())                  # (B, T, dp)
+        sc = q @ k.transpose(1, 2) / math.sqrt(self.d_ptr)
+        pad = (attention_mask == 0).unsqueeze(1)        # (B, 1, T)
+        sc = sc.masked_fill(pad, -1e9)
+        eye = torch.eye(sc.shape[-1], dtype=torch.bool,
+                        device=sc.device).unsqueeze(0)
+        return sc.masked_fill(eye, -1e9)
+
     # ------------------------------------------------------------------
     # Init from a v6 SAEEditor checkpoint (conditioning + LoRA warm start)
     # ------------------------------------------------------------------
@@ -371,6 +407,11 @@ class SAEEditFlow(nn.Module):
             sd["mag_proj.bias"] = self.mag_proj.bias.detach().cpu()
         if self.adj_emb is not None:
             sd["adj_emb.weight"] = self.adj_emb.weight.detach().cpu()
+        if self.mov_q is not None:
+            sd["mov_q.weight"] = self.mov_q.weight.detach().cpu()
+            sd["mov_q.bias"] = self.mov_q.bias.detach().cpu()
+            sd["mov_k.weight"] = self.mov_k.weight.detach().cpu()
+            sd["mov_k.bias"] = self.mov_k.bias.detach().cpu()
         if self.lora_cfg is not None:
             for n, tns in lora_state_dict(self.encoder.backbone).items():
                 sd[f"lora::{n}"] = tns
@@ -382,6 +423,7 @@ class SAEEditFlow(nn.Module):
         "lam_head.weight", "lam_head.bias", "sub_shift", "ins_shift",
         "lam_film.weight", "lam_film.bias", "mag_proj.weight",
         "mag_proj.bias", "adj_emb.weight",
+        "mov_q.weight", "mov_q.bias", "mov_k.weight", "mov_k.bias",
     )
 
     def load_trainable(self, sd: Dict[str, torch.Tensor],
@@ -406,7 +448,25 @@ class SAEEditFlow(nn.Module):
                 if name in sd or tensor is not None:
                     skipped.append(name)
                 continue
-            tensor.data.copy_(sd[name])
+            src = sd[name]
+            if tensor.shape != src.shape:
+                # kind-dim expansion (M1: 3-kind ckpt -> 4-kind model):
+                # copy the shared rows, keep the new kind at its init.
+                if name.startswith("lam_head.") and \
+                        tensor.shape[1:] == src.shape[1:] and \
+                        tensor.shape[0] > src.shape[0]:
+                    tensor.data[:src.shape[0]].copy_(src)
+                    print(f"[editflow] load_trainable: {name} expanded "
+                          f"{src.shape[0]}->{tensor.shape[0]} kinds "
+                          f"(new rows keep init)")
+                    continue
+                if strict:
+                    raise KeyError(f"trainable shape mismatch: {name} "
+                                   f"{tuple(src.shape)} -> "
+                                   f"{tuple(tensor.shape)}")
+                skipped.append(name)
+                continue
+            tensor.data.copy_(src)
         if skipped:
             print(f"[editflow] load_trainable: skipped {skipped}")
         lora_sd = {k[len("lora::"):]: v for k, v in sd.items()
@@ -439,6 +499,7 @@ class SAEEditFlow(nn.Module):
             "rate_param": self.rate_param,
             "w_max": float(self.w_max),
             "lam_prop": float(self.lam_prop),
+            "move_ops": bool(self.move_ops),
         }, path)
 
 
@@ -460,6 +521,7 @@ def load_editflow_from_checkpoint(
         rate_param=blob.get("rate_param", "free"),
         w_max=float(blob.get("w_max", 20.0)),
         lam_prop=float(blob.get("lam_prop", 0.0)),
+        move_ops=bool(blob.get("move_ops", False)),
     )
     model.load_trainable(blob["trainable"])
     return model
