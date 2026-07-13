@@ -94,6 +94,14 @@ def parse_args():
                    help="enhancement 'set' values swept on `true` "
                         "(their code uses 10); ablation is always set-0. "
                         "empty/random run at the SECOND value (10).")
+    p.add_argument("--intervention", choices=["clamp", "steer"],
+                   default="clamp",
+                   help="B1 'clamp' = OpenSAE-faithful set+reconstruction "
+                        "replacement. B3 'steer' = steering vector: "
+                        "h + alpha*(za@W_dec - zs@W_dec), a pure delta "
+                        "add (no SAE in the loop) rendering the commanded "
+                        "feature delta in residual space (SAE-TS spirit); "
+                        "--clamp-values are read as the alpha sweep.")
     p.add_argument("--max-new-tokens", type=int, default=128)
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
@@ -134,6 +142,26 @@ class SaeClampHook:
         if self.sup_idx is not None and self.sup_idx.numel():
             z[..., self.sup_idx] = 0.0
         h_new = self.sae.decode(z).to(dt)
+        if isinstance(output, tuple):
+            return (h_new,) + tuple(output[1:])
+        return h_new
+
+
+class SteerHook:
+    """B3: steering-vector intervention — the commanded feature delta
+    rendered in residual space, h + alpha*dvec, added at every position
+    (pure delta: NO SAE reconstruction in the forward pass)."""
+
+    def __init__(self):
+        self.enabled = False
+        self.dvec = None             # (d_llm,) FloatTensor
+        self.alpha = 1.0
+
+    def __call__(self, module, inputs, output):
+        if not self.enabled or self.dvec is None:
+            return None
+        h = output[0] if isinstance(output, tuple) else output
+        h_new = h + (self.alpha * self.dvec).to(h.dtype)
         if isinstance(output, tuple):
             return (h_new,) + tuple(output[1:])
         return h_new
@@ -197,11 +225,16 @@ def main():
     # Gemma Scope layer_L = residual AFTER block L → hook block L's output
     sae = load_sae(args.sae_type, args.sae_repo, args.sae_path,
                    sae_k=args.sae_k).to(args.device).eval()
-    hook = SaeClampHook(sae)
+    if args.intervention == "clamp":
+        hook = SaeClampHook(sae)
+        mode_prefix = "clamp"
+    else:
+        hook = SteerHook()
+        mode_prefix = "steer"
     it_model.model.layers[args.sae_layer].register_forward_hook(hook)
-    print(f"[b1] rewriter {args.it_model}, SAE clamp hook on "
-          f"layers[{args.sae_layer}] output (reconstruction replacement, "
-          f"all positions, prompt+generation)")
+    print(f"[b1] rewriter {args.it_model}, {args.intervention} hook on "
+          f"layers[{args.sae_layer}] output (all positions, "
+          f"prompt+generation)")
 
     @torch.no_grad()
     def rewrite(src: str) -> str:
@@ -276,20 +309,31 @@ def main():
             amp = torch.nonzero(za > 0).flatten().to(args.device)
             sup = torch.nonzero(zs > 0).flatten().to(args.device)
             if c == "true":
-                modes = [(f"clamp{v:g}", v) for v in clamp_vals]
-                modes.append(("clampZ", za[amp.cpu()].to(args.device)))
+                modes = [(f"{mode_prefix}{v:g}", v) for v in clamp_vals]
+                if args.intervention == "clamp":
+                    modes.append(("clampZ", za[amp.cpu()].to(args.device)))
             elif c == "empty":
-                modes = [("recon", ctrl_val), ("raw", None)]
+                modes = ([("recon", ctrl_val), ("raw", None)]
+                         if args.intervention == "clamp"
+                         else [("raw", None)])
             else:
-                modes = [(f"clamp{ctrl_val:g}", ctrl_val)]
+                modes = [(f"{mode_prefix}{ctrl_val:g}", ctrl_val)]
+            if args.intervention == "steer":
+                W = sae.W_dec.float()                    # (d_sae, d_llm)
+                dvec = (za.to(args.device).float() @ W
+                        - zs.to(args.device).float() @ W)
             rec["outputs"][c] = {}
             for mname, val in modes:
                 if mname == "raw":
-                    hook.enabled = False       # plain model, no SAE
-                else:
+                    hook.enabled = False       # plain model, no hook
+                elif args.intervention == "clamp":
                     hook.enabled = True        # recon replacement always
                     hook.amp_idx, hook.sup_idx = amp, sup
                     hook.amp_val = val
+                else:
+                    hook.enabled = True
+                    hook.dvec = dvec
+                    hook.alpha = float(val)
                 out_text = rewrite(src)
                 pm = pair_metrics(out_text, src, tgt)
                 rec["outputs"][c][mname] = {
@@ -306,12 +350,13 @@ def main():
                   f"({len(records)} scored)")
     pf.close()
 
-    lines = ["# B1 LinguaLens-clamp baseline (LinguaLens)", ""]
+    title = ("B1 LinguaLens-clamp" if args.intervention == "clamp"
+             else "B3 steering-vector")
+    lines = [f"# {title} baseline (LinguaLens)", ""]
     lines.append(f"pairs scored: {len(records)}; rewriter {args.it_model}; "
-                 f"OpenSAE-faithful set-intervention + reconstruction "
-                 f"replacement on layers[{args.sae_layer}]; clamp sweep "
-                 f"{clamp_vals} + clampZ; conditioning identical to the "
-                 f"EF probe")
+                 f"intervention={args.intervention} on "
+                 f"layers[{args.sae_layer}]; value/alpha sweep "
+                 f"{clamp_vals}; conditioning identical to the EF probe")
     lines += ["", "| condition | mode | exact | sim_target | copy |",
               "|---|---|---|---|---|"]
     for c in conditions:

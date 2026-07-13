@@ -103,6 +103,18 @@ def parse_args():
     p.add_argument("--steer-lambda", type=float, default=1.0,
                    help="Logit-lens bias on Q^sub/Q^ins at every step; "
                         "0 = off.")
+    p.add_argument("--feature-sets", default="",
+                   help="P-B: JSON {phenomenon: [[feature_id, frc], ..]} "
+                        "from identify_features_frc.py — restricts the "
+                        "conditioning to the pair's phenomenon-identified "
+                        "features (see --feature-mode).")
+    p.add_argument("--feature-mode", choices=["intersect", "pure"],
+                   default="intersect",
+                   help="'intersect': keep only identified features "
+                        "inside the usual top-k diff. 'pure': FULL diff "
+                        "(k=d_sae) masked to the identified set — tests "
+                        "whether the phenomenon's features alone drive "
+                        "the edit.")
     p.add_argument("--cfg-scale", type=float, default=1.0,
                    help="CFG on λ and Q independently: "
                         "u = u_empty + s·(u_cond − u_empty). 1 = off.")
@@ -451,6 +463,23 @@ def main():
                     extractor.encode_text(tgt),
                     args.pool_topk).float().cpu()
         za_t, zs_t = diff_intervention(z_src, z_tgt, args.k_amp, args.k_sup)
+        if args.feature_sets:
+            if not hasattr(main, "_fsets"):
+                _raw = json.loads(Path(args.feature_sets).read_text())
+                main._fsets = {ph: {int(f) for f, _ in lst}
+                               for ph, lst in _raw.items()}
+                print(f"[ef-probe] P-B feature sets: "
+                      f"{len(main._fsets)} phenomena, "
+                      f"mode={args.feature_mode}")
+            ident = main._fsets.get(ex.get("feature") or "?", set())
+            if args.feature_mode == "pure":
+                za_t, zs_t = diff_intervention(
+                    z_src, z_tgt, z_src.shape[-1], z_src.shape[-1])
+            keep = torch.zeros_like(za_t, dtype=torch.bool)
+            if ident:
+                keep[list(ident)] = True
+            za_t = torch.where(keep, za_t, torch.zeros_like(za_t))
+            zs_t = torch.where(keep, zs_t, torch.zeros_like(zs_t))
         zvar = {"true": (za_t, zs_t),
                 "empty": (torch.zeros_like(za_t), torch.zeros_like(zs_t)),
                 "random": (randomize_intervention(za_t, prng),

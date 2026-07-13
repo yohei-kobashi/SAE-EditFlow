@@ -175,13 +175,25 @@
 
 ## 9. 残作業(優先順)
 
-1. **B2実装+200ペアpilot**(リスク最大: ここで大差負けなら骨格再考)
-2. B1実装(クランプ値掃引込み)+200ペアpilot
-3. B3実装(ActAdd / SAE-TS の2変種)
-4. B1–B3を500ペア本番 → compare_ef_pipeline.pyで主表完成
-5. SLOR併記(B1–B3の非文性定量、§8)
-6. 投稿前deep-research: 「SAE介入×離散編集」の反例サーベイ(CRLが2026-02と
-   新しく後続の可能性; "to our knowledge"の裏取り)
+**一括実行: `run_paper_todo.sh`(全段done-markerガード+ペア単位resume、
+「ALL PAPER-TODO STAGES DONE」まで再投入、~12-16h=2-3回)**
+
+1. ~~B2実装+実行~~ 済(C2成立: 0.1242 vs 0.1904、empty copy 0.477)
+2. Stage A: B1実行(忠実クランプ、掃引+clampZ)
+3. Stage B: B3実行(steering vector = 指令デルタのW_dec描画をα掃引で加算、
+   `eval_clamp_baseline.py --intervention steer`)
+4. Stage C: FRR全システム+統制(B1/B3行込み、judge=gemma-2-9b-itパイロット
+   → 最終表はJUDGE=openai:gpt-4oで再実行)
+5. Stage D: P-A/P-C(`eval_k_sweep.py` — k掃引フロンティア、r95、オラクル
+   最小k分布、sae_gain閾値によるdeployable選択)
+6. Stage E: P-B(`identify_features_frc.py` — 評価500ペア除外でPS/PN/FRC同定
+   → probe `--feature-sets/--feature-mode intersect|pure` で同定集合条件付け)
+7. Stage F: SLOR併記(`score_slor.py`、全ベースライン+recon/raw統制)
+8. Stage G: compare拡張(`--pipeline-mode`)でEF vs B1/B2/B3の直接ペア統計
+9. P-B/P-D比較(FRC同定集合 vs 小k充分集合の重なり)— Stage D/Eのrecordsから
+   オフライン集計
+10. 投稿前deep-research: 「SAE介入×離散編集」の反例サーベイ("to our
+    knowledge"の裏取り)+ 現象タイプ×インベントリ対応表(項目7、別途)
 
 ## 引用メモ
 

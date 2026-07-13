@@ -36,6 +36,11 @@ def main():
                    help="records.jsonl whose idx set is DROPPED from the "
                         "join — e.g. the 200-pair probe that selected the "
                         "operating F, leaving a clean holdout")
+    p.add_argument("--pipeline-mode", default="",
+                   help="set when --pipeline is a PROBE-format records "
+                        "file (EF/B1/B2/B3): the decode-mode key whose "
+                        "text/metrics act as the baseline side — enables "
+                        "direct EF-vs-baseline paired stats.")
     args = p.parse_args()
 
     ef = {r["idx"]: r for r in load_jsonl(args.ef)}
@@ -50,6 +55,23 @@ def main():
               f"{len(common)} pairs")
     if not common:
         return
+
+    def pl_metrics(pr):
+        """Uniform pipeline-side metric access; supports probe-format
+        baselines via --pipeline-mode (direct EF-vs-baseline stats)."""
+        o = pr["outputs"].get(args.condition)
+        if o is None:
+            return None
+        if args.pipeline_mode:
+            m = o.get(args.pipeline_mode)
+            if not isinstance(m, dict):
+                return None
+            return {"exact_match": m["exact"],
+                    "sim_target": m["sim_target"],
+                    "copy_rate": m.get("copy", float("nan"))}
+        return o
+
+    common = [k for k in common if pl_metrics(pl[k]) is not None]
 
     ef_modes = sorted({m for r in ef.values()
                        for m, v in r["outputs"][args.condition].items()
@@ -66,7 +88,7 @@ def main():
     for k in common:
         er, pr = ef[k], pl[k]
         b = bname(er.get("n_ops", 1))
-        po = pr["outputs"][args.condition]
+        po = pl_metrics(pr)
         rows["pipeline"]["exact"].append(po["exact_match"])
         rows["pipeline"]["sim"].append(po["sim_target"])
         rows["pipeline"]["copy"].append(po["copy_rate"])
@@ -121,7 +143,7 @@ def main():
             eo = ef[k]["outputs"][args.condition].get(m)
             if not isinstance(eo, dict):
                 continue
-            po = pl[k]["outputs"][args.condition]
+            po = pl_metrics(pl[k])
             de.append(eo["exact"] - po["exact_match"])
             ds.append(eo["sim_target"] - po["sim_target"])
         n = len(ds)
