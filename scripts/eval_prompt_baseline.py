@@ -180,14 +180,19 @@ def main():
     @torch.no_grad()
     def rewrite(changes: str, src: str) -> str:
         prompt = PROMPT.format(changes=changes, src=src)
-        ids = it_tok.apply_chat_template(
+        # tokenize=False + plain tokenizer call: version-proof (newer
+        # transformers returns a BatchEncoding from apply_chat_template,
+        # which generate() rejects as a positional input). The rendered
+        # template already contains <bos>, so add_special_tokens=False.
+        text_in = it_tok.apply_chat_template(
             [{"role": "user", "content": prompt}],
-            add_generation_prompt=True, return_tensors="pt",
-        ).to(args.device)
+            add_generation_prompt=True, tokenize=False)
+        enc = it_tok(text_in, return_tensors="pt",
+                     add_special_tokens=False).to(args.device)
         gen = it_model.generate(
-            ids, max_new_tokens=args.max_new_tokens, do_sample=False,
+            **enc, max_new_tokens=args.max_new_tokens, do_sample=False,
             pad_token_id=it_tok.pad_token_id or it_tok.eos_token_id)
-        text = it_tok.decode(gen[0, ids.shape[1]:],
+        text = it_tok.decode(gen[0, enc["input_ids"].shape[1]:],
                              skip_special_tokens=True)
         return extract_sentence(text, src)
 
