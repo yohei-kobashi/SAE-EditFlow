@@ -171,6 +171,32 @@
     (direct_object, factives, resultative)— oracle 0.39が1.0でない理由の
     現象名リスト。in/near/out対応表はこのCSVから作る。
 
+## 6c. 最終動作点のFRR(997ペア、judge=gemma-2-9b-itパイロット、
+runs/tables/frr_per_feature_*; GPT-4o最終判定は JUDGE 切替で取り直し)
+
+- システム値: **ef32 0.8169** / steer0.5 0.7609(net **0.3192**、randomは
+  新規ブロックのみ判定)/ routed 0.7579。routedのrandom対照は構造的
+  (EF経路→copy; EF側フロアは旧ラウンドの0.095を引用)。
+- **非自明な構造: FRRとexactでシステム順位が逆転する** — ef32はFRR最高
+  (テール4-8でも0.83 vs steer 0.78: 離散編集は方向実現でも優る)が、
+  exactではsteerがテールを取る。routedはexact最適化の選択なのでFRRは
+  ef32単独に僅かに劣る。多軸報告の必然性の実例であり、「操舵再生成は
+  方向づけが上手いのではなく、当たった時に正確に着地する」が正しい読み。
+- **残余フロンティアの分解(exact=0現象 × FRR)**:
+  - **方向実現は可能・正確編集が不可能**: metaphor(FRR 1.00全系!)、
+    personification(0.91–1.00)、hyperbole、echo_questions(0.83–1.00)、
+    universal_quantifiers、resultative/appositives(steer 1.00)—
+    比喩・談話系は「介入としては効くがminimal pairとして打てない」。
+  - **方向実現すら低い(真に未到達)**: extraposition(0.25–0.42)が
+    ほぼ唯一。接辞形態系(nominal/verbal_suffix、quantitative_prefix、
+    FRR 0.33–0.67)は判定難度の可能性も併記。
+- **feature別net-FRRがsteerの見かけの実現を暴く**: past_tense(steer FRR
+  0.300・net −0.129 vs ef32 1.000)、expressive(net −0.50)、
+  subject_verb_inversion(−0.30)、past_tense_irregular(−0.25)—
+  randomでも同等以上に「実現」する=偽陽性支配の現象群。per-feature net
+  はsteer_rndが新規ブロックのみのため低n(付録扱い、GPT-4o判定で全997に
+  拡張可能)。
+
 ## 6. Results(確定済み数値 — 出典 README §13.8 S4 verdict)
 
 - 主表(matched 499 / holdout 300):
