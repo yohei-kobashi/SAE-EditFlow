@@ -148,8 +148,12 @@ def main():
 
     partial_path = out_dir / "records.partial.jsonl"
     records, done_idx = [], set()
-    if partial_path.exists():
-        with open(partial_path) as f:
+    # resume from BOTH the finalized records (a previous completed run —
+    # e.g. extending the sample) and the partial file (a killed run)
+    for src_path in (out_dir / "records.jsonl", partial_path):
+        if not src_path.exists():
+            continue
+        with open(src_path) as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -158,8 +162,11 @@ def main():
                     r = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if int(r["idx"]) in done_idx:
+                    continue
                 records.append(r)
                 done_idx.add(int(r["idx"]))
+    if records:
         print(f"[ksweep] RESUME: {len(records)} pairs")
     pf = open(partial_path, "a")
 

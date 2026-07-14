@@ -236,17 +236,29 @@ def main():
                 g2.append((a if a["gain"] >= b["gain"] else b)["exact"])
             lines.append(f"- gain-router 2way ({args.count_cand} vs "
                          f"{args.route_to}): {np.mean(g2):.4f}")
-            for T in (0, 1, 2, 3):
-                ex, n_head = [], 0
+            def rule_row(label, head_pred):
+                ex, n_head, w, l = [], 0, 0, 0
                 for r in subset:
-                    if hunks_of.get(r["idx"], 99) <= T:
-                        ex.append(r["cands"][args.count_cand]["exact"])
+                    hd = head_pred(hunks_of.get(r["idx"], 99))
+                    e_h = r["cands"][args.count_cand]["exact"]
+                    e_f = r["cands"][args.route_to]["exact"]
+                    ex.append(e_h if hd else e_f)
+                    if hd:
                         n_head += 1
-                    else:
-                        ex.append(r["cands"][args.route_to]["exact"])
-                lines.append(f"- **count-rule T={T}** ({args.count_cand} "
-                             f"if own hunks<=T else {args.route_to}): "
-                             f"{np.mean(ex):.4f} (head picks {n_head})")
+                        if e_h > e_f:
+                            w += 1
+                        elif e_f > e_h:
+                            l += 1
+                lines.append(f"- **{label}**: {np.mean(ex):.4f} "
+                             f"(head picks {n_head}; vs always-"
+                             f"{args.route_to} discordant +{w}/-{l})")
+            for T in (0, 1, 2, 3):
+                rule_row(f"count-rule T={T} ({args.count_cand} if own "
+                         f"hunks<=T else {args.route_to})",
+                         lambda h, T=T: h <= T)
+            rule_row(f"band-rule hunks==1 ({args.count_cand} iff exactly "
+                     f"one hunk else {args.route_to})",
+                     lambda h: h == 1)
         # per-bucket
         byb = defaultdict(list)
         for r in subset:

@@ -252,8 +252,12 @@ def main():
 
     partial_path = out_dir / "records.partial.jsonl"
     records, done_idx = [], set()
-    if partial_path.exists():
-        with open(partial_path) as f:
+    # resume from BOTH the finalized records (a previous completed run —
+    # e.g. extending the sample) and the partial file (a killed run)
+    for src_path in (out_dir / "records.jsonl", partial_path):
+        if not src_path.exists():
+            continue
+        with open(src_path) as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -262,8 +266,11 @@ def main():
                     r = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if int(r["idx"]) in done_idx:
+                    continue
                 records.append(r)
                 done_idx.add(int(r["idx"]))
+    if records:
         print(f"[b1] RESUME: {len(records)} pairs")
     pf = open(partial_path, "a")
 
@@ -380,14 +387,17 @@ def main():
     byb = defaultdict(list)
     for r in records:
         byb[bname(r["n_ops"])].append(r)
+    def bcell(rs, m, key):
+        vals = [r["outputs"]["true"][m][key] for r in rs
+                if m in r["outputs"]["true"]]
+        return f"{np.mean(vals):.4f}" if vals else "—"
+
     for b in ("1", "2-3", "4-8", "9+"):
         rs = byb.get(b, [])
         if not rs:
             continue
-        cells = [f"{np.mean([r['outputs']['true'][m]['exact'] for r in rs]):.4f}"
-                 for m in modes]
-        cells += [f"{np.mean([r['outputs']['true'][m]['sim_target'] for r in rs]):.4f}"
-                  for m in modes]
+        cells = [bcell(rs, m, "exact") for m in modes]
+        cells += [bcell(rs, m, "sim_target") for m in modes]
         lines.append(f"| {b} | {len(rs)} | " + " | ".join(cells) + " |")
 
     report = "\n".join(lines)
