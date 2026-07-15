@@ -59,6 +59,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -67,6 +68,9 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from editflow_ops import (                                       # noqa: E402
+    KIND_DEL, KIND_INS, KIND_SUB, apply_step_ops,
+)
 from eval_lingualens import (                                    # noqa: E402
     diff_intervention, edit_char_ranges, local_pool_topk, pair_metrics,
     randomize_intervention, sae_z_with_offsets,
@@ -164,10 +168,20 @@ def parse_args():
     p.add_argument("--clamp-values", default="10",
                    help="clamp: set value (LinguaLens uses 10). "
                         "delta: alpha (B3's best was 0.5)")
+    p.add_argument("--steps", type=int, default=8,
+                   help="EF's most important structural idea: edit, RE-READ, "
+                        "edit again. A single shot cannot fix a token whose "
+                        "context only becomes wrong after an earlier edit, and "
+                        "cannot decompose a multi-token insertion. 1 = the "
+                        "old single-shot behaviour.")
+    p.add_argument("--max-ops-per-step", type=int, default=4,
+                   help="EF fires the top rates, not everything above a bar")
     p.add_argument("--delta-thr", type=float, default=-1.0,
                    help="edit position i when Delta_i < this (nats). More "
                         "negative = the intervention must object more "
                         "strongly before we touch the token.")
+    p.add_argument("--ins-keep-p", type=float, default=0.10,
+                   help="after splicing v, if the intervened head still gives the\n                        original token at least this probability, v was an\n                        INSERTION, not a substitution")
     p.add_argument("--conditions", default="true,empty,random")
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
@@ -184,6 +198,100 @@ def teacher_forced_logprobs(model, ids, device):
     tgt = torch.tensor(ids[1:], dtype=torch.long, device=device)
     own = logp[:-1].gather(1, tgt.unsqueeze(1)).squeeze(1)   # (T-1,)
     return own, logits[:-1]            # own[j] scores ids[j+1]; row j too
+
+
+@torch.no_grad()
+def propose_ops(lm, ids, hook, dvec_or_none, cv, pos_mask, args, W_dec,
+                za, zs, sae):
+    """One step of EF's loop, but every decision comes from the INTERVENED
+    LM's own head — no rate head, no Q head, nothing trained.
+
+    EF splits a decision into WHERE (lambda) and WHAT (Q). Here both come out
+    of the same two forwards:
+      WHERE  Delta_j = log p_int(x_j+1 | x_<=j) - log p_base(...)  << 0
+             means the intervention objects to this token.
+      WHAT   argmax p_int(. | x_<=j) = v.
+    And the op KIND, which SUB-only cannot express, comes from asking the
+    intervened head two more questions it can already answer:
+      DEL    it prefers the token AFTER x_j+1 over x_j+1 itself -> skip it.
+      INS    it wants v, but still wants x_j+1 as well -> v goes BEFORE it.
+      SUB    it wants v instead of x_j+1.
+    The INS/SUB test needs p_int(x_j+1 | x_<=j, v); we batch those splices
+    into one forward so the whole step stays 3 forwards regardless of how
+    many positions fired."""
+    # ---- two forwards: baseline and intervened ---------------------------
+    if args.intervention == "clamp":
+        hook.enabled = True
+        hook.amp_idx = hook.sup_idx = None
+        hook.amp_val = None
+        lp_base, _ = teacher_forced_logprobs(lm, ids, args.device)
+        hook.amp_idx = torch.nonzero(za > 0).flatten().to(args.device)
+        hook.amp_val = float(cv)
+        hook.sup_idx = torch.nonzero(zs > 0).flatten().to(args.device)
+    else:
+        hook.enabled = False
+        lp_base, _ = teacher_forced_logprobs(lm, ids, args.device)
+        hook.enabled = True
+        hook.dvec = dvec_or_none
+        hook.alpha = float(cv)
+        hook.pos_mask = (pos_mask[:len(ids)] if pos_mask is not None else None)
+    lp_int, logits_int = teacher_forced_logprobs(lm, ids, args.device)
+    hook.enabled = False
+
+    delta = lp_int - lp_base                       # (T-1,); j scores ids[j+1]
+    lp_int_full = F.log_softmax(logits_int, dim=-1)
+
+    # ---- WHERE: EF fires the TOP rates, not everything past a bar --------
+    cand = [j for j in range(delta.shape[0])
+            if float(delta[j]) < args.delta_thr]
+    cand.sort(key=lambda j: float(delta[j]))       # most objected-to first
+    cand = cand[:args.max_ops_per_step]
+    if not cand:
+        return [], float(delta.min()) if delta.numel() else 0.0
+
+    # ---- WHAT + KIND -----------------------------------------------------
+    ops, splices = [], []
+    for j in cand:
+        v = int(logits_int[j].argmax())
+        cur = ids[j + 1]
+        if v == cur:
+            continue
+        # DEL: does it prefer the token AFTER this one, over this one?
+        if j + 2 < len(ids):
+            nxt = ids[j + 2]
+            if float(lp_int_full[j, nxt]) > float(lp_int_full[j, cur]) and \
+               float(lp_int_full[j, nxt]) > float(lp_int_full[j, v]):
+                ops.append({"kind": KIND_DEL, "pos": j + 1, "tok": None})
+                continue
+        splices.append((j, v, cur))
+    # INS vs SUB: is cur still wanted once v is in place? Batched.
+    if splices:
+        seqs = [ids[:j + 1] + [v] + ids[j + 1:] for j, v, _ in splices]
+        keep = keep_logprob_after_splice(lm, seqs, splices, args.device)
+        for (j, v, cur), lp_keep in zip(splices, keep):
+            if lp_keep > math.log(args.ins_keep_p):
+                ops.append({"kind": KIND_INS, "pos": j, "tok": v})
+            else:
+                ops.append({"kind": KIND_SUB, "pos": j + 1, "tok": v})
+    return ops, float(delta.min()) if delta.numel() else 0.0
+
+
+@torch.no_grad()
+def keep_logprob_after_splice(lm, seqs, splices, device):
+    """log p_int(cur | x_<=j, v) for each candidate splice, one padded
+    forward. The hook is already configured by the caller, so these run
+    under the SAME intervention."""
+    T = max(len(s) for s in seqs)
+    x = torch.zeros(len(seqs), T, dtype=torch.long, device=device)
+    am = torch.zeros(len(seqs), T, dtype=torch.long, device=device)
+    for b, s_ in enumerate(seqs):
+        x[b, :len(s_)] = torch.tensor(s_, device=device)
+        am[b, :len(s_)] = 1
+    logits = lm(input_ids=x, attention_mask=am).logits.float()
+    out = []
+    for b, (j, v, cur) in enumerate(splices):
+        out.append(float(F.log_softmax(logits[b, j + 1], dim=-1)[cur]))
+    return out
 
 
 def main():
@@ -275,41 +383,24 @@ def main():
             pos_mask = None
             if args.scope == "local":
                 pos_mask = local_position_mask(z_s, zs, len(ids))
+            dvec = None
+            if args.intervention != "clamp":
+                dvec = (za.to(args.device).float() @ W_dec
+                        - zs.to(args.device).float() @ W_dec)
             for cv in clamp_vals:
-                if args.intervention == "clamp":
-                    # clean = RECON passthrough, so Delta isolates the SET
-                    # rather than mixing in reconstruction damage.
-                    hook.enabled = True
-                    hook.amp_idx = hook.sup_idx = None
-                    hook.amp_val = None
-                    lp_base, _ = teacher_forced_logprobs(lm, ids, args.device)
-                    hook.amp_idx = torch.nonzero(za > 0).flatten().to(
-                        args.device)
-                    hook.amp_val = float(cv)
-                    hook.sup_idx = torch.nonzero(zs > 0).flatten().to(
-                        args.device)
-                    lp_int, logits_int = teacher_forced_logprobs(
-                        lm, ids, args.device)
-                else:
-                    # delta adds nothing when the spec is empty, so the
-                    # unintervened forward IS the right baseline — no
-                    # reconstruction damage to cancel.
-                    hook.enabled = False
-                    lp_base, _ = teacher_forced_logprobs(lm, ids, args.device)
-                    hook.enabled = True
-                    hook.dvec = (za.to(args.device).float() @ W_dec
-                                 - zs.to(args.device).float() @ W_dec)
-                    hook.alpha = float(cv)
-                    hook.pos_mask = pos_mask
-                    lp_int, logits_int = teacher_forced_logprobs(
-                        lm, ids, args.device)
-                hook.enabled = False
-
-                delta = (lp_int - lp_base)                    # (T-1,)
-                fire = (delta < args.delta_thr).nonzero().flatten().tolist()
+                # EF's loop: propose from the intervened head, apply with the
+                # PURE FUNCTION apply_step_ops (no parameters -> the causal
+                # claim is untouched), re-read, repeat.
                 out_ids = list(ids)
-                for j in fire:                                  # j scores ids[j+1]
-                    out_ids[j + 1] = int(logits_int[j].argmax())
+                n_fire, dmin = 0, 0.0
+                for _ in range(max(1, args.steps)):
+                    ops, dm = propose_ops(lm, out_ids, hook, dvec, cv,
+                                          pos_mask, args, W_dec, za, zs, sae)
+                    dmin = min(dmin, dm)
+                    if not ops:
+                        break
+                    n_fire += len(ops)
+                    out_ids = apply_step_ops(out_ids, ops)
                 out_text = tok.decode(out_ids, skip_special_tokens=True)
 
                 pm = pair_metrics(out_text, src, tgt)

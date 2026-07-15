@@ -38,6 +38,19 @@ set -eo pipefail
 #     the intervened LM's own head instead, teacher-forced.
 #     -> the readout itself   (UNTESTED)
 #
+# Plus the three things EF used at its best that the readout was missing:
+#  4. ITERATION. EF edits, RE-READS x_t, edits again (48 steps). A single
+#     shot cannot fix a token whose context only goes wrong after an earlier
+#     edit, and cannot decompose a multi-token insertion into single ones.
+#     -> --steps 8
+#  5. TOP-RATE FIRING, not everything past a bar (EF's det/thr modes).
+#     -> --max-ops-per-step 4
+#  6. THE OP VOCABULARY. The readout was SUB-only, so half the phenomena were
+#     structurally unreachable. INS/DEL now come from the intervened head
+#     itself: DEL when it prefers the token AFTER this one; INS when it wants
+#     v but still wants the original too. apply_step_ops applies them — a
+#     PURE FUNCTION with no parameters, so the causal claim is untouched.
+#
 # Everything here is an intervention on gemma-2-2b's layer-12 residual
 # stream, and nothing here is trained. The causal claim survives all three.
 V6=./runs/prod_gemma_v6
@@ -56,6 +69,7 @@ for IV in clamp delta; do
                 --output-dir "$D" \
                 --intervention "$IV" --scope "$SC" \
                 --clamp-values "$V" --delta-thr -1.0 \
+                --steps 8 --max-ops-per-step 4 \
                 --conditions true,empty,random \
                 --sample-size 500 --device cuda
         fi
@@ -69,6 +83,7 @@ for THR in -0.5 -2.0 -4.0; do
         python scripts/eval_clamp_readout.py \
             --output-dir "$D" --intervention delta --scope local \
             --clamp-values 0.5,1,2 --delta-thr "$THR" \
+            --steps 8 --max-ops-per-step 4 \
             --conditions true,empty,random \
             --sample-size 500 --device cuda
     fi
@@ -97,3 +112,7 @@ echo "    only the feature IDENTITIES differ."
 echo "  * n_masked reports how many positions scope=local touched. If it is"
 echo "    ~= sequence length, localization did nothing and the comparison"
 echo "    against scope=all is vacuous."
+echo
+echo "Ablate iteration with --steps 1 (the old single-shot readout) if the"
+echo "iterative numbers look good — EF's gain came from re-reading, and we"
+echo "should know how much of ours does too."
