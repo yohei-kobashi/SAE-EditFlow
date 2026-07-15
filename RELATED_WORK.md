@@ -375,17 +375,118 @@ OpenSAE。
 
 ---
 
-## Z. 2ラウンド後も**未達**(Related Work執筆のブロッカー)
+## W. ブロッカー2件を一次資料PDFで解決(2026-07-15、自前でpypdf抽出)
+
+要約器の誤りが多発したため、**arXiv/ACL AnthologyのPDFを直接落として
+pypdfで全文抽出し、正規化(リガチャ+ハイフン折返し)した上で自分でgrep**
+した。以下は**すべて実物からの逐語**。
+
+### W-1. 🟢 P-Bの対比対象が確定 — 「介入は3本、編集には32本」
+
+第1ラウンドで0-3棄却された定式化は**実際にはほぼ正しかった**(検証側の
+偽陰性)。実物 §3.2 / Appendix E.1 逐語:
+
+> "harmonic mean to penalise vectors that are only sufficient or only
+> necessary: **FRC_k = 2· PS_k PN_k / (PS_k + PN_k)**."
+> "The Feature Representation Confidence (FRC) is computed as the **harmonic
+> mean of PN and PS**: FRC = 2 PN PS / (PN+PS). The harmonic mean is chosen
+> because it ensures that FRC remains low if either PN or PS is low..."
+
+**特徴同定パイプライン全体**(逐語):
+
+> "We first perform **sensitivity pre-filtering** by computing EALE_k for
+> every base vector and retaining those whose absolute value exceeds the
+> **75th percentile**; on this reduced set we estimate PS_k and PN_k from
+> every ⟨s+, s−⟩ pair and rank the vectors by their FRC_k; finally, the
+> activation distributions of the **top-10 ranked vectors** are passed to an
+> LLM agent, which verifies that each vector genuinely encodes the intended
+> linguistic feature and flags any inconsistent or spurious patterns."
+
+**🔴 P-Bの核心 — 介入に使う特徴数(逐語)**:
+
+> "Furthermore, for each linguistic feature, we select **three base vectors
+> with the highest FRC as representatives for intervention** and compute the
+> average results across these three interventions."
+> "We select **6 representative features** for the intervention experiments."
+> (= 6つの言語現象。SAE特徴数ではない — 混同しないこと)
+
+→ **対比は「LinguaLensは現象あたり3本のbase vectorで介入」 vs 「SAE-LEWISは
+編集にk=32のinstance-level特徴を要する」**。**3 vs 32 ≈ 10×** で、P-Bが観測
+した**10×の崩壊と数字が一致する**。P-Bはこれで書ける。
+
+その他の逐語(使える):
+- EALE = 個別latent効果の集約: τ_k(s) = a(1)_k − a(0)_k、
+  "EALE_k = (1/N) Σ τ_k(s_i), which can rank base vectors by their
+  sensitivity to the specified phenomenon"
+- FIC (Feature Intervention Confidence) = 正規化ablation/enhancement効果の
+  調和平均。"if one or both of the E values are negative, we incorporate a
+  penalty coefficient w"
+- **データ構築側の最小編集(第1ラウンドの警告を実物で確認)**: "produced
+  through a **minimal edit** that deletes or substitutes the trigger while
+  preserving semantic content"
+- **🔴 LinguaLens本体は OpenSAE on Llama-3.1-8B(32層)** — Gemmaではない。
+  "For SAEs, we use OpenSAE (THU-KEG, 2025) and its released checkpoints on
+  32 layers of Llama-3.1-8B"。我々のB1はGemma+Gemma Scopeへの**忠実移植**
+  である旨を明記すること(AxBenchのGemma論点とは土俵が別)。
+- **題名**: PDF実物は **"LinguaLens: Towards Interpreting Linguistic
+  Mechanisms of Large Language Models via Sparse Auto-Encoder"**。
+  ar5ivは旧題 "Sparse Auto-Encoder Interprets Linguistic Features in Large
+  Language Models" を返す → **投稿時に版と題名を確認**。
+
+### W-2. 🟢 主張(b)の最近接脅威 = 制約付きLevT系譜 — 差別化点が確定
+
+| | Susanto et al. (ACL 2020) | EDITOR (Xu & Carpuat, TACL 2021) |
+|---|---|---|
+| 仕様の中身 | **terminology constraints**(Wiktionary / IATE **用語辞書**、En-De bilingual dictionary entries) | **soft lexical constraints** = ユーザの **output lexical choice** の選好(トークン列) |
+| 与え方 | **decode時に注入**、学習改変なし | imitation learningで学習 + decode時 parallel edits |
+| SAE/解釈可能性の語彙 | **全て0**(sparse autoencoder/autoencoder/dictionary learning/interpretable feature/activation/steering/monosemantic/probe/latent) | **全て0**(同上) |
+
+逐語 — Susanto: "our method **injects terminology constraints at inference
+time** without any impact on decoding speed" / "Our method does not require
+any modification to the training procedure and can be easily applied at
+runtime **with custom dictionaries**" / 制約の出所は "En-De bilingual
+dictionary entries extracted from **Wiktionary**" と "the **Interactive
+Terminology for Europe (IATE)** terminology database"。
+
+逐語 — EDITOR: "makes sequence generation flexible by seamlessly allowing
+users to **specify preferences in output lexical choice**"。
+
+**→ 差別化点は予測通りに確定**: 制約付きLevT系譜は確かに「離散編集を仕様で
+条件付ける」が、その**仕様は表層の用語辞書/トークン列**である。SAE-LEWISの
+仕様は**モデル内部から回収された解釈可能な特徴辞書**にある。**仕様の「種類」
+が違う**と書けばよく、「仕様で条件付ける離散編集は前例がない」とは書かない
+(それは即座に潰される)。
+
+### W-3. 🟢 EDITOR は我々のM1 MOVE(NO-GO)の先行研究 — §7 Analysisで引く
+
+EDITOR abstract 逐語:
+
+> "It relies on a novel **reposition operation** designed to **disentangle
+> lexical choice from word positioning decisions**, while enabling
+> **efficient oracles for imitation learning** and parallel edits at
+> decoding time."
+
+我々のM1 MOVEは「syntax-decidableな移動可能性 → λ^mov が不整合な条件付けの
+下で発火」で失敗した(empty ranking 0.15→0.39、random no_edit 0.50)。
+EDITORは**まさにその oracle 設計を解いている**(語彙選択と位置決定の分離)。
+→ M1のNO-GO考察は「op語彙の拡張は必要だが十分でない」で止めず、
+**「EDITORはrepositionのoracleを設計して解いた。我々のMOVEは条件付け
+コントラスティブな教師なしにop語彙だけ足したので失敗した」**と、
+**先行研究に照らした具体的な失敗原因**として書ける(P5 corruption提案の
+直接の論拠にもなる)。
+
+---
+
+## Z. 残る未達
 
 | 項目 | 状態 | 影響 |
 |---|---|---|
-| **最優先2: 制約付きLevT** (Susanto et al. ACL 2020 / EDITOR, Xu & Carpuat TACL 2021) | 一次資料未読 | **主張(b)の最近接先行研究**。仕様が表層の語リストか表現空間の何かかを確認しないと差別化点が確定しない |
-| **最優先3: LinguaLensのFRC/PS/PN定義と介入特徴数** | 0-3で棄却されたまま | **🔴 これが無いとP-Bが書けない**。「同定は少数特徴で足りるが編集には約32必要」の対比が全面的に依存 |
-| **(c) judge自己一致率** | 未調査 | 「探したが無い」と書けない |
-| **(d) 編集サイズによるルーティング** | 未調査 | routedシステムの新規性主張に直結 |
+| **(c) judge自己一致率** | 第3ラウンド実行中 | 「探したが無い」とまだ書けない |
+| **(d) 編集サイズによるルーティング** | 第3ラウンド実行中 | routedシステムの新規性主張に直結 |
 | AxBenchの正確な会場 | 未解決 | PMLR v267 (wu25a) は確認済だが OpenReview forum K2CckZjNy0 の記述と食い違う。**ICML 2025 / ICLR 2025 のどちらか要確定** |
-| vanilla SAE 0.695 への応答方針 | 未決 | SAE-LEWISの特徴選択が教師あり/教師なしかを明確化し、教師なしなら0.695側にどう応答するか決める |
+| vanilla SAE 0.695 への応答方針 | 未決 | 我々の特徴選択が教師あり/教師なしかを明確化し、教師なしなら0.695側にどう応答するか決める(**単一latent vs k=32集合**の構造的切り分けが本命) |
 | arXiv:2602.14111 への random-feature control | 未決 | Soft-Frozen/Frozen の区別による反論に加え、実証的controlを実装するか |
+| 肯定側母集団の逐語確認 | 未 | Bricken 2023 / Templeton 2024 / Cunningham 2309.08600 / JumpReLU 2407.14435 / TopK / OpenSAE。**書誌情報のみの引用なら不要** |
 
 ---
 
@@ -395,7 +496,7 @@ OpenSAE。
 
 | 棄却された主張 | 票 | なぜ危険か |
 |---|---|---|
-| 「LinguaLensはtop-3のFRC-ranked base vectorのみで条件付け、FRC=PSとPNの調和平均」 | 0-3 | **🔴 P-Bの対比対象そのもの**。「同定は1-3特徴で足りるが編集には約32のinstance-level特徴が要る」という論証がこの対比に依存する。LinguaLens本文で再確認必須(第2ラウンド) |
+| ~~「LinguaLensはtop-3のFRC-ranked base vectorのみで条件付け、FRC=PSとPNの調和平均」~~ | ~~0-3~~ | **⚠️ この棄却自体が誤り(検証側の偽陰性)**。§W-1でPDF実物から逐語確認: FRC=調和平均の式も「介入は現象あたりtop-3のbase vector」も**本文にそのまま存在する**。複合主張だったため一部の不正確さで全体が落ちたと見られる。**3票検証にも偽陰性がある**ことの実例 — 棄却されても一次資料で確認する価値がある |
 | 「LinguaLens自身がSAE介入の制御信頼性の低さを認めている」 | 0-3 | 「SAE陣営自身による自認」という**有利すぎる論拠は使えない** |
 | 「Edit Flowsの操作語彙はちょうどINS/DEL/SUBでMOVEなし」 | 0-3 | Edit Flowsの語彙の正確な内容は再確認が必要 |
 | 「LaserTaggerの語彙はKEEP/DELETE/ADDちょうど3種でSUBは非プリミティブ」 | 0-3 | 同上 |
@@ -408,13 +509,29 @@ OpenSAE。
 
 ## Y. 執筆時の手続き規則
 
-1. **逐語引用はすべてPDF全文抽出で再確認する。** このラウンドで二次要約器
-   による**2件の捏造/矛盾**が検出された: Edit Flowsについてabstractと正面
-   から矛盾する記述、LEWISについて存在しない大文字タグ(KEEP/REPLACE)を
-   「逐語」と称した記述(実物は小文字と `<ins>`/`<repl>` マーカーのみ)。
+1. **逐語引用はすべて自前のPDF全文抽出で再確認する。二次要約器を信用しない。**
+   検出された捏造/誤りは**計6件**:
+   - Edit Flowsについてabstractと正面から矛盾する記述(第1R)
+   - LEWISについて存在しない大文字タグ(KEEP/REPLACE)を「逐語」と称した
+     記述(第1R。実物は小文字と `<ins>`/`<repl>` マーカーのみ)
+   - LinguaLensの介入特徴数を「5」と回答(実物は「**3本のbase vector**」/
+     「**6現象**」)(W-1)
+   - LinguaLensのEALEを「NOT FOUND」と回答(実物は定義あり・2ヒット)(W-1)
+   - LinguaLensの題名を旧題で回答(W-1)
+   - LinguaLensに存在しない一文 "We consider a base vector to be strongly
+     related ... if its sufficiency probability exceeds 0.9" を §4.2.1 の
+     逐語と称して回答 — **PDF全文に該当なし**(W-1)
+
+   **確立した手順**: `curl -sL -o x.pdf <arxiv/aclanthology PDF URL>` →
+   pypdfで全ページ抽出 → NFKD正規化 + `ﬁ`/`ﬂ` 展開 + `-\n` 除去 + 空白畳み
+   → 自分で `re.finditer` する。
 2. **grepの0ヒットを信じない。** PDFのリガチャ("ﬁrst")とハイフン折返しで
-   偽陰性が出る(NAACL tutorialで実際に発生)。
-3. **「調べていない」と「探したが無い」を区別する。** 現状「反例なし」と
-   書いてよいのは (a)(b) のみ。
-4. **版番号を投稿時に再確認する。** LinguaLens v2 (EMNLP 2025 Main採択)、
-   Tan et al. v6 (2025-05)、Edit Flows v3 が最新。
+   偽陰性が出る(NAACL tutorialで実際に発生)。上記の正規化を必ず通す。
+3. **3票の敵対的検証にも偽陰性がある。** LinguaLensのFRC/top-3の主張は0-3で
+   棄却されたが、実物には逐語で存在した(§W-1)。**複合主張は一部の不正確さで
+   全体が落ちる**。棄却されても、論証の根幹に関わるものは一次資料で確認する。
+4. **「調べていない」と「探したが無い」を区別する。** 現状「反例なし」と
+   書いてよいのは (a)(b) のみ。(c)(d) は第3ラウンド待ち。
+5. **版番号と題名を投稿時に再確認する。** LinguaLensはarXiv旧題と現題が
+   異なる(§W-1)。Tan et al. v6 (2025-05)、Edit Flows v3 が最新。
+   AxBenchは camera-ready (v3 / PMLR v267) の数値を引く。
