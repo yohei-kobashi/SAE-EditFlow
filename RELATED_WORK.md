@@ -40,6 +40,26 @@ the top-10 with an LLM agent.
 **Crucially, LinguaLens uses those features only as an activation-space
 knob**: it clamps a target feature's activation during the forward pass
 (0 for ablation, 10 for enhancement) and reads off free-form generated text.
+
+Its identification is also uncontested by construction. LinguaLens reports no
+detection baseline — its only "baseline" is a random-25-vector control for the
+*intervention* — and no standard detection metric (AUROC, AUC and F1 all
+appear zero times in the paper), so FRC is an internal quantity that cannot be
+compared against a linear probe or a difference-of-means direction. Its PS/PN
+are moreover estimated on minimal pairs, where s+ and s− differ only in the
+trigger: the easiest possible discrimination. AxBench, by contrast, is built
+to be falsifiable — twelve methods under paired t-tests on passage-level
+detection — which is exactly why it can conclude that vanilla SAE (0.695) is
+"significantly outperformed by five supervised methods", and can price the
+supervised feature-selection step that LinguaLens performs but never
+evaluates (SAE 0.695 → SAE-A 0.917). Neither design is wrong; they answer
+different questions. But it means the field currently has an *existence*
+claim about linguistic SAE features (LinguaLens) and a *comparative* claim
+about single-latent concept detection (AxBench), and no evaluation of whether
+identified linguistic features are good enough to **act on**. That gap is
+where P-B sits: it is the baseline comparison LinguaLens could not run,
+because it has neither a competing conditioning signal nor a downstream task
+with a ground truth to score against.
 Editing appears in LinguaLens only on the *data-construction* side — its
 counterfactuals are "produced through a minimal edit that deletes or
 substitutes the trigger while preserving semantic content". **No prior work,
