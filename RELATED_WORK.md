@@ -4,9 +4,12 @@
 25主張を3票の敵対的検証 → **12確定 / 13棄却**。棄却分は「使えない」の記録
 として §X に残す(同じ罠を二度踏まないため)。
 
+第2ラウンド(2026-07-15): 24出典 → 120主張 → 25検証 → **12確定 / 13棄却**。
+軸4を確定。
+
 **現状のカバレッジ**: 軸1(probing)・軸2(離散編集)・軸3(steering限界)
-は確定。**軸4(SAE介入・SAE懐疑論)、反例(c)(judge自己一致率)、(d)
-(ルーティング)は検証済み知見ゼロ = 未調査**。第2ラウンド実行中。
+・軸4(SAE介入・SAE懐疑論)は確定。**反例(c)(judge自己一致率)と(d)
+(ルーティング)は2ラウンド経ても検証済み知見ゼロ = 未調査**。
 → **「反例は見つからなかった」と書いてよいのは(a)(b)だけ**。(c)(d)は
 「調べていない」が正しい状態で、「探したが無い」と混同してはならない。
 
@@ -217,27 +220,172 @@ proceedingsは英綴り "Analysing the Generalisation..." → 会議を引くと
 
 ---
 
-## 軸4. SAE介入技術 / SAE懐疑論 — **未調査(第2ラウンド実行中)**
+## 軸4. SAE介入技術 / SAE懐疑論 — 第2ラウンドで確定(2026-07-15)
 
-確定claim 12件の内訳は軸1が3件、軸2が7件、軸3が2件で**軸4はゼロ**。棄却
-claimにも軸4由来のものは含まれない。したがって以下は**未検証の調査対象**
-であって既知の事実ではない。
+### 結論: AxBenchは我々を沈めない。**steering軸に閉じている**
 
-**🔴 最大の脅威(検索では発見済・未検証)**: **AxBench**
-(arXiv:2501.17148, "Steering LLMs? Even Simple Baselines Outperform Sparse
-Autoencoders", Wu et al., ICML 2025 Spotlight)。**Gemma-2-2B/9B = 我々と
-同一のベースモデル**で「steeringでは単純なpromptingが既存全手法を上回る」と
-報告。中核主張への最強の反論。
+**AxBench** (arXiv:2501.17148, "Steering LLMs? Even Simple Baselines
+Outperform Sparse Autoencoders", Wu, Arora, Geiger, Wang, Huang, Jurafsky,
+Manning, Potts, PMLR v267)。題名への回答として明言するのは
+**representation steering がprompting/finetuningに劣ること のみ**:
 
-**生死を分ける区別**: AxBenchが「**SAE steeringは弱い**」に留まるのか、
-「**SAEは編集の条件付けにも使えない**」まで含意するのか。前者なら我々の
-立場はむしろAxBenchと**整合的**になる(「SAE steeringは弱い、だから離散編集で
-条件付ける」)。P-B知見(検出できることと指令として使えることは別)も同方向。
+> §7 "To answer the question in the title of this work: our evaluation shows
+> that even at SAE scale, **representation steering** is still far behind
+> simple prompting and finetuning baselines."
+> §3 "We evaluate along two axes: **concept detection** C and **model
+> steering** S."
 
-その他の未検証: Towards/Scaling Monosemanticity (Bricken et al. 2023 /
-Templeton et al. 2024), Cunningham et al. (arXiv:2309.08600), Gemma Scope
-(arXiv:2408.05147), JumpReLU (arXiv:2407.14435), TopK SAE, SAEBench,
+steeringの定義は h_i + αw の activation addition。手法集合(DiffMean, PCA,
+LAT, Probe, SSV, ReFT-r1, SAE, SAE-A, BoW, I×G, IG, Prompting,
+SFT/LoRA/LoReFT)に**離散/編集系は皆無**。偽陰性対策(リガチャ正規化+
+ハイフン折返し除去+`grep -a`)を施した全文検索で `levenshtein` 0 /
+`edit distance` 0 / `discrete edit` 0 / `text editing` 0 / `rewrite` 0 /
+`constrained decoding` 0 / `lexical constraint` 0 / `non-autoregressive` 0。
+`insertion` 3件は全て合成データ生成用プロンプト文言、`edit` の全出現は
+参考文献の "editors" と Meng et al. ROME の書誌のみ。
+
+### 🟢 AxBench自身が検出軸とsteering軸の脱連関を実証している
+
+> p.7 "Importantly, we note that SAE-A slightly underperforms the
+> unsupervised SAE; **better classification does not directly lead to better
+> steering**."
+
+**著者自身のデータが存在証明**(camera-ready v3 / PMLR v267 の値):
+
+| 手法 | 検出 (Table 1 Avg) | steering (Table 2 Avg) |
+|---|---|---|
+| SAE-A(教師ありAUROC選択) | **0.917** | **0.157** |
+| SAE(教師なし) | 0.695 | **0.165** ← 検出で0.222劣るのにsteeringは上 |
+| Probe | 0.940 | 0.098 |
+| SSV | 0.912 | 0.026 |
+
+**検出順位とsteering順位は一致しない**。Figure 1 自体が両軸を直交2軸として
+プロットしている。→ 「SAE steeringが弱い」は「SAE特徴が現象を同定・条件
+付けできない」を**含意しない**。
+
+**🔴 較正(必ず守る)**: AxBenchは **editing condition を一度も評価して
+いない**。よって detection↔steering の脱連関から「編集条件としての有用性
+≠ steeringノブとしての有用性」への橋渡しは**類推**。**"direct support" と
+書いてはならない**。正しい書き方: 「AxBenchはdetectionとsteeringが別軸で
+あることを実証しており、我々の条件付け用途はsteering軸の否定的結果に直撃
+されない」と、類推であることを明示する。なお SAE-A vs SAE のsteering差
+(0.157 vs 0.165)は小さく原文も "slightly"、**有意検定は報告されていない**。
+
+### 🔴 実質的脅威は検出軸 — vanilla SAE 0.695(12手法中11位)
+
+Abstractの "On both evaluations, SAEs are not competitive" は**検出側に
+ついては本文より強い断定**。本文逐語:
+
+> "Overall, we find that DiffMean, Probe, and ReFT-r1 are the best performers
+> with no statistically significant difference (p < 0.05) between any of them
+> under a paired t-test. Prompt, SAE-A, and SSV are not far behind and
+> significantly outperform the remaining methods. LAT also performs better
+> than random. **Vanilla SAEs are thus significantly outperformed by five
+> supervised methods**, all of which are much cheaper to train using a
+> limited amount of synthetic data."
+
+Table 1 Avg 実測: DiffMean **0.942** / Probe 0.940 / ReFT-r1 0.938 /
+Prompt 0.929 / SAE-A 0.917 / BoW 0.914 / SSV 0.912 / LAT 0.712 /
+**SAE 0.695** / PCA 0.652。
+**SAE-LEWISが教師なしで特徴選択するなら該当するのは0.695の方**。
+
+### 🟢 ただし0.695のk=32レジームへの転移には構造的限界がある(我々の防御)
+
+AxBenchのSAE検出プロトコルは**概念1つにつきGemmaScope latentを1本だけ**
+使う(encoder/decoder列ペア1組)。そのlatent単体の活性でトークンをスコア
+リングし平均プーリングでpassage-level化する。→ 測っているのは**単一特徴に
+よる概念同定**であって、**約32個のinstance-level特徴の集合による条件付け
+ではない**。論文内に多latent版は存在しない(3-0で確認)。
+
+### 🔴 モデル差による逃げは効かない
+
+AxBenchは Gemma-2-2B (L10/L20) と Gemma-2-9B (L20/L31) で Gemma Scope
+事前学習済みSAEを使用。**2BについてはAxBench自身がbase LM学習SAE
+(= SAE-LEWISが使う `gemma-scope-2b-pt-res` 系そのもの)を使用**。
+→ **同一ベースモデル・同一SAE系列**。正面から用途の切り分けで応答するしかない。
+
+### AxBenchへの唯一の正面反論も steering軸に閉じている
+
+Jørgensen & Hansen (arXiv:2605.31183) はAxBenchの中核所見を**生き残らせて
+いる**: 自身が「promptingにはなお及ばない」と明示的に譲歩し、達成した同等性
+は**LoRAに対してのみ**。→ 論争全体がsteering軸に閉じており、AxBenchの否定的
+結果は「SAE steeringはpromptingに対して弱い」にnarrowされるだけ。
+
+### その他の懐疑論
+
+**Kantamneni, Engels, Rajamanoharan, Tegmark, Nanda, "Are Sparse
+Autoencoders Useful? A Case Study in Sparse Probing"** (arXiv:2502.16681,
+ICML 2025)。SAE probeは4つの困難レジーム(data scarcity, class imbalance,
+label noise, covariate shift)**すべてでデータセット平均としてロジスティック
+回帰を下回り**、113データセット全体で従来手法に対する改善なし。
+**🟢 限定**: 敗北は ensemble / "quiver of arrows" 基準での「**一貫した優位の
+不在**」であり、**個別データセットではSAEが勝つ場合があると著者自身が明記**。
+
+**SAEBench** (arXiv:2503.09532) の証拠は**両義的**(2-1で票が割れた):
+k-sparse probingでSAEは「K本の残差ストリーム次元を直接probingする」
+ベースライン(Gemma-2-2B L12で0.65)を有意に上回るが、(i) 当メトリクスは
+アーキテクチャ・幅・sparsity間の識別力が乏しく Gao et al. (2024) の
+"probe based metricはかなりノイジー" と整合し、(ii) Appendix Eで著者自身が
+そのベースラインを **"a notably weak baseline"** と呼び、学習済みモデルの
+残差ストリームprobingは**94%精度**に達すると記載。→ 結論は比較対象次第で
+変わるので、**SAEBenchを一方向の典拠に使わない**。
+
+### 🔴 最強の反論源: frozen/random SAE baselines (arXiv:2602.14111)
+
+**abstractの見出し数値には反論可能な限定がある**(一次資料Table 2を逐語照合):
+causal editing (RAVEL) で **0.73 を出したのは Soft-Frozen Decoder**
+(ランダム初期化から cos類似 τ=0.8 内に留めつつ**学習を許す**変種)。
+**方向を完全ランダム固定する Frozen Decoder は 0.55–0.62 に落ち**、
+フル学習の 0.72–0.74 に明確に劣る。→ **「完全ランダム方向でも編集できる」
+という強い主張は成立していない**。
+一方 sparse probing では完全ランダムのFrozen Decoderが 0.669–0.702 と
+フル学習 0.721 に肉薄 → **probing系指標こそ最も弁別力を欠く**。
+
+**🔴 使えない防御**: 「同論文の causal editing はRAVELによる活性空間介入で
+あり、SAE-LEWISの表層離散編集とはタスクが異なる」という切り分けは **0-3で
+棄却**。単独の防御には使えない。Soft-Frozen/Frozen の区別で反論すること。
+
+### 肯定側の母集団
+
+**Gemma Scope** (arXiv:2408.05147, Lieberum et al., Google DeepMind,
+2024-08) — 我々が使うSAE重みそのものの出所であり、AxBenchとの共通の土俵を
+成立させている。**🟢 使える**: SAE公開側の当事者であるDeepMind自身が2024年
+8月時点で「SAEが公正なベースラインと比較して実タスク性能を改善できるか」
+「steering vectorとSAE feature steering/clampingの比較」「SAEが本当にモデル
+の『真の』概念を見つけているか」を **open problem として列挙**しており、
+**SAEの下流有効性が当初から未検証だったことの一次的根拠**になる。
+
+**未確認(書誌情報だけなら足りるが、逐語引用するなら要追加確認)**:
+Towards Monosemanticity (Bricken et al. 2023), Scaling Monosemanticity /
+Golden Gate Claude (Templeton et al. 2024), Cunningham et al.
+(arXiv:2309.08600), JumpReLU SAE (arXiv:2407.14435), TopK SAE (OpenAI),
 OpenSAE。
+
+### 軸4で棄却された主張(**書いてはいけない**)
+
+| 棄却 | 票 | なぜ |
+|---|---|---|
+| 「AxBenchのSAE不振はNeuronpediaラベルによる特徴選択のconfoundのせい」 | 0-3 | **この言い訳は使えない** |
+| 「AxBenchは steering as production intervention と features as causal ... を明示的に分離している」 | 0-3 | そんな分離は書かれていない |
+| 「Kantamneni et al.は自らscopeをprobingに限定し他タスクへの一般化を自ら否認」 | 0-3 | 自己否認はしていない |
+| 「懐疑論文自身がSAEが最先端である応用の存在を譲歩している」 | 0-3 | 有利すぎる譲歩は取れない |
+| 「arXiv:2602.14111のcausal editingはRAVEL活性空間介入で我々とタスクが違う」 | 0-3 | **単独の防御に使えない** |
+| AxBench v1 の数値 0.918 / 0.305 / 0.315 | 改訂済 | v3本文に0ヒット。v1のSAE-A 0.918はGemma-2-2Bの2設定平均をSAEの4設定平均と比べる**非対称比較**。**camera-ready (v3/PMLR v267) の値を引くこと** |
+| 「最良のDiffMean(0.938)」 | 転記ミス | **0.938はReFT-r1、DiffMeanは0.942** |
+
+---
+
+## Z. 2ラウンド後も**未達**(Related Work執筆のブロッカー)
+
+| 項目 | 状態 | 影響 |
+|---|---|---|
+| **最優先2: 制約付きLevT** (Susanto et al. ACL 2020 / EDITOR, Xu & Carpuat TACL 2021) | 一次資料未読 | **主張(b)の最近接先行研究**。仕様が表層の語リストか表現空間の何かかを確認しないと差別化点が確定しない |
+| **最優先3: LinguaLensのFRC/PS/PN定義と介入特徴数** | 0-3で棄却されたまま | **🔴 これが無いとP-Bが書けない**。「同定は少数特徴で足りるが編集には約32必要」の対比が全面的に依存 |
+| **(c) judge自己一致率** | 未調査 | 「探したが無い」と書けない |
+| **(d) 編集サイズによるルーティング** | 未調査 | routedシステムの新規性主張に直結 |
+| AxBenchの正確な会場 | 未解決 | PMLR v267 (wu25a) は確認済だが OpenReview forum K2CckZjNy0 の記述と食い違う。**ICML 2025 / ICLR 2025 のどちらか要確定** |
+| vanilla SAE 0.695 への応答方針 | 未決 | SAE-LEWISの特徴選択が教師あり/教師なしかを明確化し、教師なしなら0.695側にどう応答するか決める |
+| arXiv:2602.14111 への random-feature control | 未決 | Soft-Frozen/Frozen の区別による反論に加え、実証的controlを実装するか |
 
 ---
 
