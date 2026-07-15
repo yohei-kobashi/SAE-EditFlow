@@ -24,6 +24,12 @@ sc () {  # dir label
         --sys steer="$1/steer.jsonl,$V6/steer_baseline500/records.jsonl,steer0.5" \
         --out "runs/tables/judge_selfconsistency_$2"
     echo
+    python scripts/frr_paired_test.py --label "$2" \
+        --frr ef32="$1/ef32.jsonl" \
+        --frr routed="$1/routed.jsonl" \
+        --frr steer="$1/steer.jsonl" \
+        --out "runs/tables/frr_paired_$2"
+    echo
 }
 sc "$G" hf_google_gemma-2-9b-it
 sc "$O" openai_gpt-4o

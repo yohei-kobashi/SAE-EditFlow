@@ -11,14 +11,23 @@ construction, so
     FRR restricted to exact-match pairs  ==  judge self-consistency
 
 and (1 - that) is the judge's disagreement-with-itself rate under
-presentation-order randomization plus sampling noise.  Two consequences
-for the paper:
+presentation-order randomization plus sampling noise.
 
-  * FRR gaps smaller than the noise floor are not interpretable.
-  * Judge QUALITY becomes partially verifiable without human labels: a
-    judge that contradicts itself on identical comparisons cannot be
-    trusted on the harder non-exact ones.  This is the empirical basis
-    for choosing the primary judge.
+What this rate IS: an instrument-quality ranking, obtained without human
+labels.  A judge that contradicts itself on identical comparisons cannot
+be trusted on the harder non-exact ones, so this is the empirical basis
+for choosing the primary judge.  It also bounds ATTENUATION: per-judgment
+noise is roughly independent of the system, so it shrinks between-system
+FRR gaps toward chance, making every observed gap a conservative reading
+of the true one.
+
+What it is NOT: a threshold below which an aggregate FRR gap is
+meaningless.  An earlier version of this file claimed that, and it was
+wrong — noise that is independent across ~980 pairs AVERAGES OUT of the
+aggregate mean rather than swamping it, and it cannot manufacture a gap
+that is not there.  For "is A's FRR really above B's?" use the paired
+test in scripts/frr_paired_test.py (exact McNemar over the same pairs
+and the same judge), not a comparison against this rate.
 
 Also reports FRR on the non-exact subset (where the judge is doing real
 work) and the gold-indecisive rate (judge answered "equal" on src/tgt).
@@ -155,8 +164,11 @@ def main():
          "the gold judgment judge(src, tgt) (same feature, same strings), "
          "so a self-consistent judge scores realized=True by "
          "construction. FRR on that subset therefore measures the judge "
-         "against itself; 1 - it is the noise floor below which FRR "
-         "differences are not interpretable. No human labels needed.", "",
+         "against itself, ranking judges as instruments with no human "
+         "labels. It is NOT a threshold for aggregate FRR gaps: noise "
+         "independent across ~980 pairs averages out of the mean and "
+         "attenuates real gaps toward chance rather than inventing them "
+         "(use scripts/frr_paired_test.py to test a gap).", "",
          "| system | exact pairs | self-consistency [95% CI] | flips | "
          "non-exact pairs | FRR (non-exact) | gold-indecisive |",
          "|---|---|---|---|---|---|---|"]
@@ -169,7 +181,7 @@ def main():
     L += ["",
           f"**Pooled self-consistency: {pooled:.4f} "
           f"[{plo:.3f}, {phi:.3f}] (n={pool_n}, flips={pool_n - pool_k})** "
-          f"→ FRR noise floor ~{floor:.3f}.",
+          f"— per-judgment disagreement-with-itself {floor:.3f}.",
           "",
           f"Pooled FRR on the non-exact subset: "
           f"{(ne_k / ne_n) if ne_n else float('nan'):.4f} (n={ne_n}) — "
@@ -178,9 +190,12 @@ def main():
           "Reading: self-consistency well below 1.0 means the judge "
           "contradicts itself on identical comparisons under presentation-"
           "order randomization, and cannot be trusted to resolve the "
-          "harder non-exact pairs. Compare across judges to pick the "
-          "primary; compare the floor against between-system FRR gaps "
-          "before interpreting them."]
+          "harder non-exact pairs. Compare ACROSS judges to pick the "
+          "primary — the most self-consistent judge is the least "
+          "attenuating instrument, which is why it should also show the "
+          "LARGEST between-system separation. Do not compare this rate "
+          "against a between-system gap to decide whether the gap is "
+          "real; that is what scripts/frr_paired_test.py is for."]
     report = "\n".join(L)
     print()
     print(report)

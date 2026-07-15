@@ -100,3 +100,11 @@ python scripts/judge_selfconsistency.py --label "$TAG" \
     --out "runs/tables/judge_selfconsistency_$TAG"
 echo "All three columns are now honest order-randomized readings; before"
 echo "the fix only the routed column was."
+
+echo
+echo "==================== PAIRED FRR TESTS ===================="
+python scripts/frr_paired_test.py --label "$TAG" \
+    --frr ef32="$FRR/ef32.jsonl" \
+    --frr routed="$FRR/routed.jsonl" \
+    --frr steer="$FRR/steer.jsonl" \
+    --out "runs/tables/frr_paired_$TAG"
