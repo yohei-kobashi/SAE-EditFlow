@@ -1,13 +1,68 @@
-# 論文構成案 — SAE介入の離散編集化(SAE-LEWIS / Edit Flows)
+# 論文構成案 — SAE特徴を**条件**とした離散編集(SAE-LEWIS / Edit Flows)
 
-作成: 2026-07-13。S4判定(README §13.8、EDIT_FLOWS_ZERO §5)完了時点の構成。
-数値は全て確定済みの実測(出典を各所に記す)。未実施はベースライン B1–B3 のみ。
+作成: 2026-07-13。**2026-07-16 に枠組みを訂正 — 下記🔴を先に読むこと。**
 
-## タイトル案
+## 🔴 枠組みの訂正: 我々は「介入」していない(2026-07-16)
 
-1. *Lifting SAE Interventions into Discrete Edit Operations: Grammaticality-Preserving Minimal-Pair Transformation*
-2. *From Feature Clamping to Edit Flows: Structural Interventions on SAE Features*
-3. *SAE-LEWIS: Editing as Intervention — SAE-Conditioned Edit Flows for Linguistic Minimal Pairs*
+**旧題「SAE介入の離散編集化」および §2 の表は誤りだった。** コードで確認:
+championの条件付け経路 `feature_token_embeds` は
+
+```python
+base = W[:, nz].t()                        # W_dec[f]
+toks = self._calibrate(base) + sgn + mag   # RMS正規化 + 符号 + 大きさ
+```
+
+を **encoder入力の prefix トークン**として与える。すなわち:
+1. **層0(入力)** に置く — SAEが住む**層12ではない**
+2. **トークンを1個増やす** — 既存の活性を**書き換えない**
+3. **RMS再正規化**して埋め込み表のスケールに合わせる — `W_dec` のネイティブ
+   スケールですらない(さらに学習された `cond_scale` が掛かる)
+
+**凍結Gemmaの活性は、どの層でも一度も変更されない。** クランプもベクトル
+加算もしない。因果的に言えば:
+
+| | やっていること | 因果表現 |
+|---|---|---|
+| LinguaLens | forward中に `Z_k := 10` と固定 | **`P(Y \| do(Z=z))`** = 介入 |
+| ActAdd / steer(B3) | `h := h + α·v` | 介入 |
+| **本研究** | `W_dec[f]` を**入力トークンとして足す** | **`P(edit \| Z=z)`** = **条件付け(証拠)** |
+
+Pearlの意味で介入とは変数に値を設定し入力辺を切ること。**我々は何も設定
+していない。証拠を与えているだけ**。我々のSAEの使い方は「**解釈可能な方向の
+辞書(lookup table)**」であって介入のノブではない。
+
+**この訂正は主張を強くする**(サーベイ4ラウンドが全て「新規性=条件付け信号」
+に収束したことと整合): (a) AxBenchのsteering否定結果が**きれいに無関係**に
+なる、(b)「介入の離散化」だと**彼らの土俵(活性空間)**で戦うことになり
+「なぜ活性空間の指標で比較しない?」と聞かれる、(c)「条件付け」なら
+**タスク(目標文を作れるか)**で比較するのが自然で、それは既にやっている。
+
+**正しい2×2**(§2の表を差し替えること):
+
+| | **介入**(活性を書き換える) | **入力**(モデルに与える) |
+|---|---|---|
+| **再生成**(連続・AR) | LinguaLens, AxBench, ActAdd, steer(B3) | **B2**(ラベルを**言葉**で与える) |
+| **離散編集** | **(空白 — 誰もいない)** | **本研究** |
+
+B2と本研究は**同じ「条件付け」の列**。違いは**仕様のモダリティ**(自然言語
+ラベル vs 特徴ベクトル `W_dec[f]`)と**作用**(再生成 vs 編集操作)のみ。
+B2 exact 0.1242 < 本研究 0.2237。
+
+**用語規則**: 本研究について "intervention" / "介入" / "steering" と書かない。
+"**conditioning**" / "**specification**" を使う。`RELATED_WORK.md` は既に
+正しい("uses SAE features as the **conditioning signal** for a model that
+emits edit operations")。
+
+## タイトル案(訂正後)
+
+1. *Commanding Edits with SAE Features: Discrete Minimal-Pair Transformation without Intervening on Activations*
+2. *SAE Features as an Editing Specification, not an Intervention Knob*
+3. *SAE-LEWIS: SAE-Conditioned Edit Flows for Linguistic Minimal Pairs*
+
+**旧題(使用禁止)**: ~~*Lifting SAE Interventions into Discrete Edit
+Operations*~~ / ~~*Structural Interventions on SAE Features*~~ /
+~~*Editing as Intervention*~~ — いずれも「我々が介入している」と主張して
+しまう。
 
 ## 中心主張(全実測後に改訂 2026-07-14 — 確認測定済み)
 
@@ -46,21 +101,36 @@
      挿入・削除・並べ替え(トークン間関係の操作)を表現できない。
   3. **文法性保証の欠如** — 介入後の出力品質は劣化する(LinguaLens自身が対照群の
      非対称性を "the intervention affects overall output quality" と説明)。
-- **目標文(確定稿)**: 本研究の目標は、SAE特徴空間で特定された言語現象への介入を、
-  活性への連続バイアスではなく離散的な編集操作の系列として実現することである。
-  これにより介入の表現力は語彙的な置換に留まらず、トークンの挿入・削除と複数箇所の
-  協調を要する統語レベルの変換にまで拡張され、編集は文法性を保った最小対変換 —
-  対象の言語現象のみを反転させ、それ以外を保存する編集 — として評価可能になる。
-  - 用語注意: 「言語学的な最小単位」とは書かない(形態素と誤読される)。
+- **目標文(2026-07-16 改訂 — 旧稿は「介入を…編集操作として実現する」と書いて
+  おり、我々が介入していると主張してしまっていた)**:
+  本研究が問うのは、**SAE特徴が編集の仕様(specification)として機能するか** —
+  すなわち、活性に適用する介入のノブとしてではなく、**離散的な編集操作の系列を
+  指令する条件付け信号として**使えるか、である。凍結LMの活性は一切変更しない。
+  作用が離散操作であることにより、表現力は語彙的な置換に留まらず、トークンの
+  挿入・削除と複数箇所の協調を要する統語レベルの変換にまで及び、編集は文法性を
+  保った最小対変換 — 対象の言語現象のみを反転させ、それ以外を保存する編集 —
+  として評価可能になる。
+  - 用語注意1: 「言語学的な最小単位」とは書かない(形態素と誤読される)。
     単位は「言語現象」、編集は「最小対変換(minimal-pair transformation)」。
-- 貢献リスト:
-  (i) SAE介入の2軸分類(WHERE推論 × 作用の離散性)と3欠落の指摘;
-  (ii) SAE特徴デルタ条件付きEdit Flow(hazard分解 + 局所化CTMC)— 3欠落に
+  - 用語注意2: 本研究に "intervention" / "介入" / "steering" を使わない
+    (冒頭の枠組み訂正)。**"conditioning" / "specification"**。
+- 貢献リスト(2026-07-16 改訂):
+  (i) **特徴の入り方 × 作用**の2×2分類 — 特徴が**活性への介入**として入るのか
+  **モデルへの入力**として入るのか × 作用が**再生成**か**離散編集**か — と、
+  空白セル(入力 × 離散編集)の同定;
+  (ii) SAE特徴デルタ**条件付き**Edit Flow(hazard分解 + 局所化CTMC)— 3欠落に
   一対一対応(WHERE=rate場λ、構造=離散op、文法性=凍結LM頭Q+empty→no-edit);
-  (iii) LinguaLens 500ペアのゼロショットOOD評価で、連続介入・テキスト指示・
-  多段カスケードに対する系統的比較(matched-pair統計付き)。
+  (iii) LinguaLens 500ペアのゼロショットOOD評価で、**活性への介入**(B1クランプ・
+  B3 steer)・**テキスト仕様**(B2プロンプト)・多段カスケードに対する系統的比較
+  (matched-pair統計付き)。**同じ条件付け列にいるB2との対比が本命** —
+  仕様のモダリティ(自然言語ラベル vs 特徴ベクトル)だけが違う。
 
 ## 2. Related Work — 2軸分類が背骨
+
+> 🔴 **この表は「作用」列で本研究をLinguaLens/ActAddと同列に並べており、
+> 「皆が介入している。彼らは連続に、我々は離散に」と読める = 誤り**(冒頭の
+> 枠組み訂正を参照)。**我々は介入していない。** 差し替え先は冒頭の2×2。
+> 下表は WHERE の比較としてのみ有効(そこは正しい)。
 
 | 手法 | WHEREの決め方 | 作用 | 目標 |
 |---|---|---|---|
