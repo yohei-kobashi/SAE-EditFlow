@@ -53,7 +53,13 @@ Thumbs.db
 
 # All pipeline runs (smoke_pipeline.sh default root, plus a few common
 # alternative roots people use locally).
-runs/
+#
+# `runs/*` rather than `runs/` on purpose: git does not descend into an
+# excluded DIRECTORY, so a nested `!runs/tables/*.md` under `runs/` would be
+# silently dead. Excluding the children instead keeps the same protection
+# (excluding a directory excludes everything under it) while leaving the
+# paper-artifact re-includes at the bottom of this file able to work.
+runs/*
 outputs/
 checkpoints/
 models/
@@ -115,3 +121,35 @@ hf_cache/
 !references.bib
 !.gitignore
 !scripts/**/*.sh
+
+# --- Paper artifacts: the small text tables, synced miyabi -> local ----------
+# Everything the paper is written FROM, and nothing it is not. Order matters
+# twice over: these must come after `runs/*` above, and each directory level
+# must be re-included BEFORE its contents can be, because git will not look
+# inside a directory it has excluded. Verified with `git check-ignore`.
+#
+# Regenerate rather than hand-edit: every file here is script output
+# (run_main_tables.sh / run_frr_rerun.sh / run_judge_checks.sh /
+# run_examples.sh), so a re-run legitimately shows up as a diff.
+
+# Top-level notes written straight into runs/.
+!runs/*.md
+
+# runs/tables/ — main metrics, per-feature FRR, self-consistency, paired
+# McNemar, and the qualitative examples. The .jsonl exception is scoped to
+# this directory and currently means only the examples dumps (full
+# untruncated texts for quoting); it is NOT a licence for records.jsonl,
+# which stays excluded by `runs/prod_gemma_v6/*/*` below.
+!runs/tables/
+runs/tables/*
+!runs/tables/*.md
+!runs/tables/*.csv
+!runs/tables/*.jsonl
+
+# Per-run report.md from the baselines and sweeps (B1 clamp sweep, B3 steer,
+# k-sweep, ...). Their records.jsonl siblings stay ignored.
+!runs/prod_gemma_v6/
+runs/prod_gemma_v6/*
+!runs/prod_gemma_v6/*/
+runs/prod_gemma_v6/*/*
+!runs/prod_gemma_v6/*/report.md
