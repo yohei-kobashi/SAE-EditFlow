@@ -626,6 +626,46 @@ probe500_frc_{intersect,pure}_ctrl(両者同一 = **既知**の pool_topk=64 上
   **2つの独立な経路(学習済み編集器・無学習readout)が同じ結論**:
   現象レベル同定特徴はWHEREを部分的に運び、WHATを運ばない。
 
+## 6k. P-N — B1/B3実装の、両論文自身の指標での検証(2026-07-17実測)
+
+judge = 各論文の選択(LinguaLens: gpt-4o / AxBench: gpt-4o-mini)。
+較正: P(feature ABSENT | source) = 0.126 → **judgeはデータセットの正例を
+87.4%認識**(健全)。
+
+**LinguaLens指標(ablation成功率とE_abl、499ペア)**:
+
+| run | P(Y=0\|targeted) | P(Y=0\|random) | **E_abl** |
+|---|---|---|---|
+| b1_ours(我々の仕様×clamp) | 0.613 | 0.226 | **+0.631** |
+| ll_protocol(彼らの完全版) | 0.220 | 0.200 | **+0.091** |
+| b3_ours(我々の仕様×steer) | 0.693 | 0.437 | **+0.370** |
+| ax_protocol(AxBench完全版) | 0.349 | 0.309 | **+0.115** |
+
+**AxBench指標(0-2×3の調和平均)**:
+
+| run | true | random | conceptギャップ | fluency(true) |
+|---|---|---|---|---|
+| b1_ours | **1.211** | 0.615 | 1.32 vs 0.63 | 1.80 |
+| ll_protocol | 0.570 | 0.536 | 0.57 vs 0.53 | 1.98 |
+| b3_ours | **1.262** | 0.454 | 1.33 vs 0.55 | 1.69 |
+| ax_protocol | 1.121 | 1.038 | 1.10 vs 1.02 | 1.97 |
+
+**判定**:
+1. **✅ 実装は両方合格**: clampはLinguaLensの定性的主張(targeted≫random)を
+   E_abl +0.631 で強く再現。steerはAxBench指標で concept +0.78 かつ
+   fluency維持(1.69 vs random 1.63)。
+2. **🎯 仕様主張(C1')が彼らの指標でも再現**: 同一機構で、現象レベル仕様の
+   E_abl は +0.09/+0.12・AxBenchギャップ +0.03/+0.08 に対し、我々の
+   事例レベル仕様は **+0.63/+0.37・+0.60/+0.81** — exact特有の現象ではない。
+3. **AxBench完全版はAxBench自身の指標でもrandom対照とほぼ分離しない**
+   (+0.08)— 彼ら自身の否定的結果と整合。
+4. 指標間の順位反転も記録: LinguaLens指標では clamp(+0.631)> steer
+   (+0.370)= exactの逆。P(absent)は文破壊でも上がるため(clamp+reconの
+   破壊が寄与)、fluencyを持つAxBench指標・exact・FRRの多軸が必要という
+   主題の追加実例。
+5. 修正済みの穴: 無介入参照(raw)が初回 n=0(empty条件の2サブモードを
+   単一フォールバックが取りこぼし)→ 修正して差分再判定中。
+
 ## 6j. corruption top-up v7 = P4 + P5 + 語彙多様化(2026-07-17着手)
 
 ユーザ決定により実施。台帳(M1 NO-GO判定)の処方箋そのまま:
