@@ -54,7 +54,12 @@ set -eo pipefail
 # Everything here is an intervention on gemma-2-2b's layer-12 residual
 # stream, and nothing here is trained. The causal claim survives all three.
 V6=./runs/prod_gemma_v6
-R=$V6/clamp_readout500
+# v2: WHAT = pmi (the token the intervention promoted most, top-50-restricted)
+# + the clamp-path position mask actually consumed. v1 (clamp_readout500/) is
+# kept untouched — it IS the --what int ablation arm, and its verdict stands:
+# empty perfect, WHERE causal (true fires 2-3x random), WHAT dominated by the
+# LM prior (sim fell below the 0.6033 copy baseline at every setting).
+R=$V6/clamp_readout500_v2
 
 # ---- the 2x2: {clamp, delta} x {all, local}, all with the readout --------
 # clamp+all is B1's intervention with only handicap 3 removed, so it isolates

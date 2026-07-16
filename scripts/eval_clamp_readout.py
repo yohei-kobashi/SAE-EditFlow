@@ -180,6 +180,13 @@ def parse_args():
                    help="edit position i when Delta_i < this (nats). More "
                         "negative = the intervention must object more "
                         "strongly before we touch the token.")
+    p.add_argument("--what", default="pmi",
+                   help="pmi = the token the intervention PROMOTED most, "
+                        "within the intervened head's top-K (the "
+                        "counterfactual direction). int = argmax p_int — "
+                        "measured to be dominated by the LM prior: sim fell "
+                        "BELOW the copy baseline at every setting (v1 run)")
+    p.add_argument("--what-topk", type=int, default=50)
     p.add_argument("--ins-keep-p", type=float, default=0.10,
                    help="after splicing v, if the intervened head still gives the\n                        original token at least this probability, v was an\n                        INSERTION, not a substitution")
     p.add_argument("--feature-sets", default="",
@@ -237,13 +244,17 @@ def propose_ops(lm, ids, hook, dvec_or_none, cv, pos_mask, args, W_dec,
         hook.enabled = True
         hook.amp_idx = hook.sup_idx = None
         hook.amp_val = None
-        lp_base, _ = teacher_forced_logprobs(lm, ids, args.device)
+        hook.pos_mask = None          # recon baseline: full passthrough
+        lp_base, logits_base = teacher_forced_logprobs(lm, ids, args.device)
         hook.amp_idx = torch.nonzero(za > 0).flatten().to(args.device)
         hook.amp_val = float(cv)
         hook.sup_idx = torch.nonzero(zs > 0).flatten().to(args.device)
+        hook.pos_mask = (torch.tensor(pos_mask[:len(ids)],
+                                      dtype=torch.float32)
+                         if pos_mask is not None else None)
     else:
         hook.enabled = False
-        lp_base, _ = teacher_forced_logprobs(lm, ids, args.device)
+        lp_base, logits_base = teacher_forced_logprobs(lm, ids, args.device)
         hook.enabled = True
         hook.dvec = dvec_or_none
         hook.alpha = float(cv)
@@ -267,7 +278,18 @@ def propose_ops(lm, ids, hook, dvec_or_none, cv, pos_mask, args, W_dec,
     # ---- WHAT + KIND -----------------------------------------------------
     ops, splices = [], []
     for j in cand:
-        v = int(logits_int[j].argmax())
+        if args.what == "pmi":
+            # the counterfactual direction: the token the intervention
+            # PROMOTED most, among plausible ones. Bare delta-argmax digs up
+            # tokens promoted from -20 to -10 that were never plausible, so
+            # restrict to the intervened head's top-K. argmax of the
+            # log-softmax difference == argmax of the logit difference
+            # (the logsumexp shift is constant per row).
+            topv, topi = logits_int[j].topk(args.what_topk)
+            dlt = topv - logits_base[j][topi]
+            v = int(topi[int(dlt.argmax())])
+        else:                                  # "int": v1 ablation arm
+            v = int(logits_int[j].argmax())
         cur = ids[j + 1]
         if v == cur:
             continue

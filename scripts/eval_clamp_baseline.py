@@ -127,6 +127,10 @@ class SaeClampHook:
         self.amp_idx = None          # LongTensor or None
         self.amp_val = None          # float, or per-feature FloatTensor
         self.sup_idx = None
+        self.pos_mask = None         # (T,) bool or None = all positions.
+        # None preserves B1's original behaviour exactly; the readout's
+        # scope=local sets it (v1 computed the mask but only DeltaHook
+        # consumed it, so clamp_local silently equalled clamp_all).
 
     def __call__(self, module, inputs, output):
         if not self.enabled:
@@ -142,6 +146,10 @@ class SaeClampHook:
         if self.sup_idx is not None and self.sup_idx.numel():
             z[..., self.sup_idx] = 0.0
         h_new = self.sae.decode(z).to(dt)
+        if self.pos_mask is not None:
+            m = self.pos_mask.to(h.device)[:h.shape[1]]
+            m = m.view(1, -1, 1).to(dt)
+            h_new = h_new * m + h * (1.0 - m)
         if isinstance(output, tuple):
             return (h_new,) + tuple(output[1:])
         return h_new
