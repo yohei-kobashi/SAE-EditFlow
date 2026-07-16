@@ -89,6 +89,11 @@ def parse_args():
     p.add_argument("--k-sup", type=int, default=64)
     p.add_argument("--pool-topk", type=int, default=64)
     p.add_argument("--blocklist", default="")
+    p.add_argument("--scope", default="all",
+                   help="steer only: 'local' masks the PREFILL intervention "
+                        "to prompt positions where the suppressed features "
+                        "fire (reading preserved), while generated tokens are "
+                        "always steered (writing). 'all' = original B3.")
     p.add_argument("--feature-sets", default="",
                    help="JSON {phenomenon: [[feature_id, score], ...]} — when "
                         "set, the spec is the paper-protocol one: suppress the "
@@ -165,18 +170,35 @@ class SaeClampHook:
 class SteerHook:
     """B3: steering-vector intervention — the commanded feature delta
     rendered in residual space, h + alpha*dvec, added at every position
-    (pure delta: NO SAE reconstruction in the forward pass)."""
+    (pure delta: NO SAE reconstruction in the forward pass).
+
+    pos_mask (None = original B3, all positions): READING/WRITING split for
+    scope=local. Steering every position corrupts the model's READING of the
+    parts of the prompt it should preserve — the localization insight from
+    the readout (verified there; untested with regeneration until now). With
+    a mask: the PREFILL pass (h has T>1 positions) intervenes only where the
+    suppressed features fire in the prompt; DECODE steps (T==1, a generated
+    token) always intervene — writing is what steering is for."""
 
     def __init__(self):
         self.enabled = False
         self.dvec = None             # (d_llm,) FloatTensor
         self.alpha = 1.0
+        self.pos_mask = None         # (T_prompt,) float or None
 
     def __call__(self, module, inputs, output):
         if not self.enabled or self.dvec is None:
             return None
         h = output[0] if isinstance(output, tuple) else output
-        h_new = h + (self.alpha * self.dvec).to(h.dtype)
+        add = (self.alpha * self.dvec).to(h.dtype)
+        if self.pos_mask is None or h.shape[1] == 1:
+            h_new = h + add                      # decode step / original B3
+        else:
+            m = self.pos_mask.to(h.device)[:h.shape[1]]
+            if m.shape[0] < h.shape[1]:          # pad: unmasked tail -> 0
+                m = torch.cat([m, torch.zeros(h.shape[1] - m.shape[0],
+                                              device=h.device)])
+            h_new = h + add.view(1, 1, -1) * m.view(1, -1, 1).to(h.dtype)
         if isinstance(output, tuple):
             return (h_new,) + tuple(output[1:])
         return h_new
@@ -259,12 +281,31 @@ def main():
           f"prompt+generation)")
 
     @torch.no_grad()
-    def rewrite(src: str) -> str:
+    def make_enc(src: str):
         text_in = it_tok.apply_chat_template(
             [{"role": "user", "content": PROMPT.format(src=src)}],
             add_generation_prompt=True, tokenize=False)
-        enc = it_tok(text_in, return_tensors="pt",
-                     add_special_tokens=False).to(args.device)
+        return it_tok(text_in, return_tensors="pt",
+                      add_special_tokens=False).to(args.device)
+
+    @torch.no_grad()
+    def prompt_mask(enc, sup_idx):
+        """(T_prompt,) float mask: 1 where any SUPPRESSED feature fires in
+        the prompt. Encoded from the SAME token ids the -it model reads
+        (gemma-2-2b and -it share the vocabulary), so positions align exactly
+        — no re-tokenization drift. None when nothing fires (honest fallback
+        to all-positions, i.e. plain B3)."""
+        if sup_idx is None or sup_idx.numel() == 0:
+            return None
+        z = extractor.encode_token_ids(enc["input_ids"][0].cpu())  # (T, d)
+        act = (z[:, sup_idx.cpu()] > 0).any(dim=1)
+        if not bool(act.any()):
+            return None
+        return act.float()
+
+    def rewrite(src: str, enc=None) -> str:
+        if enc is None:
+            enc = make_enc(src)
         gen = it_model.generate(
             **enc, max_new_tokens=args.max_new_tokens, do_sample=False,
             pad_token_id=it_tok.pad_token_id or it_tok.eos_token_id)
@@ -364,6 +405,12 @@ def main():
                 dvec = (za.to(args.device).float() @ W
                         - zs.to(args.device).float() @ W)
             rec["outputs"][c] = {}
+            enc_c = None
+            if args.intervention == "steer" and args.scope == "local":
+                enc_c = make_enc(src)
+                hook.pos_mask = prompt_mask(enc_c, sup)
+            elif args.intervention == "steer":
+                hook.pos_mask = None
             for mname, val in modes:
                 if mname == "raw":
                     hook.enabled = False       # plain model, no hook
@@ -375,7 +422,7 @@ def main():
                     hook.enabled = True
                     hook.dvec = dvec
                     hook.alpha = float(val)
-                out_text = rewrite(src)
+                out_text = rewrite(src, enc_c)
                 pm = pair_metrics(out_text, src, tgt)
                 rec["outputs"][c][mname] = {
                     "text": out_text, "exact": pm["exact_match"],
