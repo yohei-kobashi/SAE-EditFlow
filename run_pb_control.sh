@@ -67,6 +67,12 @@ done
 
 echo
 echo "==================== P-B CONTROL DONE ===================="
+for FM in intersect pure; do
+    R="$V6/editflow_s3/probe500_frc_${FM}_ctrl/probe_report.md"
+    if [ -f "$R" ]; then
+        echo; echo "======== $R"; cat "$R"
+    fi
+done
 echo "Read exact for condition=true vs condition=random in each"
 echo "probe500_frc_*_ctrl/probe_report.md. random has the SAME nonzero count"
 echo "and magnitude distribution as true, only the feature IDENTITIES differ,"
