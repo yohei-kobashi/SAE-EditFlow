@@ -89,6 +89,13 @@ def parse_args():
     p.add_argument("--k-sup", type=int, default=64)
     p.add_argument("--pool-topk", type=int, default=64)
     p.add_argument("--blocklist", default="")
+    p.add_argument("--feature-sets", default="",
+                   help="JSON {phenomenon: [[feature_id, score], ...]} — when "
+                        "set, the spec is the paper-protocol one: suppress the "
+                        "phenomenon-identified features, magnitudes from the "
+                        "SOURCE's global pool. TARGET-FREE (mode pure only). "
+                        "frc_r3 + clamp = LinguaLens's complete protocol; "
+                        "auroc_r1 + steer = AxBench's complete protocol.")
     p.add_argument("--conditions", default="true,empty,random")
     p.add_argument("--clamp-values", default="5,10,20",
                    help="enhancement 'set' values swept on `true` "
@@ -227,6 +234,13 @@ def main():
         blk = torch.as_tensor(np.asarray(_bl, dtype=np.int64))
         print(f"[b1] blocklist: {len(_bl)} features masked")
 
+    fsets = None
+    if args.feature_sets:
+        _raw = json.loads(Path(args.feature_sets).read_text())
+        fsets = {ph: {int(f) for f, _ in lst} for ph, lst in _raw.items()}
+        print(f"[b1] paper-protocol spec: {len(fsets)} phenomena "
+              f"(TARGET-FREE, suppress-only)")
+
     it_tok = AutoTokenizer.from_pretrained(args.it_model)
     it_model = AutoModelForCausalLM.from_pretrained(
         args.it_model, torch_dtype=dtype).to(args.device).eval()
@@ -311,6 +325,18 @@ def main():
             z_tgt = local_pool_topk(z_t, t_off, tr, args.pool_topk, blk)
         za_t, zs_t = diff_intervention(z_src, z_tgt, args.k_amp,
                                        args.k_sup)
+        if fsets is not None:
+            # paper-protocol spec (pure): suppress the identified features,
+            # magnitudes from the SOURCE's GLOBAL pool — the edit-span pool
+            # is target-derived, and the whole point is target-free. Same
+            # construction verified in eval_clamp_readout.py.
+            ident = fsets.get(ex.get("feature") or "?", set())
+            g_src = z_s.max(dim=0).values.float().cpu()
+            zs_t = torch.zeros_like(zs_t)
+            if ident:
+                ids_i = torch.tensor(sorted(ident), dtype=torch.long)
+                zs_t[ids_i] = g_src[ids_i]
+            za_t = torch.zeros_like(za_t)
         zvar = {"true": (za_t, zs_t),
                 "empty": (torch.zeros_like(za_t),
                           torch.zeros_like(zs_t)),
