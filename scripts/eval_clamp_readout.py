@@ -458,10 +458,10 @@ def main():
                 rec["outputs"][cond][f"{args.intervention}{cv:g}"] = {
                     "text": out_text, "exact": pm["exact_match"],
                     "sim_target": pm["sim_target"], "copy": pm["copy_rate"],
-                    "n_fire": len(fire),
+                    "n_fire": n_fire,
                     "n_masked": (int(pos_mask.sum()) if pos_mask is not None
                                  else len(ids)),
-                    "delta_min": float(delta.min()) if len(delta) else 0.0,
+                    "delta_min": dmin,
                 }
         records.append(rec)
         if n % 25 == 0:
