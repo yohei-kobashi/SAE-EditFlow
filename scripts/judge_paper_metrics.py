@@ -146,6 +146,14 @@ def load_run(path, mode):
             for cond, modes in (r.get("outputs") or {}).items():
                 if not isinstance(modes, dict):
                     continue
+                if cond == "empty":
+                    # clamp runs store TWO submodes here (recon + raw); the
+                    # single-mode fallback missed both, so the uninformed-
+                    # rewrite reference came back n=0 in the first pass.
+                    for mname, node in modes.items():
+                        if isinstance(node, dict) and "text" in node:
+                            out[mname] = node["text"]
+                    continue
                 node = modes.get(mode)
                 if node is None and len(modes) == 1:   # random often stores
                     node = next(iter(modes.values()))  # a single ctrl mode
