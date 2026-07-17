@@ -35,6 +35,7 @@
 | `03_method.md` | Method | タスク定義、アーキテクチャ、Edit Flow機構、学習データ、routed規則 |
 | `04_experiment.md` | Experiments | 設定、ベースライン、全確定数値の表、統計手法、統制実験 |
 | `05_discussion_limitations.md` | Analysis / Limitations | 3層分解の物語、仕様出所の限界、判明済みの弱点 |
+| `06_pipeline_and_theory.md` | **(最新の正)** | 🔵/⚫以降の理論的背景(条件付けvs介入、外生的検証器、免許規則、形1/形2)と現行パイプラインの状態表 |
 
 ## ソース・オブ・トゥルース(数値の一次出典)
 
