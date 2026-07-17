@@ -297,6 +297,7 @@ def main():
         interv = Intervener(args.llm2vec_dir, int(cfg["d_sae"]),
                             dtype=dtype, lora_r=int(cfg.get("lora_r", 32)),
                             w_dec=sae.W_dec.detach().float().cpu(),
+                            steer_alpha=float(cfg.get("steer_alpha", 0.0)),
                             ).to(args.device).eval()
         interv.load_trainable_state_dict(blob["trainable"])
         hook = InjectHook()
@@ -460,6 +461,8 @@ def main():
                         off += 1
                         needle = needle[1:]
                 hook.delta_dec = io["delta_dec"][0].detach()
+                hook.base = (io["base"][0].detach()
+                             if "base" in io else None)
                 hook.resp_from = None
                 if lo is not None:
                     n = min(len(needle), io["delta_pre"].shape[1] - off)

@@ -15,6 +15,15 @@ heads on top of the per-position hidden states:
   * delta_decode:  (B, d)    — masked-mean pooled, added at every decode
     step (writing side; steer scope=all's learned counterpart).
 Zero-init => identity start (no intervention until trained).
+
+v2 (steer_alpha > 0): residual parameterization around the steering
+champion. forward() additionally returns base = steer_alpha *
+(z_amp - z_sup) @ W_dec, applied at ALL positions (prompt + decode) —
+exactly the C1' steer rendering. The heads become corrections on top,
+so zero-init now starts AT the champion (exact 0.2385) instead of at
+identity, which killed v1 (copy-attractor collapse: NLL is dominated
+by unchanged tokens, so identity-start heads learned "copy" and true
+became indistinguishable from random).
 """
 from __future__ import annotations
 
@@ -29,7 +38,8 @@ from editflow import SAEEditFlow
 class Intervener(nn.Module):
     def __init__(self, llm2vec_dir: str, d_sae: int,
                  dtype: torch.dtype = torch.bfloat16, lora_r: int = 32,
-                 w_dec: Optional[torch.Tensor] = None):
+                 w_dec: Optional[torch.Tensor] = None,
+                 steer_alpha: float = 0.0):
         super().__init__()
         self.flow = SAEEditFlow(
             llm2vec_dir, d_sae, dtype=dtype, lora_r=lora_r,
@@ -40,6 +50,15 @@ class Intervener(nn.Module):
         for lin in (self.delta_prefill, self.delta_decode):
             nn.init.zeros_(lin.weight)
             nn.init.zeros_(lin.bias)
+        self.steer_alpha = float(steer_alpha)
+        if self.steer_alpha > 0.0:
+            if w_dec is None:
+                raise ValueError("steer_alpha base requires w_dec")
+            # non-persistent: rebuilt from the SAE at load time, so the
+            # checkpoint stays head+LoRA sized.
+            self.register_buffer(
+                "w_dec_base", w_dec.detach().float().clone(),
+                persistent=False)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
                 z_amp: torch.Tensor, z_sup: torch.Tensor
@@ -54,7 +73,11 @@ class Intervener(nn.Module):
         m = attention_mask.unsqueeze(-1).float()
         pooled = (h * m).sum(1) / m.sum(1).clamp_min(1.0)
         delta_dec = self.delta_decode(pooled)            # (B, d)
-        return {"delta_pre": delta_pre * m, "delta_dec": delta_dec}
+        out_d = {"delta_pre": delta_pre * m, "delta_dec": delta_dec}
+        if self.steer_alpha > 0.0:
+            out_d["base"] = self.steer_alpha * (
+                (z_amp.float() - z_sup.float()) @ self.w_dec_base)  # (B, d)
+        return out_d
 
     def trainable_state_dict(self) -> Dict[str, torch.Tensor]:
         sd = {f"flow::{k}": v for k, v in
@@ -90,11 +113,15 @@ class InjectHook:
         self.delta_dec = None     # (d,)
         self.resp_from = None     # int | None — teacher-forcing: add
         #                           delta_dec at positions >= resp_from
+        self.base = None          # (d,) | None — steer_alpha residual
+        #                           base, ALL positions (champion scope=all)
 
     def __call__(self, module, inputs, output):
         if not self.enabled:
             return None
         h = output[0] if isinstance(output, tuple) else output
+        if self.base is not None:
+            h = h + self.base.to(h.dtype).view(1, 1, -1)
         if h.shape[1] == 1:                              # decode step
             if self.delta_dec is not None:
                 h = h + self.delta_dec.to(h.dtype).view(1, 1, -1)

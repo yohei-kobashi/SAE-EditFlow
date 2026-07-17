@@ -95,6 +95,19 @@ def parse_args():
                         "target = x0 (copy) + delta-norm suppression — "
                         "silence under mismatched conditioning.")
 
+    # v2: residual base + copy-attractor countermeasure.
+    p.add_argument("--steer-alpha-base", type=float, default=0.0,
+                   help="if > 0, the intervention is steer_alpha*dvec at "
+                        "ALL positions (the C1' champion rendering) plus "
+                        "the learned heads as corrections — zero-init "
+                        "then starts AT steer0.5 (0.2385) instead of at "
+                        "identity, which collapsed to copy in v1.")
+    p.add_argument("--edit-weight", type=float, default=1.0,
+                   help="CE upweight on the response tokens that differ "
+                        "from src (LCP/LCS trim). Fights the copy "
+                        "attractor: x1~x0 so unweighted NLL is dominated "
+                        "by unchanged tokens.")
+
     # Norm budget (the 'intervention-sized' constraint).
     p.add_argument("--norm-alpha", type=float, default=0.5,
                    help="budget = norm_alpha * ||(za-zs)@W_dec|| per "
@@ -207,6 +220,26 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
         # needle[j] <-> x0[enc_off + j] <-> prompt[lo + j].
         needle = it_tok(src_text, add_special_tokens=False).input_ids
         enc_off = 1 if (x0 and x0[0] == bos_id) else 0
+
+        # edit region in the response (true rows): LCP/LCS trim of
+        # src-vs-target it-token ids; CE upweight lives there. Pure
+        # deletions get the boundary token.
+        edit_lo = edit_hi = None
+        if null_kind is None and args.edit_weight != 1.0:
+            aa, bb = needle, resp_ids[:-1]               # drop <end_of_turn>
+            pfx = 0
+            while (pfx < min(len(aa), len(bb))
+                   and aa[pfx] == bb[pfx]):
+                pfx += 1
+            sfx = 0
+            while (sfx < min(len(aa), len(bb)) - pfx
+                   and aa[-1 - sfx] == bb[-1 - sfx]):
+                sfx += 1
+            edit_lo, edit_hi = pfx, len(bb) - sfx
+            if edit_lo >= edit_hi:                       # pure deletion
+                edit_lo = max(0, pfx - 1)
+                edit_hi = min(len(bb), pfx + 1)
+
         lo = find_subseq(prompt_ids, needle)
         if lo is None and len(needle) > 1:   # leading-piece drift fallback
             lo = find_subseq(prompt_ids, needle[1:])
@@ -218,6 +251,7 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
             "prompt_ids": prompt_ids, "resp_ids": resp_ids,
             "span_lo": lo, "span_n": (len(needle) if lo is not None else 0),
             "null": null_kind, "za": a, "zs": s,
+            "edit_lo": edit_lo, "edit_hi": edit_hi,
         })
     if not rows:
         return None
@@ -230,6 +264,7 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
     lm_ids = torch.full((B, Tl), it_pad, dtype=torch.long)
     lm_mask = torch.zeros((B, Tl), dtype=torch.long)
     labels = torch.full((B, Tl), -100, dtype=torch.long)
+    ce_w = torch.ones((B, Tl), dtype=torch.float32)
     for i, r in enumerate(rows):
         e = r["enc_ids"]
         enc_ids[i, :len(e)] = torch.tensor(e, dtype=torch.long)
@@ -240,6 +275,8 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
         rf = len(r["prompt_ids"])
         labels[i, rf:len(full)] = torch.tensor(r["resp_ids"],
                                                dtype=torch.long)
+        if r["edit_lo"] is not None:
+            ce_w[i, rf + r["edit_lo"]:rf + r["edit_hi"]] = args.edit_weight
         r["resp_from"] = rf
         r["lm_len"] = len(full)
     W = ctx["w_dec"]                                     # (d_sae, d) f32
@@ -250,6 +287,7 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
     return {
         "rows": rows, "enc_ids": enc_ids, "enc_mask": enc_mask,
         "lm_ids": lm_ids, "lm_mask": lm_mask, "labels": labels,
+        "ce_w": ce_w,
         "z_amp": za, "z_sup": zs, "budget": budget,
         "null_mask": torch.tensor([r["null"] is not None for r in rows]),
         "span_found": float(np.mean([r["span_lo"] is not None
@@ -285,6 +323,9 @@ def intervener_loss(model, it_model, hook, built: Dict, args, device: str,
     B, Tl = built["lm_ids"].shape
     d = delta_dec.shape[-1]
     add = torch.zeros(B, Tl, d, device=device, dtype=torch.float32)
+    if "base" in out:                    # v2 residual base: ALL positions
+        add = add + (out["base"].unsqueeze(1)
+                     * built["lm_mask"].to(device).unsqueeze(-1).float())
     pre_norms, pre_sq = [], []
     for i, r in enumerate(built["rows"]):
         if r["span_lo"] is not None and r["span_n"] > 0:
@@ -316,7 +357,8 @@ def intervener_loss(model, it_model, hook, built: Dict, args, device: str,
                              tgt.reshape(-1), ignore_index=-100,
                              reduction="none").view(B, -1)
     valid = (tgt != -100).float()
-    nll = (ce_tok * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1.0)
+    w = built["ce_w"][:, 1:].to(device) * valid          # edit upweight
+    nll = (ce_tok * w).sum(dim=1) / w.sum(dim=1).clamp_min(1.0)
 
     budget = built["budget"].to(device)                  # (B,)
     null = built["null_mask"].to(device)
@@ -374,7 +416,8 @@ def main():
     print(f"[intervener] W_dec from {args.sae_repo}/{args.sae_path}")
     w_dec = load_sae_w_dec(args.sae_repo, args.sae_path)
     model = Intervener(args.llm2vec_dir, d_sae, dtype=dtype,
-                       lora_r=args.lora_r, w_dec=w_dec).to(args.device)
+                       lora_r=args.lora_r, w_dec=w_dec,
+                       steer_alpha=args.steer_alpha_base).to(args.device)
 
     it_model = AutoModelForCausalLM.from_pretrained(
         args.it_model, torch_dtype=dtype,
@@ -454,6 +497,7 @@ def main():
                                "d_sae": d_sae, "lora_r": args.lora_r,
                                "inject_layer": args.inject_layer,
                                "sae_path": args.sae_path,
+                               "steer_alpha": args.steer_alpha_base,
                                "it_model": args.it_model}}, str(path))
 
     best_path = out_dir / "intervener-best.pt"
