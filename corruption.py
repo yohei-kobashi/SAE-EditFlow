@@ -220,6 +220,12 @@ def parse_args():
     # directions are emitted, so the same surface form appears with
     # opposite conditioning and opposite gold — the direction is decidable
     # only through z.
+    p.add_argument("--sentence-regex", default="",
+                   help="fast pre-filter: skip sentences NOT matching this "
+                        "regex BEFORE tokenization/parsing. For rare-pattern "
+                        "harvests (e.g. SPLITINF needs both a to-infinitive "
+                        "and an -ly adverb), this multiplies effective scan "
+                        "throughput by the regex's rejection rate.")
     p.add_argument("--transform-prob", type=float, default=0.35,
                    help="Fraction of sentence attempts routed to "
                         "transformation ops (0 disables v4).")
@@ -2364,9 +2370,17 @@ def main():
             if _skipped >= skip_n_sentences:
                 break
 
+    sent_re = re.compile(args.sentence_regex) if args.sentence_regex else None
+    n_regex_skip = 0
     for sent in sent_iter:
         if written >= args.target_samples:
             break
+        if sent_re is not None and not sent_re.search(sent):
+            n_regex_skip += 1          # cheap reject: no tokenize, no parse
+            if n_regex_skip % 100000 == 0:
+                print(f"[corruption] regex pre-filter skipped "
+                      f"{n_regex_skip} sentences")
+            continue
         gemma_token_count = len(gemma_tok(sent, add_special_tokens=False).input_ids)
         if not (args.sent_min_tokens <= gemma_token_count <= args.sent_max_tokens):
             continue
