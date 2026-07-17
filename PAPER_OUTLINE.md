@@ -724,8 +724,14 @@ judge = 各論文の選択(LinguaLens: gpt-4o / AxBench: gpt-4o-mini)。
 - 生成: `run_corruption_v7.sh`(interact-g、2h予算内timeout、再実行で延長、
   別dir生成→shard-v7-*をsymlink合流、meta_v7topup.json)。
   ゲート: 実spaCyでのSPLITINF自己テスト合格後にのみGPU消費。
-- 次段: S6学習(S3温開始 + v7シャード + --mismatch-null-prob 0.1〜0.15 +
-  --move-ops[M1b相乗り、台帳の条件成立])→ probe500 + 全ゲート再判定。
+- **v7生成完了(2026-07-17)**: 12,000レコード/12シャード合流。family計:
+  ADVPLACE 313 / PARTICLE 218 / DATIVE 217 / PPFRONT 179 / CLEFT 105 /
+  QUOTINV 79 / **SPLITINF 17**(パターン可用性が天井 — dolma文に稀)。
+- **S6開始(同日)**: S3温開始 + v7キャッシュ + --mismatch-null-prob 0.12 +
+  --move-ops。**注意: P4幾何は17件と薄く、MOVEゲート(4/12)は届かない
+  可能性が高い** — S6の主賞はP5(random no_edit ≥0.87 とemptyランキング
+  非漏洩)。MOVEゲートが幾何不足で落ちた場合の追手: SPLITINF専用生成
+  (--transform-families SPLITINF 単独、累積TARGET引き上げ)+ 短い継続学習。
 
 ## 6i. S5(family仕様学習)への懸念と、B1改善の実行順(2026-07-16)
 
