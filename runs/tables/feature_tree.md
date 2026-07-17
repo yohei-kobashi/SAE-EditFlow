@@ -1,6 +1,6 @@
 # 編集可能性の判別木(現象別)— SAE側/効果器側/LM側の切り分け示唆
 
-detection thr 0.9; where = mean fires true−random (delta0.5); clamp = clamp10; b2 = prompt8; 貪欲最小化・閾値は全て表に出す(classは示唆)
+内部診断版(EF列あり); detection thr 0.9; where = mean fires true−random (delta0.5); clamp = clamp10; b2 = prompt8; 貪欲最小化・閾値は全て表に出す(classは示唆)
 
 | feature | n | AUROC | WHERE Δ (>/< ) | steer | clamp | ef32 | routed | B2 | class |
 |---|---|---|---|---|---|---|---|---|---|
