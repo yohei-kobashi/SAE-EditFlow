@@ -1,19 +1,51 @@
-# 論文構成案 — SAE特徴を**条件**とした離散編集(SAE-LEWIS / Edit Flows)
+# 論文構成案 — SAE介入を信号とするeditor(Intervener)による最小対編集
 
-作成: 2026-07-13。**2026-07-16 に枠組みを訂正 — 下記🔴を先に読むこと。**
-**2026-07-17 に目的を再固定 — 下記🔵が主張の序列を決める。**
+作成: 2026-07-13。本ファイルは時系列の台帳 — **最新の決定が上位**:
+**🔶 2026-07-18(editor前提、最上位)→ 🔵/⚫ 2026-07-17 → 🔴 2026-07-16 →
+初版(条件付け枠組み)**。🔶を最初に読むこと。
 
-## 🔵 目的の再固定: 編集可能性は同定の因果証明である(2026-07-17、ユーザー決定)
+## 🔶 研究の大前提(2026-07-18、ユーザー再固定 — 本ファイルの最上位層)
+
+**SAEへのintervention(仕様 z_amp/z_sup)を「信号」としてeditor
+(LEWIS/EF系のエンコーダ)に入力し、editorの出力embedding(Δh)を
+凍結LMのresidual streamに戻す。テキストは凍結LMの生成として出る。**
+これが研究の大前提であり、**editorを使わない案(素のsteer/clampを
+最終形・主claimとする枠組み)はユーザー指示により削除**した(reports/
+とメモリも同日改訂済み)。
+
+- **提案システム = Intervener**(INTERVENER_PLAN.mdが正): LEWIS→EFで
+  蓄積した編集器本体(LLM2Vec双方向エンコーダ+特徴トークン条件付け)を
+  流用し、**出力チャネルだけをトークン→Δhに差し替えた**もの。
+  prefill側=位置依存Δh場(srcスパン)、decode側=全域Δh_dec。
+  凍結gemma-2-2b-it層12に注入(→勝てばL20比較)。
+- **出力インターフェース基準(07-17決定、維持)**: トークン直接出力=
+  条件付け(因果証明にならない、論文外)/ Δh出力=介入(ReFT類縁、正当)。
+- **steer/clampの位置づけ**: editorの自明な特殊ケース(固定描画)= 
+  **ベースライン・統制・v2の初期化基底**。🔵節の「主claim=C1'」は
+  **「ベースライン結果」に読み替える**(C1'の数値・統制・2×2はすべて
+  editorのバーとして論文に残る)。
+- **学習の現状(2026-07-18)**: v1(恒等初期化)= probe500 exact 0.0200で
+  失敗 — コピーアトラクタ崩壊(true≈random、copy 0.65; empty→copy 0.972
+  でnull防御は機能)。**v2 = 残差パラメータ化(Δh = 0.5·dvec基底+ゼロ
+  初期化補正)+編集トークンCE重み4×、学習中** — 初期状態でsteer0.5
+  (0.2385@499)を厳密再現し、そこからの上積みを学習する。
+- 下記🔴(2026-07-16「我々は介入していない」)は**トークン出力EF時代の
+  診断**として正しく、まさにその問題をΔh出力への差し替えが解消した。
+  「"intervention"と書かない」の用語規則は**トークン出力系にのみ適用** —
+  Intervenerは文字通り介入する。
+
+## 🔵 目的の再固定: 編集可能性は同定の因果証明である(2026-07-17、ユーザー決定
+— **🔶により読み替え**: 「主claim=C1'」→「C1'はベースライン」、提案=Intervener)
 
 **前提(当初の目的)**: LinguaLensと同様、言語学的featureに対応するSAE
 activationsを**見つける**こと。**編集可能性はその因果証明**:
 同定した活性に**介入**して当該featureだけが反転した編集が出れば
 (random対照との分離込み)、対応の因果的証明になる。
 
-**🔴 貢献の位置づけ(ユーザー明示、2026-07-17)**: 本研究は**新たなSAE
-activations抽出手法を提案しているのではない**。主張は
-「**activationsの因果妥当性は編集によって評価されるべきであり、これにより
-評価の幅が広がる**」— 編集ベースの因果評価**枠組み**の提案である。
+**貢献の位置づけ(🔶で更新)**: 新たなSAE activations**抽出**手法は提案
+しない。提案するのは (i) **Intervener**(SAE仕様に条件付けられた介入生成
+editor)と (ii)「**activationsの因果妥当性は編集によって評価されるべき**」
+という編集ベース因果評価**枠組み**。
 - 同定手法は既存のものを対象にする: FRC(LinguaLens)/ AUROC(AxBench)/
   事例レベルdelta。どれで同定した活性でも同じ枠組みで評価できる。
 - 「評価の幅」の中身: 顕著さjudge(LinguaLens)や生成rubric(AxBench)に
@@ -24,16 +56,19 @@ activations抽出手法を提案しているのではない**。主張は
   FRC(微弱だが純粋 67/0)とAUROC(検出0.939でも因果0.86×)を判別できた
   = 評価軸として情報量がある、という実証。
 
-**主張の序列(これまでのC0主役を入れ替える)**:
-1. **主claim = C1'(介入による編集=因果検証)**: 事例レベル同定活性への
-   介入が最小対編集を実行する(steer 0.2337/0.2385、E_abl +0.370、
-   clamp 0.1743/E_abl +0.631; random/raw/recon対照分離)。仕様を両論文の
-   現象レベルプロトコルに替えると 0.016〜0.070 に崩壊。
+**主張の序列(🔶で更新 — 旧「主claim=C1'」を読み替え)**:
+1. **主claim = Intervener(学習editorによる介入編集=因果検証)**:
+   仕様+srcを読むeditorがΔhをresidual streamに描画し、凍結LMの生成が
+   最小対編集を実現する。数値はv2学習完了待ち(バー=下記ベースライン)。
+1'. **ベースライン = C1'(固定描画steer/clampによる介入編集)**: 事例レベル
+   同定活性への固定介入だけでも最小対編集が成立する(steer 0.2337/0.2385、
+   E_abl +0.370、clamp 0.1743/E_abl +0.631; random/raw/recon対照分離)。
+   仕様を両論文の現象レベルプロトコルに替えると 0.016〜0.070 に崩壊 —
+   **介入の編集力は仕様が決める**(この2×2はeditorのバーとして論文に残る)。
    P-I(393/31、p=5.6e-81)は学習ゼロの因果床。
-2. **副claim = 条件付け(EF/routed 0.2839)**: 同じ活性が仕様として
-   さらに多くを運ぶ — **因果ではなく情報・実用の主張**と明示ラベル。
-   EFは因果証明には使えないが、「情報は活性に在るか」の**上界測定器**
-   として切り分け(下記判別木)に使う。
+2. **トークン出力の条件付け(EF/routed 0.2839)は論文外**(⚫維持)。
+   因果証明には使えない。内部診断(「情報は活性に在るか」の上界測定)と
+   してのみ履歴に保持。
 3. **介入本数 = 表出の局在性スペクトル**(新しい中心図):
    少数の介入で編集できる → featureは少数活性に局在。多数必要 → 分散。
    事例横断の安定性と直交させ **(事例内で少数か)×(事例間で同じ集合か)**:
@@ -88,7 +123,8 @@ B-2 prune_spec.py --effector steer(P-O介入版)+ **後段: S_min安定核×FRC 
 **生き残るもの(論文の全部)**:
 - **仕様構築はSAEのみに依存**: delta = z_tgt − z_src の top-k は編集器と無関係
   → C1'(介入編集 steer 0.2337 / clamp 0.1743 + 両プロトコル対比 + raw/recon
-  統制)が**唯一のヘッドライン**
+  統制)。**🔶注: 「唯一のヘッドライン」は撤回 — C1'はベースライン、
+  ヘッドラインはIntervener(Δh出力editor)**
 - P-I(学習ゼロreadout、WHERE p=5.6e-81)、P-J(FRC vs AUROC因果対決)
 - **🔴 訂正(2026-07-17、reports改訂時に発見)**: 当初「生存」に入れた
   **P-BとM0はEF編集器を介した実験**(FRC特徴でEFを条件付け / EFのk掃引)
@@ -104,10 +140,12 @@ B-2 prune_spec.py --effector steer(P-O介入版)+ **後段: S_min安定核×FRC 
   P-I WHEREのみが担う)。内部診断としてはEF列を保持
 - LinguaLens/AxBench再現アンカー、B2(SAE不使用参照としてのみ)
 
-**得るもの**: 「新手法の提案ではなく評価枠組み」という位置づけと完全に整合
-する(編集効果器が既存機構[steering/clamp]だけになり、貢献が評価枠組みと
-発見に純化)。サーベイ(a)(b)(d)の「条件付け信号」新規性は使わなくなるが、
-R5の(e)(f)が新規性の置き場所として既に確定済み。
+**得るもの(🔶で訂正)**: ~~「編集効果器が既存機構[steering/clamp]だけに
+なり、貢献が評価枠組みに純化」~~ — **この読みはeditorを使わない案であり
+削除(2026-07-18)**。正しくは: トークン出力EFの除外は**出力インター
+フェースの矯正**であり、editor本体(エンコーダ・条件付け)はΔh出力の
+Intervenerとして提案に復帰する(INTERVENER_PLAN.md、同日決定の第7項)。
+新規性の置き場所: 「事例レベルSAE仕様に条件付けられた介入生成」+R5の(e)(f)。
 
 **キューへの影響**: ours_ef腕とP-O ef版を中止。B-2(steer版S_min)・判別木
 再集計(EF列なし版)・再現アンカーはそのまま。
@@ -162,6 +200,10 @@ runs/prod_gemma_v6/prune_spec_steer/report.md + runs/tables/smin_vs_frc.md)
     判別木の比喩クラスタと一貫。
 
 ## 🔴 枠組みの訂正: 我々は「介入」していない(2026-07-16)
+【🔶注: この診断は**トークン出力EF時代のシステム**についてのもの。現在の
+提案(Intervener)はΔhをresidual streamに書き込む=文字通りの介入であり、
+この節の結論は「だからこそ出力チャネルをΔhに差し替えた」という動機として
+読む。】
 
 **旧題「SAE介入の離散編集化」および §2 の表は誤りだった。** コードで確認:
 championの条件付け経路 `feature_token_embeds` は
@@ -207,25 +249,27 @@ B2と本研究は**同じ「条件付け」の列**。違いは**仕様のモダ
 ラベル vs 特徴ベクトル `W_dec[f]`)と**作用**(再生成 vs 編集操作)のみ。
 B2 exact 0.1242 < 本研究 0.2237。
 
-**用語規則**: 本研究について "intervention" / "介入" / "steering" と書かない。
-"**conditioning**" / "**specification**" を使う。`RELATED_WORK.md` は既に
-正しい("uses SAE features as the **conditioning signal** for a model that
-emits edit operations")。
+**用語規則(🔶で適用範囲を限定)**: **トークン出力の編集器(旧EF/LEWIS
+実装)について** "intervention" / "介入" / "steering" と書かない —
+"**conditioning**" / "**specification**" を使う。**Intervener(Δh出力)は
+介入であり、"intervention" と書くのが正しい**。
 
-## タイトル案(訂正後)
+## タイトル案(2026-07-16時点 — 🔶により旧案、reports/01の案が現行)
 
-1. *Commanding Edits with SAE Features: Discrete Minimal-Pair Transformation without Intervening on Activations*
-2. *SAE Features as an Editing Specification, not an Intervention Knob*
-3. *SAE-LEWIS: SAE-Conditioned Edit Flows for Linguistic Minimal Pairs*
+1. ~~*Commanding Edits with SAE Features: Discrete Minimal-Pair Transformation without Intervening on Activations*~~
+2. ~~*SAE Features as an Editing Specification, not an Intervention Knob*~~
+3. ~~*SAE-LEWIS: SAE-Conditioned Edit Flows for Linguistic Minimal Pairs*~~
 
 **旧題(使用禁止)**: ~~*Lifting SAE Interventions into Discrete Edit
 Operations*~~ / ~~*Structural Interventions on SAE Features*~~ /
 ~~*Editing as Intervention*~~ — いずれも「我々が介入している」と主張して
 しまう。
 
-## 中心主張(全実測後に改訂 2026-07-14 — 確認測定済み)
+## 中心主張(2026-07-14版 — 🔶注: **歴史層**。C0/C2/C3はトークン出力EF系
+のため論文外[⚫]、C1'はベースラインに読み替え[🔶]。現行の主張は🔶と
+reports/01が正)
 
-- **C0(ヘッドライン、2026-07-16用語訂正)**: SAE**条件付き**ハイブリッド
+- **C0(旧ヘッドライン、論文外)**: SAE**条件付き**ハイブリッド
   システム(EF λ場が編集regimeを判定: ≤1編集なら**条件付き離散編集**、
   それ以外は指令デルタのW_dec**介入**+再生成)が、**全体exactで全方式に勝つ**
   — 未接触の確認標本498ペアで 0.2892 vs steer0.5 0.2269(+80/−49、p≈0.007)・
@@ -234,7 +278,7 @@ Operations*~~ / ~~*Structural Interventions on SAE Features*~~ /
   編集器(EF)であり、介入(steer)はfallback。介入列のヘッドラインは別
   (C1'、P-K)。routed は「条件付けと介入の、教師なし規則による相補的結合」
   として書く。
-- **C1'(介入列のヘッドライン、2026-07-16実測確定)**: 介入の編集性能を
+- **C1'(介入列のベースライン[🔶]、2026-07-16実測確定)**: 介入の編集性能を
   決めるのは機構ではなく**仕様**。2×2(exact、499ペア):
 
   | | 現象レベル仕様(彼ら) | 我々の事例レベル仕様 |
@@ -277,6 +321,13 @@ Operations*~~ / ~~*Structural Interventions on SAE Features*~~ /
   −0.98は過剰損傷0.47 — 文法性はgold ΔSLORへの近さで測る。
 
 ---
+
+> 🔶 **以下の章立て(§1〜§9)は初版(2026-07-13〜16、トークン出力EF=
+> 条件付け枠組み)の歴史層** — 論文の現行構成は reports/01〜06(2026-07-18
+> editor前提で改訂済み)が正。この層は (a) 🟢/6x台帳の実測値の文脈、
+> (b) B1/B2/B3等ベースラインの実装詳細、の参照用にのみ残す。
+> 「介入していない」「条件付けとして書く」等の規範文は現行提案
+> (Intervener、Δh出力=介入)には適用しない。
 
 ## 1. Introduction
 
