@@ -88,6 +88,22 @@ def parse_args():
     p.add_argument("--t0-prob", type=float, default=0.5,
                    help="prob. that x_t = x0 (full remaining edit); else "
                         "t ~ U(0,1) partial application per opcode.")
+    p.add_argument("--edit-only-loss", action="store_true",
+                   help="2026-07-18 user decision after the L12 copy "
+                        "collapse (ef true==random, copy 0.92): restrict "
+                        "the NLL to the CHANGED tokens of x1 vs x_t "
+                        "(non-equal difflib opcodes + deletion boundary). "
+                        "Echoing then earns nothing and the edit content "
+                        "exists only in the spec -> spec reading is "
+                        "forced. Unchanged tokens keep --bg-weight.")
+    p.add_argument("--bg-weight", type=float, default=0.1,
+                   help="loss weight on unchanged response tokens under "
+                        "--edit-only-loss (small but nonzero so the "
+                        "reproduction skill does not silently degrade).")
+    p.add_argument("--init-ckpt", default="",
+                   help="warm-start the editor from this checkpoint's "
+                        "trainable state (e.g. the copy-collapsed run, "
+                        "which already induces reproduction).")
 
     # Norm budget.
     p.add_argument("--norm-alpha", type=float, default=0.5,
@@ -186,9 +202,26 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
         lm_prefix = list(xt) + [ctx["nl_id"]]
         if len(lm_prefix) + len(x1_body) > args.max_lm_len:
             continue
+
+        # positions of x1_body that differ from x_t (edit-only loss):
+        # non-equal opcode spans on the x1 side; deletions mark the
+        # boundary token after the removed span.
+        edit_pos = set()
+        if args.edit_only_loss and null_kind is None:
+            xt_body = xt[1:] if (xt and xt[0] == ctx["bos_id"]) else list(xt)
+            sm = difflib.SequenceMatcher(None, xt_body, x1_body,
+                                         autojunk=False)
+            for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                if tag == "equal":
+                    continue
+                if j2 > j1:
+                    edit_pos.update(range(j1, j2))
+                else:                                  # pure deletion
+                    edit_pos.add(min(j1, len(x1_body) - 1))
         rows.append({
             "xt": xt, "prefix": lm_prefix, "resp": x1_body,
             "null": null_kind, "za": a, "zs": s, "t": t,
+            "edit_pos": edit_pos,
         })
     if not rows:
         return None
@@ -201,6 +234,7 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
     lm_ids = torch.full((B, Tl), ctx["it_pad"], dtype=torch.long)
     lm_mask = torch.zeros((B, Tl), dtype=torch.long)
     labels = torch.full((B, Tl), -100, dtype=torch.long)
+    ce_w = torch.ones((B, Tl), dtype=torch.float32)
     for i, r in enumerate(rows):
         e = r["xt"]
         enc_ids[i, :len(e)] = torch.tensor(e, dtype=torch.long)
@@ -212,6 +246,10 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
             rf = len(r["prefix"])
             labels[i, rf:len(full)] = torch.tensor(r["resp"],
                                                    dtype=torch.long)
+            if args.edit_only_loss:
+                ce_w[i, rf:len(full)] = args.bg_weight
+                for j in r["edit_pos"]:
+                    ce_w[i, rf + j] = 1.0
         r["xt_len"] = len(e)
         r["lm_len"] = len(full)
     W = ctx["w_dec"]                               # (d_sae, d) f32
@@ -222,6 +260,7 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
     return {
         "rows": rows, "enc_ids": enc_ids, "enc_mask": enc_mask,
         "lm_ids": lm_ids, "lm_mask": lm_mask, "labels": labels,
+        "ce_w": ce_w,
         "z_amp": za, "z_sup": zs, "budget": budget,
         "null_mask": torch.tensor([r["null"] is not None for r in rows]),
     }
@@ -270,7 +309,8 @@ def ef_loss(model, it_model, hook, built: Dict, args, device: str,
                              tgt.reshape(-1), ignore_index=-100,
                              reduction="none").view(B, -1)
     valid = (tgt != -100).float()
-    nll = (ce_tok * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1.0)
+    w = built["ce_w"][:, 1:].to(device) * valid
+    nll = (ce_tok * w).sum(dim=1) / w.sum(dim=1).clamp_min(1.0)
 
     budget = built["budget"].to(device)            # (B,)
     null = built["null_mask"].to(device)
@@ -334,6 +374,12 @@ def main():
     w_dec = load_sae_w_dec(args.sae_repo, args.sae_path)
     model = EFIntervener(args.llm2vec_dir, d_sae, dtype=dtype,
                          lora_r=args.lora_r, w_dec=w_dec).to(args.device)
+
+    if args.init_ckpt:
+        blob = torch.load(args.init_ckpt, map_location=args.device,
+                          weights_only=False)
+        model.load_trainable_state_dict(blob["trainable"])
+        print(f"[ef-lm] warm start from {args.init_ckpt}")
 
     it_model = AutoModelForCausalLM.from_pretrained(
         args.it_model, torch_dtype=dtype,

@@ -36,9 +36,17 @@ esac
 LLM2VEC=runs/mcgill_gemma_repro_3k/final
 CACHE=runs/prod_gemma_v4/corruption_z_l$LAYER
 DEV=runs/prod_gemma_v4/corruption_seldev_z_l$LAYER
-OUT=runs/prod_gemma_v6/eflm_l$LAYER
+OUT=runs/prod_gemma_v6/eflm_l$LAYER${OUT_SUFFIX:-}
+MAX_STEPS=${MAX_STEPS:-40000}
 
 [ -f "$CACHE/meta.json" ] || { echo "sidecar missing: $CACHE"; exit 1; }
+
+EXTRA=()
+# v2 recipe (2026-07-18 user decision after the copy collapse): loss
+# restricted to the changed tokens (+ small background weight), warm
+# start from a reproduction-capable checkpoint.
+[ -n "${EDIT_ONLY:-}" ] && EXTRA+=(--edit-only-loss --bg-weight "${BG_WEIGHT:-0.1}")
+[ -n "${INIT_CKPT:-}" ] && EXTRA+=(--init-ckpt "$INIT_CKPT")
 
 TRAIN_ARGS=(--corruption-dir "$CACHE" --dev-corruption-dir "$DEV"
     --llm2vec-dir "$LLM2VEC" --output-dir "$OUT"
@@ -48,7 +56,7 @@ TRAIN_ARGS=(--corruption-dir "$CACHE" --dev-corruption-dir "$DEV"
     --empty-prob 0.08 --mismatch-null-prob 0.12 --t0-prob 0.5
     --norm-alpha 0.5 --norm-reg-w 0.05 --null-norm-w 0.1
     --dev-batches 48 --eval-steps 2000 --save-steps 2000
-    --resume --device cuda)
+    --resume --device cuda "${EXTRA[@]}")
 
 PROBE_ARGS=(--llm2vec-dir "$LLM2VEC" --sae-path "$SAE"
     --sae-layer "$LAYER" --blocklist "$BLK"
@@ -71,7 +79,7 @@ fi
 
 # Stage 2 — full training.
 if [ ! -f "$OUT/eflm-final.pt" ]; then
-    python train_ef_editor.py "${TRAIN_ARGS[@]}" --max-steps 40000
+    python train_ef_editor.py "${TRAIN_ARGS[@]}" --max-steps "$MAX_STEPS"
 fi
 
 # Stage 3 — probe500 with all arms.
