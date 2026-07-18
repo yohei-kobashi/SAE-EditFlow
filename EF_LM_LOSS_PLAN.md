@@ -1,104 +1,78 @@
-# EF版 through-LM loss 学習計画(最終版、2026-07-18 ユーザー承認)
+# 論文コア実験パイプライン(2026-07-18 改訂2、ユーザー指示)
 
-本ファイルはユーザーとの目標統一で確定した学習計画の記録。ここに書かれた
-決定を変更する場合は必ずユーザーに確認する。
+本ファイルはユーザーとの目標統一で確定した計画の記録。変更は必ずユーザー確認。
 
-## 0. 決定事項(すべてユーザー決定)
+## 0. 論文のコア表(ユーザー指示 2026-07-18)
 
-| 項目 | 決定 |
-|---|---|
-| 大前提 | SAE介入(仕様)を信号としてeditorに入力し、editorの出力embedding(Δh)を凍結LMのresidual streamに戻す。テキストは凍結LMの生成 |
-| 系統 | EF版のみ(LEWIS版は不採用)。レート場+内容場、反復推論 |
-| loss | 凍結LMの出力を使って計算(teacher-forced NLL、勾配は凍結LM越し) |
-| フレーム | **プロンプトなし・テキストのみ(LinguaLens完全準拠)**。rewrite等の指示プロンプトは使わない |
-| steer基底 | なし(純粋学習)。v2(基底あり・rewrite枠)は比較腕として保全 |
-| レイヤー | **L4 / L12 / L20 の3層、それぞれ独立に学習**(層条件付き単一モデル案=工夫2は不採用) |
-| データ準備 | **工夫1採用**: 1回のforwardから全対象層のzを一括生成(サイドカー) |
-| 評価 | LinguaLens準拠 — 現象(feature)ごとに対応layer/SAEを特定して評価する枠組み。学習は現象非依存 |
+**データ = LinguaLens-Data(英語)。全手法を L4 / L12 / L20 の3層で実行し、
+featureごとのFIC と exact の2指標で評価する。** 掲載する手法は以下の4つのみ
+(それ以外の実測は当面掲載候補から外す):
 
-## 1. モデル(各層で同一構成、独立に3本)
+| 腕 | 手法 | 介入の描画 | プロンプト |
+|---|---|---|---|
+| A1 | **LinguaLens忠実**(公式github準拠) | set介入(active上書き+min-slot強制挿入、値10/0)+残差をSAE再構成で完全置換、全位置・全ステップ | なし(素テキスト — 彼らのrepoはchat template不使用) |
+| A2 | **AxBench忠実 steer** | addition steering: h + factor·max_act·(W_dec方向)、全位置・全ステップ(彼らのAdditionIntervention) | なし(AxBenchのsteering自体は概念情報をプロンプトに入れない。編集タスク化にあたり指示プロンプトも使わない) |
+| A3 | **AxBenchのprompting法の移植** | SAE不使用。彼らのprompt-steeringテンプレートを最小改変で移植し、feature記述を言葉で与えて生成 | あり(この手法の定義そのもの) |
+| A4 | **本手法**(EF through-LM editor) | 学習editorのΔh(λ場×内容場)をresidual streamに注入 | なし(bare枠) |
 
-```
-入力: [BOS] + x_t のトークン列、SAE仕様(z_amp, z_sup — 層LのSAE)
-エンコーダ: LLM2Vec双方向Gemma-2-2B + LoRA r=32
-            (SAEEditFlow流用、feature-tokens条件付け=層LのW_dec行+符号+強度、
-             tトークンで中間状態の時刻を条件付け)
-ヘッド:  λ_i = σ(rate_head(h_i))   … 位置iに未実行編集が残る確率(bias −2初期化)
-         v_i = content_head(h_i)    … 内容方向(Linear(d,d)ゼロ初期化)
-出力:    Δh_i = λ_i · v_i  (ゼロ初期化により恒等スタート)
-注入:    凍結gemma-2-2b-itの層L出力、[BOS]+x_t スパンの各位置
-         (エンコーダ入力とLM入力が同一トークン列 → 位置対応は恒等)
-```
+- A1/A2/A4 は**同一の事例レベル仕様**(層LのSAEでのz_amp/z_sup、編集局所
+  プール+層別blocklist、k64/64)を使う — 差は「描画機構」のみに帰着させる。
+- 生成フレームは A3 以外すべて共通: `[BOS]+src(+\n)` の素テキスト継続。
+- 統制: random仕様(A1/A2/A4)、empty、raw。FICの定義上randomは必須。
 
-## 2. 学習手順
+## 1. 指標
 
-- **LM入力**: `[BOS] + x_t + x1`(チャットテンプレートなし・指示なし)。
-  lossはx1スパンのNLLのみ。「x0の後に編集済み文を出す」挙動自体をΔhが
-  誘導する — 編集の成立はdo(Δh)にのみ帰属可能
-- **中間状態サンプリング**: P(t=0)=0.5(x_t=x0)、それ以外 t〜U(0,1)。
-  x_tはトークン列difflibアラインメントの部分適用で構築(CPU)。仕様は常に
-  ペアの完全なdiff spec。t→1で「残り編集なし→λ→0」を学習し、推論時の
-  反復と自己停止(Σλ<閾値)を可能にする
-- **null教師**: empty仕様 p=0.08、mismatched仕様(パートナーspec、P5)
-  p=0.12 — いずれも**Δhノルム抑制のみ**(NLL項なし; bare枠ではコピー目標を
-  強制できないため。抑制でΔh≈0=無介入と同値)
-- **ノルム予算**: 位置ごと‖Δh_i‖ ≤ 0.5·‖dvec_L‖、超過ペナルティ w=0.05、
-  null抑制 w=0.1。実測ノルム/予算比を必ず報告
-- ハイパラ: batch 4 × accum 2、lr 3e-4(ヘッド)/1e-4(LoRA)、40kステップ、
-  k-top 32、k-amp/k-sup log:1-32、dev監視2000ごと(best-dev採用)、
-  ckpt 2000ごと、resume対応
-- **fail-fast**: 10kステップ時点でジョブ内probe100(bare枠、true/empty)を
-  実行し、崩壊・再現不能を早期検出
+- **exact**(+sim/copy 併記): 標準probe(499ペア、seed42)で全腕。
+- **FIC(featureごと)**: LinguaLensの介入評価の編集タスク版。
+  - enhancement試行: s1(特徴なし側)に +feature 介入して生成 →
+    judgeが特徴の存在を判定。ablation試行: s2に −feature 介入 → 不在判定。
+  - E_enh / E_abl = targeted成功率 − random対照成功率、FIC = 彼らの
+    ペナルティ付き結合(w=0.5、実装は judge_ll_repro.py の検算済み式)。
+  - サンプリング: featureごとに層化(全英語featureを対象、ペア数は§4)。
+- デコード: **FIC系は彼らのrepo既定(temperature 1.0, do_sample, 100tok)**、
+  **exactは同一フレームのgreedy**(別パス)。両方recordsに保存。
 
-## 3. データ準備(サイドカージョブ、工夫1)
+## 2. 忠実性の再監査(ユーザー指摘: 論文を再現できていない)
 
-- 対象: `runs/prod_gemma_v4/corruption` 先頭〜30万レコード + `corruption_seldev` 全件
-- 各レコードのx/x'トークン列をベースgemma-2-2bに**1回ずつforward**し、
-  層{4, 12, 20}のhidden statesを同時抽出 → 各層SAEでエンコード →
-  **編集局所max-pool**(トークン列difflibの差分位置; なければglobal)→
-  **層別blocklist**マスク → top-64 → zフィールドを差し替えた新キャッシュdir
-  `corruption_z_l{4,12,20}` を書き出し(v4キャッシュ構築と同一の意味論)
-- **L12も同パスで再計算**(3層のz意味論を完全統一。既存キャッシュは不変)
-- **層別blocklist**: `build_grammaticality_blocklist.py` をL4/L20のSAEで実行
-  (L12は既存 `runs/blocklist/blocklist.npy`)。同ジョブ内で先に構築
-- resumable(シャード単位)
+実装前に公式githubと逐語照合し、結果を `reports/audit_ll_axbench.md` に記録:
+- LinguaLens (THU-KEG/LinguaLens lingualens/intervener.py):
+  set/multiplyの意味論、prompt_only、生成パラメータ、対象latentの平均化
+  (FRC top-3を1本ずつ)、randomベースラインの本数の読み。
+- AxBench (stanfordnlp/axbench): AdditionIntervention の正確な式
+  (factor×max_act×単位方向か生W_decか)、factor格子、prompt-steering法の
+  テンプレート全文、彼らのjudge/デコード設定。
+- 差分が見つかれば修正してから本番実行。
 
-## 4. 評価(新probe、LinguaLens準拠bare枠)
+## 3. 本手法(A4)の学習 — 変更なし(改訂1の内容を維持)
 
-- 499ペア(seed 42、既存probeと同一標本)。仕様は評価時にその層のSAEで
-  オンザフライ構築(編集局所プール+層別blocklist、k 64/64)
-- **入力 `[BOS]+src`、greedy、max_new = len(src)+24、extract_sentence**
-- 腕: **ef(学習editor)/ steer0.5(同一bare枠の固定描画)/ raw(無介入)**
-- 条件: true / empty / random。指標: exact / sim_target / copy
-- 診断: **λ-IoU**(λ場 vs gold編集位置、true/empty/random)、ノルム実測
-- 反復ablation(L12のみ、probe再実行): 1パス vs 2-3パス(自己停止)
-- **現象別レイヤー表**: 3層のrecordsから現象ごとの最良層を集計
-  (LinguaLensの全層カバレッジに対応する3点版)
-- 参考併記: rewrite枠steer0.5=0.2385、v2結果(枠が異なることを明記)
+- EFIntervener: LLM2Vecエンコーダ+feature-tokens条件付け、λ_i=σ(rate_head)、
+  v_i=content_head(ゼロ初期化)、Δh_i=λ_i·v_i。恒等スタート、steer基底なし。
+- 学習: bare枠 `[BOS]+x_t+\n+x1`、through-LM NLL(x1)、中間状態x_t
+  サンプリング(t0-prob 0.5)、null教師(empty 0.08 / mismatch 0.12、
+  ノルム抑制のみ)、ノルム予算 0.5·||dvec_L||、40k steps、10k時点でprobe100。
+- 層ごとに独立学習(L4/L12/L20)。データ=多層zサイドカー(工夫1、実行中)。
 
-## 5. ジョブとスケジュール(miyabi停止 7/29 9:00 絶対期限)
+## 4. 実行計画とコスト
 
-| 日 | 作業 | ジョブ |
+| 段 | 内容 | 規模 |
 |---|---|---|
-| 7/18 | 実装(model/trainer/probe/sidecar/runner)+CPUテスト → **サイドカージョブ投入** | short-g 8h ×1 |
-| 7/19 AM | サイドカー確認 → **L12学習ジョブ投入** | short-g 8h |
-| 7/19 PM | L12のprobe100(10k時点、投入+3h頃)確認 → 生存なら **L4・L20投入(並行)** | short-g 8h ×2 |
-| 7/20 | 3層probe回収(ジョブ内自動)、反復ablation、層プロファイル集計 | probe+オフライン |
-| 7/21-22 | 予備(分岐A/B発動時の再学習1回分) | — |
+| P0 | 忠実性監査(§2)+ 統一probe実装(4腕×FIC/exact) | 実装0.5-1日 |
+| P1 | サイドカー(実行中)→ L12学習 → probe100ゲート → L4/L20学習 | short-g 3本 |
+| P2 | exact probe: 499ペア × 4腕 × 3層(A4はeflm-final) | 層ごとジョブ内 |
+| P3 | FIC probe: featureごとn_pairsペア × 両方向 × {targeted, random} × 3腕(A1/A2/A4)+ A3 + raw参照 | GPU生成が支配的 |
+| P4 | FIC judge(API)→ feature別 FIC×3層×4腕の表・層プロファイル図 | API課金 |
 
-## 6. ゲートと分岐
+FICのコスト目安(全98feature): n_pairs=10 → 生成 ≈ 98×10×2方向×2(targeted/random)×3腕×3層 ≈ 70k生成(+A3/raw)。
+n_pairs=5なら半分。**n_pairsとjudgeモデル(gpt-4o vs gpt-4o-mini)はユーザー決定待ち**。
 
-- **L12ゲート**: ef exact > steer0.5(同一bare枠)、empty/random=無介入同等、
-  λ-IoUがtrue専有
-- **分岐A(複製が立ち上がらない)**: bare枠ではΔhが「文の複製」まで誘導する
-  必要があり、ノルム予算が律速し得る → norm-alpha 0.5→1.0 の腕を1本
-  (予算超過は実測報告で透明化)。発動はユーザーに報告してから
-- **分岐B(λが立たない)**: アラインメント既知の編集位置でλに弱い直接教師を追加
-- L12通過後のL4/L20はレシピ変更なしの機械的展開
+## 5. ゲート(変更なし)
 
-## 7. 論文成果物
+L12: A4 exact > A2(同枠steer)、empty/random無害、λ-IoU true専有。
+分岐A(複製不成立→norm-alpha 1.0)、分岐B(λ不発→弱直接教師)は発動前に報告。
 
-1. 主表: 層{4,12,20} × 腕{ef, steer0.5, raw} × 条件{true, empty, random}
-2. 深さプロファイル図(exact・λ-IoUの層依存)
-3. 現象別レイヤー表(featureごとの対応層 — LinguaLens準拠評価の中核)
-4. 反復推論ablation、ノルム実測/予算比
+## 6. 掲載スコープ(ユーザー指示の反映)
+
+- コア表: 4腕×3層×{FIC, exact}(feature別FIC表+層プロファイル)。
+- v2 Intervener(プロンプト+steer基底+学習補正、0.2725)は比較・参考行。
+- その他の既測定(C1'2×2、P-I/P-J、k掃引、S_min、FRR等)は「追加で載せる
+  かもしれないもの」として一旦コア構成から外す(数値・recordsは保全)。
