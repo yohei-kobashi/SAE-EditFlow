@@ -104,6 +104,21 @@ def parse_args():
                    help="warm-start the editor from this checkpoint's "
                         "trainable state (e.g. the copy-collapsed run, "
                         "which already induces reproduction).")
+    p.add_argument("--init-flow-ckpt", default="",
+                   help="plan-A (user-approved 2026-07-19): warm-start "
+                        "ONLY the flow encoder (feature-token conditioning "
+                        "+ LoRA) from a token-output EF checkpoint whose "
+                        "spec-reading is proven (S3 champion, lam-IoU "
+                        "0.73 true / 0.30 random). strict=False filtered "
+                        "load; rate/content heads stay fresh.")
+    p.add_argument("--mismatch-echo", action="store_true",
+                   help="plan-B (user-approved 2026-07-19): mismatch rows "
+                        "get an ECHO NLL target (labels = x_t itself), "
+                        "hi-weighted at the pair's own edit sites — the "
+                        "contrast 'wrong spec -> reproduce unchanged, "
+                        "especially where the true spec would edit'. "
+                        "Mismatch rows leave the norm-suppression and "
+                        "lam-BCE pools (delta must be nonzero to echo).")
     p.add_argument("--lam-sup-w", type=float, default=0.0,
                    help="branch B (plan §5, activated 2026-07-19 after "
                         "v2 kept true==random): weak direct BCE on the "
@@ -216,9 +231,12 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
         # non-equal opcode spans; deletions mark the boundary token.
         edit_pos = set()
         lam_pos = set()
-        if null_kind is None and (args.edit_only_loss or args.lam_sup_w > 0):
-            xt_body = xt[1:] if (xt and xt[0] == ctx["bos_id"]) else list(xt)
-            bos_off = len(xt) - len(xt_body)
+        xt_body = xt[1:] if (xt and xt[0] == ctx["bos_id"]) else list(xt)
+        bos_off = len(xt) - len(xt_body)
+        need_diff = (args.edit_only_loss or args.lam_sup_w > 0) and (
+            null_kind is None
+            or (null_kind == "mismatch" and args.mismatch_echo))
+        if need_diff:
             sm = difflib.SequenceMatcher(None, xt_body, x1_body,
                                          autojunk=False)
             for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -232,10 +250,23 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
                     lam_pos.update(range(bos_off + i1, bos_off + i2))
                 else:                                  # pure insertion
                     lam_pos.add(bos_off + min(i1, len(xt_body) - 1))
+
+        if null_kind == "mismatch" and args.mismatch_echo:
+            # plan-B echo teacher: label = x_t itself; hi-weight at the
+            # pair's own edit sites (body frame of the echo target).
+            resp = list(xt_body)
+            hi_pos = {p - bos_off for p in lam_pos
+                      if 0 <= p - bos_off < len(resp)}
+            has_labels = True
+        else:
+            resp = x1_body
+            hi_pos = edit_pos
+            has_labels = null_kind is None
         rows.append({
-            "xt": xt, "prefix": lm_prefix, "resp": x1_body,
+            "xt": xt, "prefix": lm_prefix, "resp": resp,
             "null": null_kind, "za": a, "zs": s, "t": t,
-            "edit_pos": edit_pos, "lam_pos": lam_pos,
+            "hi_pos": hi_pos, "lam_pos": lam_pos,
+            "has_labels": has_labels,
         })
     if not rows:
         return None
@@ -261,14 +292,15 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
         full = r["prefix"] + r["resp"]
         lm_ids[i, :len(full)] = torch.tensor(full, dtype=torch.long)
         lm_mask[i, :len(full)] = 1
-        if r["null"] is None:                      # null rows: no NLL
+        if r["has_labels"]:
             rf = len(r["prefix"])
             labels[i, rf:len(full)] = torch.tensor(r["resp"],
                                                    dtype=torch.long)
             if args.edit_only_loss:
                 ce_w[i, rf:len(full)] = args.bg_weight
-                for j in r["edit_pos"]:
-                    ce_w[i, rf + j] = 1.0
+                for j in r["hi_pos"]:
+                    if rf + j < Tl:
+                        ce_w[i, rf + j] = 1.0
         r["xt_len"] = len(e)
         r["lm_len"] = len(full)
     W = ctx["w_dec"]                               # (d_sae, d) f32
@@ -282,6 +314,8 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
         "ce_w": ce_w, "lam_tgt": lam_tgt,
         "z_amp": za, "z_sup": zs, "budget": budget,
         "null_mask": torch.tensor([r["null"] is not None for r in rows]),
+        "empty_mask": torch.tensor([r["null"] == "empty" for r in rows]),
+        "mm_mask": torch.tensor([r["null"] == "mismatch" for r in rows]),
     }
 
 
@@ -333,33 +367,48 @@ def ef_loss(model, it_model, hook, built: Dict, args, device: str,
 
     budget = built["budget"].to(device)            # (B,)
     null = built["null_mask"].to(device)
+    empty = built["empty_mask"].to(device)
+    mm = built["mm_mask"].to(device)
     true_m = (~null).float()
     has_nll = (valid.sum(dim=1) > 0).float()
     eps = 1e-6
+
+    # rows whose delta must be SILENT: empty always; mismatch only when
+    # the echo teacher is off (with echo, mismatch rows need a delta to
+    # render the reproduction).
+    silent = (empty | mm) if not args.mismatch_echo else empty
+    active_m = (~silent).float()
 
     pos_norm = delta.norm(dim=-1)                  # (B, Te)
     enc_m = built["enc_mask"].to(device).float()
     over = F.relu(pos_norm - budget.unsqueeze(1)).pow(2) \
         / (budget.unsqueeze(1).pow(2) + eps)
     over = (over * enc_m).sum(dim=1) / enc_m.sum(dim=1).clamp_min(1.0)
-    norm_pen = (over * true_m).sum() / true_m.sum().clamp_min(1.0)
+    norm_pen = (over * active_m).sum() / active_m.sum().clamp_min(1.0)
 
     ref = ((budget.pow(2) * true_m).sum()
            / true_m.sum().clamp_min(1.0)).detach().clamp_min(1.0)
     null_sq = (delta.pow(2).sum(dim=-1) * enc_m).sum(dim=1) \
         / enc_m.sum(dim=1).clamp_min(1.0)
-    null_pen = ((null_sq / ref) * null.float()).sum() \
-        / null.float().sum().clamp_min(1.0)
+    sil_f = silent.float()
+    null_pen = ((null_sq / ref) * sil_f).sum() / sil_f.sum().clamp_min(1.0)
 
+    labeled = has_nll
+    nll_lab = (nll * labeled).sum() / labeled.sum().clamp_min(1.0)
     nll_true = (nll * true_m * has_nll).sum() \
         / (true_m * has_nll).sum().clamp_min(1.0)
-    loss = (nll_true + args.norm_reg_w * norm_pen
+    loss = (nll_lab + args.norm_reg_w * norm_pen
             + args.null_norm_w * null_pen)
     if args.lam_sup_w > 0:
         lam_t = built["lam_tgt"].to(device)
         lam_bce = F.binary_cross_entropy(
             lam.clamp(1e-6, 1 - 1e-6), lam_t, reduction="none")
-        lam_bce = (lam_bce * enc_m).sum() / enc_m.sum().clamp_min(1.0)
+        # mismatch rows leave the BCE pool under the echo teacher (their
+        # lambda may fire to render the echo).
+        row_m = (~mm).float() if args.mismatch_echo \
+            else torch.ones_like(mm, dtype=torch.float32)
+        wmask = enc_m * row_m.unsqueeze(1)
+        lam_bce = (lam_bce * wmask).sum() / wmask.sum().clamp_min(1.0)
         loss = loss + args.lam_sup_w * lam_bce
     if not return_metrics:
         return loss
@@ -400,6 +449,13 @@ def main():
     model = EFIntervener(args.llm2vec_dir, d_sae, dtype=dtype,
                          lora_r=args.lora_r, w_dec=w_dec).to(args.device)
 
+    if args.init_flow_ckpt:
+        blob = torch.load(args.init_flow_ckpt, map_location="cpu",
+                          weights_only=False)
+        sd = blob.get("trainable", blob)
+        model.flow.load_trainable(sd, strict=False)
+        print(f"[ef-lm] flow encoder warm start from "
+              f"{args.init_flow_ckpt} ({len(sd)} keys, strict=False)")
     if args.init_ckpt:
         blob = torch.load(args.init_ckpt, map_location=args.device,
                           weights_only=False)

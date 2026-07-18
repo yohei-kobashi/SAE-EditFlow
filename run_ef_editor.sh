@@ -48,6 +48,8 @@ EXTRA=()
 [ -n "${EDIT_ONLY:-}" ] && EXTRA+=(--edit-only-loss --bg-weight "${BG_WEIGHT:-0.1}")
 [ -n "${INIT_CKPT:-}" ] && EXTRA+=(--init-ckpt "$INIT_CKPT")
 [ -n "${LAM_SUP:-}" ] && EXTRA+=(--lam-sup-w "$LAM_SUP")
+[ -n "${FLOW_INIT:-}" ] && EXTRA+=(--init-flow-ckpt "$FLOW_INIT")
+[ -n "${MM_ECHO:-}" ] && EXTRA+=(--mismatch-echo)
 
 TRAIN_ARGS=(--corruption-dir "$CACHE" --dev-corruption-dir "$DEV"
     --llm2vec-dir "$LLM2VEC" --output-dir "$OUT"
