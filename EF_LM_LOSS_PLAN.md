@@ -86,6 +86,17 @@ FICの位置づけ(監査で確定): 彼らのFIC原実験は5 feature × 手書
 - 注: コア表のA1腕は事例レベル仕様なのでFRC同定に依存しない。FRCが要るのは
   この再現アンカーのみ(論文でも分離を明記)。
 
+## 4c. T6 — LinguaLens実装の同一スタック検証(工程末尾、2026-07-18ユーザー指示)
+
+元論文と同じ **Llama-3.1-8B + OpenSAE**(THU-KEG/OpenSAE-LLaMA-3.1-Layer_XX、
+全32層公開済み)で我々の実装を検証する:
+- T6-2: **彼らのコード逐語**(TransformerWithSae+Intervener)で
+  politeness(156439)/causality(223621 — repo examples記載のindices)×50生成
+  → 我々のjudge+FIC式 → Table 2該当行と直接比較(judge側の検証)
+- T6-3: 我々の再実装を同一スタック・同一indicesで → T6-2と比較(フック側の検証)
+- T6-4(任意): 我々のFRC同定を彼らのスタックで → 同定込みの完全検証
+- 前提: meta-llamaのHFゲート承認(ユーザー確認)。実行は7/22-24、interact-g。
+
 ## 5. ゲート(変更なし)
 
 L12: A4 exact > A2(同枠steer)、empty/random無害、λ-IoU true専有。
