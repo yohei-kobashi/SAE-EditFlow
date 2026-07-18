@@ -99,6 +99,71 @@ class Intervener(nn.Module):
             lin.bias.data.copy_(sd[f"{name}.bias"])
 
 
+class EFIntervener(nn.Module):
+    """EF-version editor under the through-LM objective (EF_LM_LOSS_PLAN.md,
+    user-approved 2026-07-18).
+
+    rate field x content field over the encoder's per-position states:
+        lam_i = sigmoid(rate_head(h_i))   probability that unexecuted edits
+                                          remain at position i
+        v_i   = content_head(h_i)         content direction (zero-init)
+        delta_i = lam_i * v_i             injected at frozen layer L, at the
+                                          [BOS]+x_t span (bare frame: encoder
+                                          input and LM prefix are the SAME
+                                          token sequence, so the position map
+                                          is the identity)
+    No token output; no steer base; t is fed as 0 always (inference-time t
+    is unobservable — intermediate states x_t vary the INPUT instead)."""
+
+    def __init__(self, llm2vec_dir: str, d_sae: int,
+                 dtype: torch.dtype = torch.bfloat16, lora_r: int = 32,
+                 w_dec: Optional[torch.Tensor] = None,
+                 rate_bias_init: float = -2.0):
+        super().__init__()
+        self.flow = SAEEditFlow(
+            llm2vec_dir, d_sae, dtype=dtype, lora_r=lora_r,
+            cond_mode="feature-tokens", rate_param="hazard", w_dec=w_dec)
+        d = self.flow.d_model
+        self.rate_head = nn.Linear(d, 1)
+        nn.init.zeros_(self.rate_head.weight)
+        nn.init.constant_(self.rate_head.bias, float(rate_bias_init))
+        self.content_head = nn.Linear(d, d)
+        nn.init.zeros_(self.content_head.weight)
+        nn.init.zeros_(self.content_head.bias)
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
+                z_amp: torch.Tensor, z_sup: torch.Tensor
+                ) -> Dict[str, torch.Tensor]:
+        """input_ids: (B, T) = [BOS]+x_t tokens (gemma vocab).
+        Returns delta (B, T, d) float32 and lam (B, T) float32."""
+        B = input_ids.shape[0]
+        t0 = torch.zeros(B, device=input_ids.device)
+        out = self.flow(input_ids, attention_mask, z_amp, z_sup, t0)
+        h = out["hidden"].float()                        # (B, T, d)
+        m = attention_mask.float()
+        lam = torch.sigmoid(self.rate_head(h)).squeeze(-1) * m   # (B, T)
+        v = self.content_head(h)                                 # (B, T, d)
+        return {"delta": v * lam.unsqueeze(-1), "lam": lam}
+
+    def trainable_state_dict(self) -> Dict[str, torch.Tensor]:
+        sd = {f"flow::{k}": v for k, v in
+              self.flow.trainable_state_dict().items()}
+        for name in ("rate_head", "content_head"):
+            lin = getattr(self, name)
+            sd[f"{name}.weight"] = lin.weight.detach().cpu()
+            sd[f"{name}.bias"] = lin.bias.detach().cpu()
+        return sd
+
+    def load_trainable_state_dict(self, sd: Dict[str, torch.Tensor]):
+        flow_sd = {k[len("flow::"):]: v for k, v in sd.items()
+                   if k.startswith("flow::")}
+        self.flow.load_trainable(flow_sd)
+        for name in ("rate_head", "content_head"):
+            lin = getattr(self, name)
+            lin.weight.data.copy_(sd[f"{name}.weight"])
+            lin.bias.data.copy_(sd[f"{name}.bias"])
+
+
 class InjectHook:
     """Forward hook on it_model.model.layers[L]: prefill (T>1) adds the
     per-position field at the src span [lo, hi); decode steps (T==1) add
