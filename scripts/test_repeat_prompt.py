@@ -33,6 +33,12 @@ CANDIDATES = {
                        "anything else.\nInput: {src}\nOutput: "),
     "bare_E": ("bare", "Input: {src}\nRepeat the input sentence exactly, "
                        "and output nothing else.\nOutput: "),
+    # src-first variants (diag7 follow-up: instruction AFTER src keeps
+    # src-position states near the bare identification context)
+    "chat_F": ("chat", "Input: {src}\n\nRepeat the input sentence "
+                       "exactly. Never output anything else."),
+    "chat_G": ("chat", "{src}\n\nRepeat the sentence above exactly. "
+                       "Never output anything else."),
 }
 
 

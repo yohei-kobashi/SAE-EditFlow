@@ -30,7 +30,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from transformers import AutoTokenizer                          # noqa: E402
 
-from intervener import REPEAT_PROMPT, chat_prompt_ids, find_subseq  # noqa
+from intervener import (REPEAT_PROMPT, REPEAT_PROMPT_SRC_FIRST,  # noqa
+                        chat_prompt_ids, find_subseq)
 from model import SAEFeatureExtractor                           # noqa: E402
 
 
@@ -49,6 +50,9 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--topk", type=int, default=64)
     p.add_argument("--pos-topk", type=int, default=16)
+    p.add_argument("--src-first", action="store_true",
+                   help="use REPEAT_PROMPT_SRC_FIRST (instruction AFTER "
+                        "src) as the injection-condition prompt")
     p.add_argument("--device", default="cuda")
     return p.parse_args()
 
@@ -91,7 +95,9 @@ def main():
         with torch.no_grad():
             zA = ex_base.encode_text(src)              # (Ta, d)
             zB = ex_it.encode_text(src)                # (Tb, d)
-            pids = chat_prompt_ids(it_tok, REPEAT_PROMPT.format(src=src))
+            tpl = (REPEAT_PROMPT_SRC_FIRST if args.src_first
+                   else REPEAT_PROMPT)
+            pids = chat_prompt_ids(it_tok, tpl.format(src=src))
             needle = it_tok(src, add_special_tokens=False).input_ids
             off = 0
             lo = find_subseq(pids, needle)
@@ -139,7 +145,8 @@ def main():
 
     lines = [
         f"# DIAG 7 — identification vs injection context shift "
-        f"(layer {args.sae_layer}, n={len(rows)})", "",
+        f"(layer {args.sae_layer}, n={len(rows)}, "
+        f"prompt={'src-first' if args.src_first else 'instr-first'})", "",
         "A = bare src / base model (identification condition)",
         "B = bare src / -it model (model-shift control)",
         "C = src inside the repeat prompt / -it (injection condition)", "",

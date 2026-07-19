@@ -42,6 +42,13 @@ from editflow import SAEEditFlow
 REPEAT_PROMPT = ("Repeat the input sentence exactly. Never output "
                  "anything else.\n\nInput: {src}")
 
+# src-first variant (user request 2026-07-19): with a causal LM the src
+# tokens attend only leftward, so placing the instruction AFTER src keeps
+# the src-position states close to the bare-sentence identification
+# context (diag7 follow-up).
+REPEAT_PROMPT_SRC_FIRST = ("Input: {src}\n\nRepeat the input sentence "
+                           "exactly. Never output anything else.")
+
 
 def chat_prompt_ids(it_tok, text: str):
     """Chat-templated prompt token ids with the tokenizers version-drift
