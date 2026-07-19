@@ -39,15 +39,17 @@ from editflow import SAEEditFlow
 # 99% of LinguaLens sentences under this chat-templated prompt (bare-text
 # variants: 0%). The prompt supplies ONLY reproduction capability; the
 # intervention decides WHAT gets reproduced.
-REPEAT_PROMPT = ("Repeat the input sentence exactly. Never output "
-                 "anything else.\n\nInput: {src}")
-
-# src-first variant (user request 2026-07-19): with a causal LM the src
-# tokens attend only leftward, so placing the instruction AFTER src keeps
-# the src-position states close to the bare-sentence identification
-# context (diag7 follow-up).
-REPEAT_PROMPT_SRC_FIRST = ("Input: {src}\n\nRepeat the input sentence "
-                           "exactly. Never output anything else.")
+# ADOPTED (user decision 2026-07-19, diag7 follow-up): src-first — with a
+# causal LM the src tokens attend only leftward, so placing the
+# instruction AFTER src keeps the src-position states close to the bare
+# identification context (spec persistence 0.52 -> 0.59, per-position
+# overlap 0.59 -> 0.70) at an identical 99% plain-model copy rate.
+REPEAT_PROMPT = ("Input: {src}\n\nRepeat the input sentence "
+                 "exactly. Never output anything else.")
+REPEAT_PROMPT_SRC_FIRST = REPEAT_PROMPT          # alias (diag script)
+# previous instruction-first wording, kept for reference:
+REPEAT_PROMPT_INSTR_FIRST = ("Repeat the input sentence exactly. Never "
+                             "output anything else.\n\nInput: {src}")
 
 
 def chat_prompt_ids(it_tok, text: str):
