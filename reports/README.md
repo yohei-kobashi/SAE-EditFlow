@@ -76,9 +76,10 @@
 | AxBench層拡張(sae_a) | L4 0.197 / L10 0.229 / L12 0.179 / L20 0.139 — 浅層ピークの山型 | 確定 |
 | LinguaLens再現v2(3層・公式忠実化後) | FICアンカー弱(全セル一桁〜10台 vs Table2)— プロトコルのスタック転移の弱さとして議論 | 確定 |
 
-## 進行中・待機(執筆時は空欄/暫定)
+## 進行中・待機(2026-07-20)
 
-- **Intervener v2 学習+probe500**(提案editor本体 — 最優先)→ 勝てばL20
-- **AxBench再現 L20/L10** + ll_set10(相互評価セル)→ judge
-- FRR表のEF行なし再集計(オフライン)、clamp腕のFRR判定(任意)
-- random辞書対照(情報軸を復活させる場合のみ)、BLEU/chrF、定性例
+- L4/L20の**層ネイティブEF基盤→v5f2**(short-g / interact-gで並行学習中)
+- Ablation(Tier1学習3本+Tier2 probe5種+強度掃引+feature別集計)— interact-gキュー
+- FIC生成(L12)→ judge(gpt-4o、prepost)。A4のFIC/KLはv5f2完成後に3層で
+- T6(Llama同一スタック検証、要HFゲート承認)
+- 旧参考項目(v2 Intervener 0.2725=プロンプト+基底+補正の比較行、FRR再集計等)は付録候補
