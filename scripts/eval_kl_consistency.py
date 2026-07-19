@@ -44,6 +44,7 @@ from eval_lingualens import (                                  # noqa: E402
 from intervener import (EFIntervener, REPEAT_PROMPT,           # noqa: E402
                         chat_prompt_ids, find_subseq)
 from model import SAEFeatureExtractor, load_sae                # noqa: E402
+from scripts.eval_clamp_baseline import SaeClampHook           # noqa: E402
 
 
 def parse_args():
@@ -150,6 +151,8 @@ def main():
 
     hook = SpanHook()
     it_model.model.layers[args.sae_layer].register_forward_hook(hook)
+    clamp_hook = SaeClampHook(sae)
+    it_model.model.layers[args.sae_layer].register_forward_hook(clamp_hook)
     print(f"[klc] layer {args.sae_layer}, arms {arms}, "
           f"{len(chosen)} pairs (teacher-forced, no generation)")
 
@@ -240,6 +243,13 @@ def main():
                     hook.delta = io["delta"][0,
                                              eo:eo + len(needle)].detach()
                     hook.off = lo
+                elif arm == "clamp":
+                    clamp_hook.enabled = True
+                    clamp_hook.amp_idx = torch.nonzero(
+                        za > 0).flatten().to(args.device)
+                    clamp_hook.amp_val = 10.0
+                    clamp_hook.sup_idx = torch.nonzero(
+                        zs > 0).flatten().to(args.device)
                 else:
                     dvec = (za.to(args.device).float() @ W
                             - zs.to(args.device).float() @ W)
@@ -247,6 +257,7 @@ def main():
                     hook.alpha = args.steer_alpha
                 lpA = resp_logprobs(fC, len(pC))
                 hook.mode = None
+                clamp_hook.enabled = False
                 kl_AB = float((pB_p * (lpB - lpA)).sum(-1).mean())
                 nllA = float(-lpA.gather(-1, torch.tensor(
                     resp, device=args.device).view(-1, 1)).mean())
