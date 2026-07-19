@@ -106,8 +106,12 @@ def main():
                 torch.tensor(pids, dtype=torch.long))
             zC = zC_full[lo:lo + len(needle)]          # src span in prompt
 
-        pA = zA.max(dim=0).values.float().cpu()
-        pB = zB.max(dim=0).values.float().cpu()
+        # exclude BOS from the bare pools: its attention-sink mega-
+        # activations dominate a global max-pool and would make A/B vs C
+        # (a BOS-free span) incomparable. The real spec pipeline pools
+        # edit-locally (BOS-free) as well.
+        pA = zA[1:].max(dim=0).values.float().cpu()
+        pB = zB[1:].max(dim=0).values.float().cpu()
         pC = zC.max(dim=0).values.float().cpu()
         sA, sB, sC = (top_set(p, args.topk) for p in (pA, pB, pC))
         # per-position overlap: bare -it positions vs in-context positions
