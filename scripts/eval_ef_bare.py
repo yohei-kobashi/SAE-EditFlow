@@ -112,6 +112,10 @@ def parse_args():
                         "at the src span inside the prompt, steer at all "
                         "positions, raw = prompt only. oracle_/steer_"
                         "local diag arms are bare-frame only.")
+    p.add_argument("--spec-scope", choices=["local", "global"],
+                   default="local",
+                   help="ablation (7): 'global' pools the spec over ALL "
+                        "sentence positions instead of the edit span")
     p.add_argument("--rounds", type=int, default=1)
     p.add_argument("--stop-lam", type=float, default=0.05)
     p.add_argument("--max-new-pad", type=int, default=24)
@@ -351,6 +355,9 @@ def main():
             opcodes = difflib.SequenceMatcher(
                 None, src_ids, tgt_ids, autojunk=False).get_opcodes()
             sr, tr = edit_char_ranges(opcodes, om_s, om_t)
+            if args.spec_scope == "global":
+                sr, tr = [], []          # local_pool_topk falls back to
+                #                          global pooling on empty ranges
             z_src = local_pool_topk(z_s, s_off, sr, args.pool_topk, blk)
             z_tgt = local_pool_topk(z_t, t_off, tr, args.pool_topk, blk)
         za_t, zs_t = diff_intervention(z_src, z_tgt, args.k_amp, args.k_sup)

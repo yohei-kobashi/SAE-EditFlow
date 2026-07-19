@@ -57,8 +57,8 @@ TRAIN_ARGS=(--corruption-dir "$CACHE" --dev-corruption-dir "$DEV"
     --inject-layer "$LAYER" --sae-path "$SAE"
     --batch-size 4 --grad-accum-steps 2 --num-workers 2
     --k-top 32 --k-amp log:1-32 --k-sup log:1-32
-    --empty-prob 0.08 --mismatch-null-prob 0.12 --t0-prob 0.5
-    --norm-alpha 0.5 --norm-reg-w 0.05 --null-norm-w 0.1
+    --empty-prob "${EMPTY_PROB:-0.08}" --mismatch-null-prob "${MM_PROB:-0.12}" --t0-prob 0.5
+    --norm-alpha 0.5 --norm-reg-w "${NORM_REG_W:-0.05}" --null-norm-w "${NULL_NORM_W:-0.1}"
     --dev-batches 48 --eval-steps 2000 --save-steps 2000
     --resume --device cuda "${EXTRA[@]}")
 
