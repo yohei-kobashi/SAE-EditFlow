@@ -11,10 +11,12 @@ Conditions: targeted / random (same shape) / control (raw continuation;
 the clamp arm additionally gets its faithful 'recon' control =
 reconstruction passthrough, LinguaLens's multiply x1).
 
-Arms (editor-independent): steer (alpha*dvec every position), clamp
-(set 10/0 + recon replacement), prompting (A3-literal steering prompts —
-their native prominence task). The ef arm is added separately once its
-FIC frame treatment is decided.
+Arms: steer (alpha*dvec every position), clamp (set 10/0 + recon
+replacement), prompting (A3-literal steering prompts — their native
+prominence task), and ef (--ef-ckpt: the editor's delta injected over the
+sentence prefill — use the BARE-frame champion v4 here; user decision
+2026-07-21: FIC covers all four arms in both frames, the repeat side by
+reusing the exact-probe records via eval_fic_judge.py).
 
 Resume-safe (records keyed). Judge lives in a separate script.
 """
@@ -40,9 +42,33 @@ from eval_lingualens import (                                  # noqa: E402
     diff_intervention, edit_char_ranges, local_pool_topk,
     randomize_intervention, sae_z_with_offsets,
 )
-from intervener import chat_prompt_ids                         # noqa: E402
+from intervener import EFIntervener, chat_prompt_ids           # noqa: E402
 from model import SAEFeatureExtractor, load_sae                # noqa: E402
 from scripts.eval_clamp_baseline import SaeClampHook           # noqa: E402
+
+
+class EFPrefillHook:
+    """Add the editor's per-position delta over the first n prefill
+    positions (bare frame: sentence starts at position 0). Decode steps
+    (seq len 1) are untouched — same mechanics as eval_ef_bare's BareHook
+    'ef' mode."""
+
+    def __init__(self):
+        self.enabled = False
+        self.delta = None            # (n, d)
+
+    def __call__(self, module, inputs, output):
+        if not self.enabled or self.delta is None:
+            return None
+        h = output[0] if isinstance(output, tuple) else output
+        if h.shape[1] > 1:
+            n = min(self.delta.shape[0], h.shape[1])
+            add = torch.zeros_like(h)
+            add[:, :n] = self.delta[:n].to(h.dtype)
+            h = h + add
+        if isinstance(output, tuple):
+            return (h,) + tuple(output[1:])
+        return h
 
 
 def stable_hash(*parts) -> int:
@@ -67,6 +93,12 @@ def parse_args():
     p.add_argument("--pool-topk", type=int, default=64)
     p.add_argument("--blocklist", default="")
     p.add_argument("--arms", default="steer,clamp,prompting")
+    p.add_argument("--ef-ckpt", default="",
+                   help="EFIntervener checkpoint for the ef arm — use the "
+                        "BARE-frame champion (v4) here; this script's frame "
+                        "is the bare free continuation (user 2026-07-21: "
+                        "both-frames FIC; the repeat side reuses the exact "
+                        "probe records)")
     p.add_argument("--a3-prompts", default="runs/a3_prompts/steering_prompts.json")
     p.add_argument("--steer-alpha", type=float, default=0.5)
     p.add_argument("--max-new-tokens", type=int, default=100)  # repo default
@@ -131,11 +163,30 @@ def main():
     a3 = (json.loads(Path(args.a3_prompts).read_text())
           if "prompting" in arms else None)
 
+    interv = None
+    if "ef" in arms:
+        if not args.ef_ckpt:
+            raise SystemExit("arm 'ef' needs --ef-ckpt")
+        blob = torch.load(args.ef_ckpt, map_location="cpu",
+                          weights_only=False)
+        cfg = blob["config"]
+        if int(cfg["inject_layer"]) != args.sae_layer:
+            raise SystemExit(f"ckpt layer {cfg['inject_layer']} != "
+                             f"--sae-layer {args.sae_layer}")
+        interv = EFIntervener(args.llm2vec_dir, int(cfg["d_sae"]),
+                              dtype=dtype, lora_r=int(cfg.get("lora_r", 32)),
+                              w_dec=sae.W_dec.detach().float().cpu(),
+                              ).to(args.device).eval()
+        interv.load_trainable_state_dict(blob["trainable"])
+        print(f"[fic] EF editor loaded from {args.ef_ckpt}")
+
     steer_hook = SteerAllHook()
     clamp_hook = SaeClampHook(sae)
+    ef_hook = EFPrefillHook()
     layer = it_model.model.layers[args.sae_layer]
     layer.register_forward_hook(steer_hook)
     layer.register_forward_hook(clamp_hook)
+    layer.register_forward_hook(ef_hook)
 
     rec_path = out_dir / "records.jsonl"
     done = set()
@@ -198,6 +249,7 @@ def main():
                 key = f"{f}|{pi}|{d}|_|control"
                 if key not in done:
                     steer_hook.enabled = clamp_hook.enabled = False
+                    ef_hook.enabled = False
                     emit(key, f, pi, d, "_", "control",
                          gen(bare_ids, (key,)))
                     done.add(key)
@@ -215,8 +267,19 @@ def main():
                         else:
                             za_c, zs_c = za, zs
                         steer_hook.enabled = clamp_hook.enabled = False
+                        ef_hook.enabled = False
                         prefix = bare_ids
-                        if arm == "steer" and cond != "recon":
+                        if arm == "ef":
+                            with torch.no_grad():
+                                ei = torch.tensor([bare_ids],
+                                                  device=args.device)
+                                io = interv(
+                                    ei, torch.ones_like(ei),
+                                    za_c.unsqueeze(0).to(args.device),
+                                    zs_c.unsqueeze(0).to(args.device))
+                                ef_hook.delta = io["delta"][0].detach()
+                            ef_hook.enabled = True
+                        elif arm == "steer" and cond != "recon":
                             steer_hook.vec = args.steer_alpha * (
                                 za_c.to(args.device).float() @ W
                                 - zs_c.to(args.device).float() @ W)
@@ -243,6 +306,7 @@ def main():
                                 it_tok, sp_dir + "\n\nQuestion: " + start)
                         text = gen(prefix, (key,))
                         steer_hook.enabled = clamp_hook.enabled = False
+                        ef_hook.enabled = False
                         emit(key, f, pi, d, arm, cond, text)
                         done.add(key)
         print(f"[fic] {f} done ({len(done)} records)")
