@@ -176,6 +176,10 @@ def main():
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     trials = collect_trials(args)
+    # user 2026-07-21: the repeat-frame ef trials reuse the 40k v5f2/v5f
+    # probe outputs, which may be superseded by 80k extensions — judge
+    # everything else first (stable sort; judging 40k afterwards is fine).
+    trials.sort(key=lambda t: t["frame"] == "repeat" and t["arm"] == "ef")
 
     cache_path = out / f"judge_cache_{args.judge_model}.jsonl"
     cache = {}
