@@ -248,6 +248,40 @@ FIC=ペナルティ付き調和平均(w=0.5)のfeature平均(99 features)。
   exact(厳密)とFIC(顕著さ)は相補的で、主表の学習量選択は
   exact基準を推奨(ユーザー判断待ち)。
 
+## 5f. LinguaLens 4大分類(categories)別の分析(2026-07-21)
+
+feature→categories(複数所属あり)で集計。exactはペア重み付き、FICはfeature平均。
+表はruns/tables/perfeature_ef_l12_combined.md(feature別99行も同梱)。
+
+**exact(true)**:
+
+| category | L4 40k | L4 80k | L12 40k |
+|---|---|---|---|
+| morphology | 0.096 | 0.096 | 0.154 |
+| syntax | 0.166 | 0.162 | **0.253** |
+| semantics | 0.118 | 0.212 | **0.307** |
+| pragmatics | 0.184 | **0.272** | 0.253 |
+
+**復唱枠FICのPT_abl(現象除去の成功率; E_ablはPB≈0の天井効果のためPT併記)**:
+
+| category | L4 40k | L4 80k | L12 40k |
+|---|---|---|---|
+| morphology | 0.260 | 0.366 | 0.351 |
+| syntax | 0.404 | 0.491 | **0.589** |
+| semantics | 0.453 | 0.578 | **0.622** |
+| pragmatics | 0.487 | **0.635** | 0.538 |
+
+- **「形態・統語は浅層L4が得意」という仮説は両指標で棄却**。morphologyは
+  全層で最弱(L4 80kでもexact 0.096、延長で唯一改善しない分類)。
+  接辞系featureのゼロ集中から、層ではなく**サブワード分割による表層実現の
+  困難**(editor非依存)が示唆される。LinguaLensの層別「存在」分布と
+  編集の「成功」分布は一致しない — 区別して書くこと。
+- **L12は統語・意味の両指標で最良**。L4延長の改善はsemantics/pragmaticsに
+  集中(表層系は不変)。
+- **唯一の逆転はpragmatics**: L4 80kがexact(0.272 vs 0.253)とFIC PT_abl
+  (0.635 vs 0.538、≈2SE)の両指標でL12超え — 実傾向の可能性、深掘り候補。
+- 統計注意: セルn=104-229(exact)/f=13-42(FIC)、SE≈3-5pt。
+
 ## 6. 計算リソース実測(2026-07-20集計)
 
 環境: 東大/筑波大 Miyabi、Miyabi-Gノード(NVIDIA GH200 ×1/ノード)、
