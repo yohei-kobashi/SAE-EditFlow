@@ -677,10 +677,21 @@ dev選択): L4=2.5 / L12=3.5 / L20=1.5(信号強度と逆相関 — 深層ほど
   enhancement(FRC-r3 latentをSET、force-insert)をclamp値5/10/20で
   実行(clamp10=忠実値、clampZ=プールmax_act)→ fs_clampE_l*_amp。
 - 🔴 AxBench amp = 同バグ(§上記、fs_axbEで修正済み・実行中)。
-- ⚠️ **rewrite枠のamp raw床は0.1202と高い**(素のrewriterが対事実文を
-  自然な文に「直す」= 現象を自発復元するため)。rewrite枠ampセルは
-  net(true−raw/random)必須。復唱枠(ef/steer)のamp床はcopy≈0のまま
-  (randomのみ0.03-0.05に上昇)。
+- ⚠️ **rewrite枠のamp raw床は0.1202と高い** — 当初「対事実文を自然な文に
+  直すため」と書いたが不正確(ユーザー指摘)。実データ(raw一致60/499の
+  feature内訳)で確定した正しい機序は2つ:
+  (i) **主因: morphology系featureの対事実文は非文**(trigger形態素の
+  削除・置換で "The meeting has been hold." / "The key are in my pocket."
+  等が生じる)。60件中50件超がこの型(past_tense_irregular 6・
+  past_participle_irregular 5・third_person_singular 5・各種suffix系…)で、
+  素のrewriterの文法事前が修復した結果がたまたまs1に一致する。
+  **「最小対の両側が文法的」はLinguaLens-Dataでは成り立たない**(構文・
+  意味・語用系は概ね両側文法的、形態系は片側非文)— §5f''の流暢性事前
+  問題と同根で、論文の記載事項。
+  (ii) 副因(sup床0.0601も同機序): 文法的だが有標な構成(do強調・
+  文頭Actually・gapping等)を無標形へ正規化する回帰。
+  rewrite枠ampセルはnet(true−raw/random)必須。復唱枠(ef/steer)の
+  amp床はcopy≈0のまま(randomのみ0.03-0.05に上昇)。
 - FIC judge: MORE/LESS両方向を集計済み(ampはE_enh列を読む — 既存
   fic_judge_amp_l12の前例どおり)。KL/NLLのfeature-spec版は未実施
   (別パス、旧oracle版ampは機構的に正しい)。
