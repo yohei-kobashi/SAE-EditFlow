@@ -140,6 +140,11 @@ def parse_args():
                    help="extra multiplier on the feature spec AFTER the "
                         "norm-median rescale (input-side strength sweep; "
                         "only meaningful with --feature-spec)")
+    p.add_argument("--pool-dev", default="",
+                   help="eval_split.json path; sample pairs from the "
+                        "identification POOL instead of the eval 500 — "
+                        "for hyperparameter selection (e.g. fspec-scale) "
+                        "without touching the eval sample")
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
     return p.parse_args()
@@ -216,6 +221,11 @@ def main():
         ds = ds.filter(lambda r: r["language"] == args.language)
     order = list(range(len(ds)))
     random.Random(args.seed).shuffle(order)
+    if args.pool_dev:
+        _ev = set(json.loads(Path(args.pool_dev).read_text())["eval_idx"])
+        order = [k for k in order if k not in _ev]
+        print(f"[efbare] POOL-DEV mode: sampling from the "
+              f"{len(order)}-pair identification pool (eval excluded)")
     chosen = order[:min(args.sample_size, len(order))]
     print(f"[efbare] {len(ds)} pairs, sampling {len(chosen)}")
 
