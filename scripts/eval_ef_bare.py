@@ -128,6 +128,14 @@ def parse_args():
     p.add_argument("--rounds", type=int, default=1)
     p.add_argument("--stop-lam", type=float, default=0.05)
     p.add_argument("--max-new-pad", type=int, default=24)
+    p.add_argument("--feature-spec", default="",
+                   help="per-feature spec JSON (build_feature_specs.py "
+                        "l{L}_spec.json). When set, the intervention spec "
+                        "is the feature's pool-mean delta (rescaled to the "
+                        "pool's per-pair norm median) instead of the "
+                        "evaluated pair's own z_tgt−z_src — the pair "
+                        "never contributes to its spec. sup direction is "
+                        "the stored sign; --reverse-pairs flips it.")
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
     return p.parse_args()
@@ -241,6 +249,12 @@ def main():
                               ).to(args.device).eval()
         interv.load_trainable_state_dict(blob["trainable"])
         print(f"[efbare] EF editor loaded from {args.ef_ckpt}")
+
+    fspec = None
+    if args.feature_spec:
+        fspec = json.loads(Path(args.feature_spec).read_text())
+        print(f"[efbare] FEATURE-SPEC mode: {len(fspec)} features from "
+              f"{args.feature_spec} (pair-independent interventions)")
 
     a3 = None
     if "prompting" in arms or "prompting_edit" in arms:
@@ -371,7 +385,22 @@ def main():
                 #                          global pooling on empty ranges
             z_src = local_pool_topk(z_s, s_off, sr, args.pool_topk, blk)
             z_tgt = local_pool_topk(z_t, t_off, tr, args.pool_topk, blk)
-        za_t, zs_t = diff_intervention(z_src, z_tgt, args.k_amp, args.k_sup)
+        if fspec is not None:
+            fs = fspec.get(ex.get("feature") or "?")
+            if fs is None:
+                continue                     # feature absent from pool
+            v = torch.zeros_like(z_src)
+            for fi, val in fs["spec"].items():
+                v[int(fi)] = val
+            if fs["mean_norm"] > 0:          # rescale to pool's per-pair
+                v = v * (fs["norm_median"] / fs["mean_norm"])
+            if args.reverse_pairs:           # spec stored sup (s1->s2)
+                v = -v
+            za_t, zs_t = diff_intervention(
+                torch.zeros_like(v), v, args.k_amp, args.k_sup)
+        else:
+            za_t, zs_t = diff_intervention(
+                z_src, z_tgt, args.k_amp, args.k_sup)
         zvar = {"true": (za_t, zs_t),
                 "empty": (torch.zeros_like(za_t), torch.zeros_like(zs_t)),
                 "random": (randomize_intervention(za_t, prng),
