@@ -112,6 +112,9 @@
 - **同定パス(bspecs)完了**: 3層×(ef spec平均+FRC+AUROC)を1パスで同定。
   **specのsplit-half cosine 0.833-0.838(3層一致)** — LinguaLensのtop-3
   選択不安定(top-1一致36-43%)に対するmean集約の安定性の実証値。
+  **展開実行中(04§9d)**: 3層×両方向×4腕exact(fsrol{4,12,20})+
+  FIC復唱judge(prepostチェーンficfs)。スケールは層別に同定プールdev
+  標本で選択(評価500非接触)。ピーク=L12で2.5×(0.1443)
   **L12パイロット完了(04§9b)**: ef 0.0822(oracle比26%残存)≈steer
   0.0862 > AUROC-r1 0.0701 > FRC-r3 0.0160、prompting 0.1804が最強arm。
   efのcopy 0.597=発火不足 → 強度掃引fssweep実行中
