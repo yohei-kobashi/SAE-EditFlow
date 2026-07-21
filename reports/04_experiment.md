@@ -344,9 +344,18 @@ feature別・4大分類別集計(§5f、runs/tables/perfeature_ef_l12_combined.m
 (§5b)、Tier2 probe群、k掃引feature別表(runs/tables/perfeature_ksweep.md)
 まで全て確定。
 
+**🔶 2026-07-21ユーザー決定: nobudget(0.3166)をチャンピオンに採用**
+(exact優先)。移行計画が実行中:
+(1) nobudgetレシピの学習: L12 80k延長(interact-g)+L4/L20の40k→80k
+2段(short-g、efl4n/efl20n系)。
+(2) L12の40k/80k勝者レシピでEF基盤・対照教師ablationを再実行
+(interact-g、2段手続きをチャンピオンと揃える)。
+(3) 完成モデルから順次、復唱枠FICを再判定(prepost、fic_judge_nb_*)。
+v5f系の既存数値は「ノルム予算あり」の参考系として保存。
+
 | 残り項目 | 状態 |
 |---|---|
-| **nobudgetのチャンピオン採用可否** | **ユーザー判断待ち**(0.3166>v5f。KL/FIC/ノルム実測の検証が前提、§5b) |
+| nobudget移行(1)(2)(3) | 実行中(上記) |
 | **主表の学習量(40k/80k/層別)** | **ユーザー判断待ち**(exactとFICで層ごとに優劣不一致、§5e') |
 | FIC bare枠のL4/L20(4腕生成+judge) | 未着手(学習量判断後に投入) |
 | LinguaLensとの差別化の検討 | ユーザー側で後日 |
