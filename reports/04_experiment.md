@@ -1,5 +1,10 @@
 # 04 — Experiment(コア表の実測記録、2026-07-19時点)
 
+> **🚫 プロトコル注意(2026-07-22ユーザー指示)**: 本ファイル記載の
+> exact/FIC値は(明記のない限り)**旧oracle-specプロトコル=付録限定**。
+> 本文の主表はfeature-specプロトコル(03§3')の再測定値のみで構成する。
+> 旧値の本文使用は禁止(README規則0')。
+
 手法定義は reports/03_method.md、計画は EF_LM_LOSS_PLAN.md。
 フレーム: src先行復唱プロンプト(exact/KL整合)、greedy。499ペア(seed42)。
 
