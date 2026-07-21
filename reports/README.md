@@ -85,12 +85,21 @@
 | feature別(99現象) | exact>0が56現象、完全成功6(copular_be・past_tense・s_genitive等)。表=runs/tables/perfeature_ef_l12_combined.md | 確定 |
 | FRC同定のsplit-half安定性(99現象×20反復×3層) | FRC値は汎化(top-1 in 0.88-0.90→out 0.84-0.86)だが**top-1特徴のhalf間一致 36-43%・top-3で約50%** — 同定される特徴集合の同一性はデータ依存。LinguaLens原法は全ペアin-sample選択+同一データGPT-4o検証でこれを測れない(262k候補)。表=runs/tables/frc_splithalf_l{4,12,20}.md、詳細=audit_ll_axbench.md §5 | 確定 |
 
-## 進行中・待機(2026-07-21)
+## 進行中・待機(2026-07-22)
 
-- Tier1-④ nobudget(ノルム予算なし)学習 — interact-gチェーンで実行中(最後のablation学習)
+- **評価プロトコル変更(ユーザー決定07-22、03§3')**: 同定/評価データ分離 —
+  評価500・同定プール4,451、全アーム統一。bspecs(3層同定パス)→
+  fspilot(L12パイロット: ef feature-spec / FRC-r3 clamp / AUROC-r1 steer)
+  がshort-gで自動連鎖中。**exact/FICの主表数値は全て新プロトコルで
+  再測定になる**(旧oracle-spec値=上界診断として保持)。旧FIC判定
+  (prepost)は停止・破棄済み
+- nobudget学習系(プロトコル非依存なので継続): interact-g nbqチェーン
+  (L12 nb 80k→amp probes→nb ablations)、short-g efl4nx(L4 nb 80k)。
+  **L20 nb 80k完了: exact 0.0441**(nb 40k 0.0321から+37%だが予算あり80k
+  0.0601未満 — L20は予算あり優位の層依存を追認)
+- FIC再評価(新プロトコル・全層)— パイロット通過後に生成→prepost判定を再開
 - k掃引feature別表(S8のperfeature_ksweep)— キュー末尾で自動生成
-- **主表の学習量の判断待ち(ユーザー)**: 40k統一(推奨)/80k統一/層別。exactとFICで層ごとに優劣が食い違う(04§5e')
-- FIC bare枠のL4/L20生成(4腕)— 未着手(判断後に投入)
+- 主表の学習量の判断(40k/80k/層別)は新プロトコル数値が出てから再検討
 - LinguaLensとの差別化の検討(ユーザー、後日)
 - T6(Llama同一スタック検証、要HFゲート承認)
 - 旧参考項目(v2 Intervener 0.2725=プロンプト+基底+補正の比較行、FRR再集計等)は付録候補
