@@ -83,6 +83,7 @@
 | Tier1 ablation(単一要因) | noS3(EF基盤なし)**0.0361 = −85%**(steer以下に崩壊)/ noctr(対照教師なし)0.2104 = −15%+empty λ-IoU 0.10→0.40(スペック特異性喪失)/ nobudget 学習中 | ②③確定(04§5b) |
 | 4大分類別(L4 vs L12) | L12=統語0.253・意味0.307の本拠地。「浅層=形態統語」仮説はexact/FIC両指標で棄却。morphologyは全層最弱(サブワード要因示唆)。pragmaticsのみL4 80kが両指標で逆転(≈2SE) | 確定(04§5f) |
 | feature別(99現象) | exact>0が56現象、完全成功6(copular_be・past_tense・s_genitive等)。表=runs/tables/perfeature_ef_l12_combined.md | 確定 |
+| FRC同定のsplit-half安定性(99現象×20反復×3層) | FRC値は汎化(top-1 in 0.88-0.90→out 0.84-0.86)だが**top-1特徴のhalf間一致 36-43%・top-3で約50%** — 同定される特徴集合の同一性はデータ依存。LinguaLens原法は全ペアin-sample選択+同一データGPT-4o検証でこれを測れない(262k候補)。表=runs/tables/frc_splithalf_l{4,12,20}.md、詳細=audit_ll_axbench.md §5 | 確定 |
 
 ## 進行中・待機(2026-07-21)
 
