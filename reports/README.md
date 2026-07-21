@@ -104,10 +104,15 @@
   がshort-gで自動連鎖中。**exact/FICの主表数値は全て新プロトコルで
   再測定になる**(旧oracle-spec値=上界診断として保持)。旧FIC判定
   (prepost)は停止・破棄済み
-- nobudget学習系(プロトコル非依存なので継続): interact-g nbqチェーン
-  (L12 nb 80k→amp probes→nb ablations)、short-g efl4nx(L4 nb 80k)。
-  **L20 nb 80k完了: exact 0.0441**(nb 40k 0.0321から+37%だが予算あり80k
-  0.0601未満 — L20は予算あり優位の層依存を追認)
+- nobudget学習系(プロトコル非依存なので継続): interact-g nbqチェーンは
+  nb ablations段(noS3実行中→noctr)。**nb延長は全層完了**:
+  L4 80k **0.2846**(予算あり80k比+58% — nb 40k劣化は未収束が原因と判明、
+  L4もnobudget優位)/ L12 80k 0.2886(40kの0.3166が勝者)/ L20 80k
+  0.0441(L20のみ予算あり優位)。いずれも旧プロトコル=付録/レシピ選択用
+- **同定パス(bspecs)完了**: 3層×(ef spec平均+FRC+AUROC)を1パスで同定。
+  **specのsplit-half cosine 0.833-0.838(3層一致)** — LinguaLensのtop-3
+  選択不安定(top-1一致36-43%)に対するmean集約の安定性の実証値。
+  L12パイロット(fspilot)実行中
 - FIC再評価(新プロトコル・全層)— パイロット通過後に生成→prepost判定を再開
 - k掃引feature別表(S8のperfeature_ksweep)— キュー末尾で自動生成
 - 主表の学習量の判断(40k/80k/層別)は新プロトコル数値が出てから再検討
