@@ -21,6 +21,9 @@ cd ~/SAE-LEWIS
 set -eo pipefail
 git pull || true
 
+# DIRS=sup / amp / sup,amp (default) — lets two workers split directions
+DIRS=${DIRS:-sup,amp}
+
 P=runs/prod_gemma_v6
 FS=runs/feature_specs
 L2V=runs/mcgill_gemma_repro_3k/final
@@ -31,6 +34,8 @@ SC=$(cat $P/fs_scale_l12.txt)
 
 for R in 1 2 3 4 5; do
   for DIRX in "" "_amp"; do
+    if [ -z "$DIRX" ] && ! echo "$DIRS" | grep -q sup; then continue; fi
+    if [ -n "$DIRX" ] && ! echo "$DIRS" | grep -q amp; then continue; fi
     OUT=$P/fs_tmp1_l12_r${R}${DIRX}
     if [ -n "$DIRX" ]; then EXTRA=--reverse-pairs; else EXTRA=""; fi
     if [ ! -f $OUT/report.md ]; then
@@ -46,6 +51,13 @@ for R in 1 2 3 4 5; do
   done
 done
 
+# aggregate only when ALL 10 cells exist (last finisher does it)
+NDONE=$(ls $P/fs_tmp1_l12_r*/report.md 2>/dev/null | wc -l)
+if [ "$NDONE" -lt 10 ]; then
+    echo "[fssamp] $NDONE/10 cells done — aggregation deferred"
+    echo "==================== FS-SAMPLING-PART-DONE ===================="
+    exit 0
+fi
 python3 - <<'PY'
 import json
 from pathlib import Path
