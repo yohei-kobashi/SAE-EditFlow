@@ -863,7 +863,7 @@ L12 sup・targeted条件のLESS判定(FIC成功)をjudgeキャッシュ×records
 | steer(較正済・同spec) | 0.300 | **0.569** | 0.307 |
 | prompting(層共通) | — | 0.410 | — |
 | LinguaLens準拠clamp | 0.072 | 0.045 | 0.058 |
-| AxBench準拠 | 判定中 | 0.116(部分) | 判定中 |
+| AxBench準拠 | E_abl 0.202 / enh再判定中 | 0.116(E_enh −0.060 / E_abl −0.006) | E_abl −0.021 / enh再判定中 |
 
 - **L12の統合FICはsteer 0.569 > ef 0.463**: 調和平均がefのenhancement
   弱さ(0.308 vs steerの0.347)を強く罰するため。L4はef 0.546が全arm
