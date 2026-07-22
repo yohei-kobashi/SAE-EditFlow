@@ -143,6 +143,13 @@ def parse_args():
                         "whose SOURCE side is most similar (SAE max-act "
                         "cosine) to the eval src — input-only adaptation.")
     p.add_argument("--retrieve-m", type=int, default=5)
+    p.add_argument("--cluster-expand", default="",
+                   help="improvement ① : W_dec neighbor table "
+                        "(build_cluster_table.py). Each spec component "
+                        "shares weight with its decoder-cosine split-"
+                        "siblings: v[j] += share * cos_ij * v[i]. Offline "
+                        "and input-independent.")
+    p.add_argument("--cluster-share", type=float, default=0.5)
     p.add_argument("--amp-only", action="store_true",
                    help="improvement C: after direction resolution keep "
                         "only the additive (v>0) components and renorm — "
@@ -294,6 +301,12 @@ def main():
         fspec = json.loads(Path(args.feature_spec).read_text())
         print(f"[efbare] FEATURE-SPEC mode: {len(fspec)} features from "
               f"{args.feature_spec} (pair-independent interventions)")
+    ctab = None
+    if args.cluster_expand:
+        ctab = {int(k): v for k, v in json.loads(
+            Path(args.cluster_expand).read_text()).items()}
+        print(f"[efbare] CLUSTER-EXPAND: {len(ctab)} latents with "
+              f"neighbors, share={args.cluster_share}")
     rtab = None
     if args.fspec_retrieve:
         rtab = json.loads(Path(args.fspec_retrieve).read_text())
@@ -468,6 +481,15 @@ def main():
                     v[int(fi)] = val
             if args.reverse_pairs:           # spec stored sup (s1->s2)
                 v = -v
+            if ctab is not None:
+                add = torch.zeros_like(v)
+                nz2 = torch.nonzero(v).flatten().tolist()
+                for i in nz2:
+                    for j, c in ctab.get(int(i), ()):
+                        add[j] += args.cluster_share * c * float(v[i])
+                if blk is not None:
+                    add[blk] = 0.0
+                v = v + add
             if args.amp_only:
                 v = torch.clamp(v, min=0.0)
             if args.src_gate:
@@ -476,7 +498,8 @@ def main():
                     g_src[blk] = 0.0
                 dead = (v < 0) & (g_src <= 0)
                 v[dead] = 0.0
-            if args.src_gate or args.amp_only or rtab is not None:
+            if (args.src_gate or args.amp_only or rtab is not None
+                    or ctab is not None):
                 nrm = float(v.norm())        # dynamic renorm paths
                 if nrm > 0:
                     v = v * (fs["norm_median"] / nrm)
