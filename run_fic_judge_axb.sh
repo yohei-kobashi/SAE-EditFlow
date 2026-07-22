@@ -21,11 +21,11 @@ git pull || true
 P=runs/prod_gemma_v6
 CELLS=(
   "fs_probe_l4       fs_axb_l4        steer1    fic_fs_axb_l4"
-  "fs_probe_l4_amp   fs_axbE_l4_amp   steer1    fic_fs_axb_l4_amp"
+  "fs_probe_l4_amp   fs_axbE_l4_amp   steer0.6  fic_fs_axb_l4_amp"
   "fs_probe_l12      fs_axb_l12       steer1    fic_fs_axb_l12"
   "fs_probe_l12_amp  fs_axbE_l12_amp  steer0.6  fic_fs_axb_l12_amp"
   "fs_probe_l20      fs_axb_l20       steer1    fic_fs_axb_l20"
-  "fs_probe_l20_amp  fs_axbE_l20_amp  steer1    fic_fs_axb_l20_amp"
+  "fs_probe_l20_amp  fs_axbE_l20_amp  steer0.6  fic_fs_axb_l20_amp"
 )
 
 while true; do
@@ -45,7 +45,8 @@ while true; do
               --dir-map runs/tables/lingualens_dirmap_en.json \
               --output-dir "$OUT" | tee /tmp/ficaxb_last.log \
            && grep -q "FIC-JUDGE-DONE" /tmp/ficaxb_last.log \
-           && grep -qE "^\| axbench \| .*[0-9]" "$OUT/report.md"; then
+           && { case "$4" in *_amp) grep -qE "^\| axbench \| -?[0-9]" "$OUT/report.md" ;;
+                  *) grep -qE "^\| axbench \| — \| -?[0-9]" "$OUT/report.md" ;; esac; }; then
             done_n=$((done_n+1))
         fi
     done
