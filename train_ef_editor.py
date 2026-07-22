@@ -98,6 +98,13 @@ def parse_args():
     p.add_argument("--t0-prob", type=float, default=0.5,
                    help="prob. that x_t = x0 (full remaining edit); else "
                         "t ~ U(0,1) partial application per opcode.")
+    p.add_argument("--agg-aug-prob", type=float, default=0.0,
+                   help="probability of replacing the true spec's dense "
+                        "inputs with a dilution mix (own*w + others-mean*"
+                        "(1-w), w~U(0.3,0.7)) before sparsification — "
+                        "adapter for feature-level averaged specs")
+    p.add_argument("--agg-aug-n", type=int, default=3,
+                   help="how many other batch members to mix in")
     p.add_argument("--edit-only-loss", action="store_true",
                    help="2026-07-18 user decision after the L12 copy "
                         "collapse (ef true==random, copy 0.92): restrict "
@@ -221,8 +228,27 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
                     k_sup=draw_k(rng, args._k_sup), rng=rng,
                     empty_conditioning_prob=0.0)
         else:
+            zx_b, zxp_b = batch["z_X"][b], batch["z_X_prime"][b]
+            if (args.agg_aug_prob > 0 and B_ > 1
+                    and rng.random() < args.agg_aug_prob):
+                # aggregated-spec augmentation (2026-07-22, user-approved
+                # ③): dilute the pair's own delta with the batch-mean of
+                # other pairs' deltas — mimics the feature-level pool-mean
+                # spec's statistics (own signal shrunk, unrelated
+                # components averaged in) so the editor is not OOD on the
+                # evaluation-time averaged specs.
+                others = [o for o in range(B_) if o != b]
+                n_mix = min(args.agg_aug_n, len(others))
+                pick = rng.choice(len(others), size=n_mix, replace=False)
+                sel = [others[int(i)] for i in pick]
+                w = 0.3 + 0.4 * rng.random()
+                mx = torch.stack([batch["z_X"][o] for o in sel]).mean(0)
+                mxp = torch.stack(
+                    [batch["z_X_prime"][o] for o in sel]).mean(0)
+                zx_b = w * zx_b + (1 - w) * mx
+                zxp_b = w * zxp_b + (1 - w) * mxp
             a, s = diff_to_sparse(
-                batch["z_X"][b], batch["z_X_prime"][b], k_top=args.k_top,
+                zx_b, zxp_b, k_top=args.k_top,
                 k_amp=draw_k(rng, args._k_amp),
                 k_sup=draw_k(rng, args._k_sup), rng=rng,
                 empty_conditioning_prob=0.0)

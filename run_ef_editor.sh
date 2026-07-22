@@ -51,6 +51,7 @@ EXTRA=()
 [ -n "${FLOW_INIT:-}" ] && EXTRA+=(--init-flow-ckpt "$FLOW_INIT")
 [ -n "${MM_ECHO:-}" ] && EXTRA+=(--mismatch-echo)
 [ -n "${FRAME:-}" ] && EXTRA+=(--frame "$FRAME")
+[ -n "${AGG_AUG:-}" ] && EXTRA+=(--agg-aug-prob "$AGG_AUG" --agg-aug-n "${AGG_AUG_N:-3}")
 
 TRAIN_ARGS=(--corruption-dir "$CACHE" --dev-corruption-dir "$DEV"
     --llm2vec-dir "$LLM2VEC" --output-dir "$OUT"
