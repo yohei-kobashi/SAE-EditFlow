@@ -105,6 +105,17 @@ def parse_args():
                         "adapter for feature-level averaged specs")
     p.add_argument("--agg-aug-n", type=int, default=3,
                    help="how many other batch members to mix in")
+    p.add_argument("--agg-cluster-table", default="",
+                   help="v6/T1: {dominant_latent: sparse mean delta} JSON "
+                        "(build_group_means.py). When set, agg-aug mixes "
+                        "the pair's delta with its PSEUDO-FEATURE group "
+                        "mean (same dominant SAE latent) instead of "
+                        "unrelated batch members — reproduces the "
+                        "eval-time feature-mean statistics WITH signal.")
+    p.add_argument("--ins-loss-boost", type=float, default=1.0,
+                   help="v6/T3: NLL weight multiplier for true rows whose "
+                        "remaining edit net-INSERTS tokens — strengthens "
+                        "the insertion drive that limits enhancement.")
     p.add_argument("--edit-only-loss", action="store_true",
                    help="2026-07-18 user decision after the L12 copy "
                         "collapse (ef true==random, copy 0.92): restrict "
@@ -229,7 +240,19 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
                     empty_conditioning_prob=0.0)
         else:
             zx_b, zxp_b = batch["z_X"][b], batch["z_X_prime"][b]
-            if (args.agg_aug_prob > 0 and B_ > 1
+            if (args.agg_cluster_table and "agg_table" in ctx
+                    and args.agg_aug_prob > 0
+                    and rng.random() < args.agg_aug_prob):
+                d_own = (zxp_b - zx_b).float()
+                if float(d_own.abs().max()) > 0:
+                    dom = int(d_own.abs().argmax())
+                    gm = ctx["agg_table"].get(dom)
+                    if gm is not None:
+                        wmix = 0.3 + 0.4 * rng.random()
+                        mixed = wmix * d_own + (1 - wmix) * gm
+                        zx_b = torch.clamp(-mixed, min=0.0)
+                        zxp_b = torch.clamp(mixed, min=0.0)
+            elif (args.agg_aug_prob > 0 and B_ > 1
                     and rng.random() < args.agg_aug_prob):
                 # aggregated-spec augmentation (2026-07-22, user-approved
                 # ③): dilute the pair's own delta with the batch-mean of
@@ -499,7 +522,17 @@ def ef_loss(model, it_model, hook, built: Dict, args, device: str,
     null_pen = ((null_sq / ref) * sil_f).sum() / sil_f.sum().clamp_min(1.0)
 
     labeled = has_nll
-    nll_lab = (nll * labeled).sum() / labeled.sum().clamp_min(1.0)
+    if args.ins_loss_boost != 1.0:
+        bo = torch.tensor(
+            [args.ins_loss_boost
+             if (r.get("null") is None and r.get("span_n") is not None
+                 and len(r.get("resp", [])) - 1 > r["span_n"])
+             else 1.0 for r in built["rows"]],
+            device=device, dtype=nll.dtype)
+    else:
+        bo = torch.ones_like(nll)
+    nll_lab = (nll * labeled * bo).sum() \
+        / (labeled * bo).sum().clamp_min(1.0)
     nll_true = (nll * true_m * has_nll).sum() \
         / (true_m * has_nll).sum().clamp_min(1.0)
     loss = (nll_lab + args.norm_reg_w * norm_pen
@@ -590,6 +623,18 @@ def main():
         "eot_id": int(it_tok.convert_tokens_to_ids("<end_of_turn>")),
         "w_dec": w_dec.float(),
     }
+    if args.agg_cluster_table:
+        import json as _json
+        _tab = _json.loads(Path(args.agg_cluster_table).read_text())
+        agg = {}
+        for dom, sp in _tab.items():
+            v = torch.zeros(d_sae)
+            for i, val in sp.items():
+                v[int(i)] = float(val)
+            agg[int(dom)] = v
+        ctx["agg_table"] = agg
+        print(f"[ef-lm] T1 cluster table: {len(agg)} pseudo-feature "
+              f"group means")
     if args.frame == "repeat":
         print(f"[ef-lm] REPEAT frame: {REPEAT_PROMPT[:60]!r}...")
 

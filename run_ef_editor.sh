@@ -52,6 +52,8 @@ EXTRA=()
 [ -n "${MM_ECHO:-}" ] && EXTRA+=(--mismatch-echo)
 [ -n "${FRAME:-}" ] && EXTRA+=(--frame "$FRAME")
 [ -n "${AGG_AUG:-}" ] && EXTRA+=(--agg-aug-prob "$AGG_AUG" --agg-aug-n "${AGG_AUG_N:-3}")
+[ -n "${AGG_CLUSTER:-}" ] && EXTRA+=(--agg-cluster-table "$AGG_CLUSTER")
+[ -n "${INS_BOOST:-}" ] && EXTRA+=(--ins-loss-boost "$INS_BOOST")
 
 TRAIN_ARGS=(--corruption-dir "$CACHE" --dev-corruption-dir "$DEV"
     --llm2vec-dir "$LLM2VEC" --output-dir "$OUT"
