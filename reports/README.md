@@ -137,6 +137,10 @@
   0.0862 > AUROC-r1 0.0701 > FRC-r3 0.0160、prompting 0.1804が最強arm。
   efのcopy 0.597=発火不足 → 強度掃引fssweep実行中
 - FIC再評価(新プロトコル・全層)— パイロット通過後に生成→prepost判定を再開
+- **📋 予約(T1〜T3切り分け後、04§9p)**: T4=train区画3,951での適応
+  fine-tune(zero-shot版/pool適応版の2行構成)+feature別top-k
+  (本命=t統計ゲート: 全feature共通αのみdev選択、kは統計から創発。
+  診断として既存fs_k*記録のfeature別再集計を先行)
 - **📋 予約(最終手法確定後)**: (i) AxBench準拠の3分割へ移行 —
   test=現行500/dev=次の500(ハイパラ専用)/train=3,951(同定専用)、
   定義はeval_split.json v2に固定済み。spec再構築+dev再選択は最終再測定に
