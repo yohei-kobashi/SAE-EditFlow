@@ -140,6 +140,12 @@ def parse_args():
                    help="extra multiplier on the feature spec AFTER the "
                         "norm-median rescale (input-side strength sweep; "
                         "only meaningful with --feature-spec)")
+    p.add_argument("--temperature", type=float, default=0.0,
+                   help="0 = greedy (default). >0 turns on sampling for "
+                        "the frame generation — combine with --gen-seed "
+                        "and repeated runs for a sampling-robustness probe")
+    p.add_argument("--gen-seed", type=int, default=0,
+                   help="torch manual seed for sampled generation runs")
     p.add_argument("--pool-dev", default="",
                    help="eval_split.json path; sample pairs from the "
                         "identification POOL instead of the eval 500 — "
@@ -277,6 +283,10 @@ def main():
         a3 = json.loads(Path(args.a3_prompts).read_text())
         print(f"[efbare] A3 prompts: {len(a3)} features")
 
+    if args.temperature > 0:
+        torch.manual_seed(args.gen_seed or args.seed)
+        print(f"[efbare] SAMPLING mode: temperature={args.temperature}, "
+              f"gen_seed={args.gen_seed or args.seed}")
     hook = BareHook()
     it_model.model.layers[args.sae_layer].register_forward_hook(hook)
     # A1 arm: LinguaLens-faithful set(10/0) + full recon replacement,
@@ -300,11 +310,14 @@ def main():
         full = (prefix_ids if args.frame == "repeat"
                 else prefix_ids + [nl_id])
         ids = torch.tensor([full], device=args.device)
+        gen_kw = dict(do_sample=False)
+        if args.temperature > 0:
+            gen_kw = dict(do_sample=True, temperature=args.temperature)
         out = it_model.generate(
             input_ids=ids,
             max_new_tokens=(src_len or len(prefix_ids)) + args.max_new_pad,
-            do_sample=False,
-            pad_token_id=it_tok.pad_token_id or it_tok.eos_token_id)
+            pad_token_id=it_tok.pad_token_id or it_tok.eos_token_id,
+            **gen_kw)
         text = it_tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
         return text.split("\n")[0].strip()
 
