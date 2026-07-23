@@ -4,7 +4,7 @@
 #PBS -q short-c
 #PBS -l select=1
 #PBS -l walltime=6:00:00
-#PBS -W group_list=go25
+#PBS -W group_list=gj26
 #PBS -j oe
 
 # AxBench steering reproduction — JUDGE (CPU batch on short-c; aarch64,
