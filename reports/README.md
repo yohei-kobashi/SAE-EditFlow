@@ -9,18 +9,21 @@
 
 作成 2026-07-17。**2026-07-18 ユーザー再固定を反映**:
 
-> 🔶 **研究の大前提**: SAEへのintervention(仕様 z_amp/z_sup)を信号として
-> **editor**(LEWIS/EF系のエンコーダ)に入力し、**editorの出力embedding
+> 🔶 **研究の大前提**: SAEへのintervention(spec z_amp/z_sup)を信号として
+> **editor**(EF系エンコーダ)に入力し、**editorの出力embedding
 > (Δh)を凍結LMのresidual streamに戻す**。テキストは凍結LMの生成として
 > 出る。editorを使わない案(素のsteer/clampを最終形とする枠組み)は
 > ユーザー指示により削除した。
 
-論文 = **SAE仕様に条件付けられた学習editor(Intervener)の提案**+
-編集可能性による因果評価。steer / clamp は**ベースライン・統制**として
-のみ載せる(steerはeditorの自明な特殊ケース=固定描画であり、v2の
-初期化基底でもある)。トークンを直接出力するEF系(S系列・ef32・routed・
-λ-IoU・M0・P-B)は条件付けのためコード/runsに履歴として残るが
+論文 = **SAE specに条件付けられた学習editor(記述名: SAE-conditioned
+edit-flow intervention)の提案**+編集可能性による因果評価。steer /
+clamp は**ベースライン・統制**としてのみ載せる(steerはeditorの自明な
+特殊ケース=固定描画)。トークンを直接出力するEF系(S系列・ef32・
+routed・λ-IoU・M0・P-B)は条件付けのためコード/runsに履歴として残るが
 **論文には載せない**(出力インターフェース基準)。
+**specはfeatureレベル**(03§3': 同定プールの符号付き平均、評価500非接触)
+— 07-22のプロトコル移行以降、「事例レベル仕様」を前提とした旧記述は
+無効(01/02/05/06は07-23に現行へ改訂済み)。
 
 ## ファイル構成
 
@@ -29,8 +32,8 @@
 | `01_introduction.md` | Introduction | 動機、主張、貢献リスト、冒頭数値、タイトル案 |
 | `abstract_aaai.md` | Abstract | AAAI提出用(日本語版+英語骨子+数値アンカー、feature-spec値のみ) |
 | `02_previous_works.md` | Related Work | 冒頭の改訂ガイドに従って読む(embedding出力editorの復帰でD.3の一部が再関連) |
-| `03_method.md` | Method | **提案editor(Intervener)**、仕様構築、ベースライン効果器、統制、指標、局在性測定器、判別木、再現 |
-| `04_experiment.md` | Experiments | 確定数値の表(トークン出力EFなし)、統計、Intervener欄は学習完了待ち |
+| `03_method.md` | Method | 提案editor(記述名で書く)、spec構築(**§3' feature-specプロトコルが正**)、フレーム、指標、ablation |
+| `04_experiment.md` | Experiments | §1-8=旧oracle-specプロトコル記録(付録限定)、**§9=本文用feature-spec測定(正)** |
 | `05_discussion_limitations.md` | Analysis / Limitations | 3層分解、免許規則、attenuation、限界 |
 | `06_pipeline_and_theory.md` | 理論とパイプライン状態 | 条件付けvs介入の理論(⚫の根拠)、実験の状態表 |
 | `axbench_testdata.md` | 付録/実験 | AxBenchテストデータの正体と再現・相互評価設計 |
@@ -73,11 +76,27 @@
 6. LinguaLensのFRCは論文とコードで定義が違う(条件付き vs 周辺)—
    我々はコード側に忠実、と1文明記。
 
-## 数値クイックシート(2026-07-21更新 — コア表はreports/04が正)
+## 数値クイックシート【本文用】(feature-specプロトコル、2026-07-23)
+
+すべて03§3'(同定プール4,451でspec構築・評価500非接触)の確定値。
+コア表は04§9が正。方向は enhancement(足す)/ ablation(消す)。
+
+| 主張 | 数値 | 状態 |
+|---|---|---|
+| **本手法 exact(L12、基準spec)** | ablation **0.128**(random 0.000)/ enhancement 0.148(random 0.054、net 0.094) | 確定(04§9d) |
+| ベースライン(同一同定プール、L12 ablation) | 較正steer 0.086 / AxBench準拠AUROC-r1 0.070 / LinguaLens準拠FRC-r3 0.016 / prompting 0.180(random 0.088、net 0.092) | 確定(04§9b/9d) |
+| 層別ef(abl/enh true、層別スケール) | L4 0.086/0.172、L12 0.128/0.148、L20 0.036/0.048 — **ef>較正steerは6セル中5**(例外L4 abl) | 確定(04§9d) |
+| 特異性 | 本手法random≈0.000-0.054 vs prompting random 0.088(誤spec指定でも編集してしまう) | 確定(04§9d) |
+| FIC(復唱枠、gpt-4o) | E_abl ef **0.850/0.937/0.848**(L4/L12/L20、全層で4腕最良); **統合FIC(w=0.5)ef 0.546/0.463/0.124 vs prompting 0.410**、LinguaLens準拠 0.05-0.07、AxBench準拠 0.11-0.17。steer L12 0.569はef超えだが壊れ文19%の割引要(efは2%) | 確定(04§9e/9i/9k) |
+| spec安定性 | mean集約specのsplit-half cos **0.833-0.838**(3層一致)vs LinguaLens top-1特徴のhalf間一致 **36-43%**(top-3でも~50%) | 確定(04§9a、audit§5) |
+| サンプリング頑健性 | greedy ≈ temp1.0×5シード平均の2倍(復唱枠は厳格な逐語復唱が前提 → greedy採用) | 確定(04§9h) |
+| 改善(**採用候補** — 最終構成はT系切り分け後にユーザー確定) | ⑦文脈内spec: abl 0.148(+16%)/enh net 0.108(+15%); ③invstd: enh net 0.124(+32%); v6(T1+T3): enh 0.130/abl 0.112(不採用推奨) | 04§9m/9o |
+
+## 数値クイックシート【付録限定】(旧oracle-specプロトコル、2026-07-21)
 
 > **🚫 注意(07-22)**: 本シートのexact/FIC値はすべて**旧oracle-spec
-> プロトコル=付録限定**(規則0')。本文用の数値はfeature-spec再測定
-> (進行中)で置き換わる。ここの値を本文に書かないこと。
+> プロトコル=付録限定**(規則0')。本文には上の【本文用】シートの値のみ
+> を使う。ここの値を本文に書かないこと。
 
 | 主張 | 数値 | 状態 |
 |---|---|---|
@@ -116,27 +135,14 @@
   チャンピオン+⑦0.128で**不採用推奨**。T1/T3切り分け(各~3h)は可能。
   最終構成((a)⑦単独/(b)方向別/v6追撃)はユーザー判断待ち
 
-- **評価プロトコル変更(ユーザー決定07-22、03§3')**: 同定/評価データ分離 —
-  評価500・同定プール4,451、全アーム統一。bspecs(3層同定パス)→
-  fspilot(L12パイロット: ef feature-spec / FRC-r3 clamp / AUROC-r1 steer)
-  がshort-gで自動連鎖中。**exact/FICの主表数値は全て新プロトコルで
-  再測定になる**(旧oracle-spec値=上界診断として保持)。旧FIC判定
-  (prepost)は停止・破棄済み
-- nobudget学習系(プロトコル非依存なので継続): interact-g nbqチェーンは
-  nb ablations段(noS3実行中→noctr)。**nb延長は全層完了**:
-  L4 80k **0.2846**(予算あり80k比+58% — nb 40k劣化は未収束が原因と判明、
-  L4もnobudget優位)/ L12 80k 0.2886(40kの0.3166が勝者)/ L20 80k
-  0.0441(L20のみ予算あり優位)。いずれも旧プロトコル=付録/レシピ選択用
-- **同定パス(bspecs)完了**: 3層×(ef spec平均+FRC+AUROC)を1パスで同定。
-  **specのsplit-half cosine 0.833-0.838(3層一致)** — LinguaLensのtop-3
-  選択不安定(top-1一致36-43%)に対するmean集約の安定性の実証値。
-  **展開実行中(04§9d)**: 3層×両方向×4腕exact(fsrol{4,12,20})+
-  FIC復唱judge(prepostチェーンficfs)。スケールは層別に同定プールdev
-  標本で選択(評価500非接触)。ピーク=L12で2.5×(0.1443)
-  **L12パイロット完了(04§9b)**: ef 0.0822(oracle比26%残存)≈steer
-  0.0862 > AUROC-r1 0.0701 > FRC-r3 0.0160、prompting 0.1804が最強arm。
-  efのcopy 0.597=発火不足 → 強度掃引fssweep実行中
-- FIC再評価(新プロトコル・全層)— パイロット通過後に生成→prepost判定を再開
+- **feature-specプロトコルの主測定は完了**(03§3'、04§9a-9k): 3層×
+  両方向exact+FIC復唱judge+統合FIC+改善ラウンド(検索spec/⑦/①/③)
+  まで確定。数値は上の【本文用】クイックシート参照
+- **実行中: v6切り分け(04§9o)** — T1のみ(short-g efv6t1)/T3のみ
+  (interact-gチェーン run_v6t3.sh)の40kスクラッチ2本+⑦spec両方向eval
+- **次: T2個別検証**(検証形態=スクラッチ統一 vs 部分再構築+適応は
+  投入前にユーザー確認)→ **T1/T2/T3/③invstdから最終構成をユーザー確定**
+  → T4は採用モデルに追加学習 → Aゲート(t統計)評価をT4前後で(04§9p)
 - **📋 予約(T1〜T3切り分け後、04§9p)**: T4=train区画3,951での適応
   fine-tune(zero-shot版/pool適応版の2行構成)+feature別top-k
   (本命=t統計ゲート: 全feature共通αのみdev選択、kは統計から創発。
@@ -147,8 +153,7 @@
   同乗(増分半日)。(ii) ベースライン2腕を復唱枠に統一し、介入強度を
   AxBench流に新devで選択(LLのclamp10固定廃止)— 04§9n。
   exact+FICを3層×両方向で再測定
-- k掃引feature別表(S8のperfeature_ksweep)— キュー末尾で自動生成
-- 主表の学習量の判断(40k/80k/層別)は新プロトコル数値が出てから再検討
+- 残分析: 壊れ文除外版FIC(steer 19%割引の定量)、絞り込み×4分類内訳
 - LinguaLensとの差別化の検討(ユーザー、後日)
 - T6(Llama同一スタック検証、要HFゲート承認)
-- 旧参考項目(v2 Intervener 0.2725=プロンプト+基底+補正の比較行、FRR再集計等)は付録候補
+- 旧参考項目(v2編集器0.2725の比較行、FRR再集計等)は付録候補
