@@ -41,9 +41,13 @@ for CYCLE in $(seq 1 18); do
     for L in 12 4 20; do
         for SUF in "" "_amp"; do
             judge_ef_cell fs_v6t2_l$L fic_ad_l$L "$L" "$SUF" || ALL=0
-            judge_ef_cell fs_t4_l$L  fic_t4_l$L "$L" "$SUF" || ALL=0
             [ -f $P/fic_bl_l$L$SUF/report.md ] || ALL=0
         done
+    done
+    # L12-only ef variants (T4 v1 = negative-result row; T4v2 = defended)
+    for SUF in "" "_amp"; do
+        judge_ef_cell fs_t4_l12   fic_t4_l12   12 "$SUF" || ALL=0
+        judge_ef_cell fs_t4v2_l12 fic_t4v2_l12 12 "$SUF" || ALL=0
     done
     if [ "$ALL" = "1" ]; then
         echo "==================== ALL-FIC-DONE ===================="

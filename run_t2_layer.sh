@@ -106,7 +106,12 @@ for DIRX in "" "_amp"; do
         --sample-size 500 --output-dir "$O" $X
 done
 
-# ---- 5. T4 ---------------------------------------------------------------
+# ---- 5. T4 (user 2026-07-24: SKIPPED for L4/L20 — DO_T4=1 to enable) ----
+if [ "${DO_T4:-0}" != "1" ]; then
+    echo "[t2layer] T4 stage skipped (user decision)"
+    echo "==================== T2T4-L$LAYER-DONE ===================="
+    exit 0
+fi
 T4C=$V4/t4_ctx_l$LAYER
 if ! python -c "import json,sys;m=json.load(open('$T4C/meta.json'));sys.exit(0 if 'd_sae' in m else 1)" 2>/dev/null; then
     python scripts/make_t4_cache.py \

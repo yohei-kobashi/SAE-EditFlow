@@ -40,6 +40,12 @@ def parse_args():
     p.add_argument("--language", default="English")
     p.add_argument("--tokenizer", default="runs/mcgill_gemma_repro_3k/final")
     p.add_argument("--shard-size", type=int, default=2000)
+    p.add_argument("--scramble-prob", type=float, default=0.0,
+                   help="per pair, add an identity (copy-teacher) row "
+                        "whose spec has RANDOMLY PERMUTED latent ids — "
+                        "the exact construction of the eval 'random' "
+                        "condition, teaching 'garbage spec -> no edit'")
+    p.add_argument("--seed", type=int, default=7)
     p.add_argument("--meta-from", required=True,
                    help="existing cache meta.json to inherit trainer "
                         "fields from (d_sae etc.)")
@@ -48,6 +54,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    import random as pyrandom
     from transformers import AutoTokenizer
     from datasets import load_dataset
 
@@ -102,6 +109,21 @@ def main():
         rows.append({"x_prime_token_ids": s2, "x_token_ids": s1,
                      "z_X_topk": sparse(neg), "z_X_prime_topk": sparse(pos),
                      "bucket": "t4_enh", "feature": ex.get("feature")})
+        if args.scramble_prob > 0:
+            rng = pyrandom.Random(args.seed + k)
+            if rng.random() < args.scramble_prob:
+                d_sae = int(meta["d_sae"])
+                ids = rng.sample(range(d_sae), len(v))
+                sv = dict(zip(ids, v.values()))
+                spos = [(i, x) for i, x in sv.items() if x > 0]
+                sneg = [(i, -x) for i, x in sv.items() if x < 0]
+                sent = s1 if rng.random() < 0.5 else s2
+                rows.append({"x_prime_token_ids": sent,
+                             "x_token_ids": sent,
+                             "z_X_topk": sparse(spos),
+                             "z_X_prime_topk": sparse(sneg),
+                             "bucket": "t4_scramble_null",
+                             "feature": ex.get("feature")})
 
     n = 0
     for i0 in range(0, len(rows), args.shard_size):
