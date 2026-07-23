@@ -40,6 +40,9 @@ def parse_args():
     p.add_argument("--language", default="English")
     p.add_argument("--tokenizer", default="runs/mcgill_gemma_repro_3k/final")
     p.add_argument("--shard-size", type=int, default=2000)
+    p.add_argument("--meta-from", required=True,
+                   help="existing cache meta.json to inherit trainer "
+                        "fields from (d_sae etc.)")
     return p.parse_args()
 
 
@@ -59,11 +62,13 @@ def main():
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "meta.json").write_text(json.dumps({
+    meta = json.loads(Path(args.meta_from).read_text())
+    meta.update({
         "kind": "t4_lingualens_train_adaptation",
-        "spec": args.spec, "scale": args.scale,
-        "split": args.split, "note": "train section only "
-        "(eval500 + dev500 excluded); 2 rows per pair (abl/enh)"}))
+        "t4_spec": args.spec, "t4_scale": args.scale,
+        "t4_split": args.split, "t4_note": "train section only "
+        "(eval500 + dev500 excluded); 2 rows per pair (abl/enh)"})
+    (out / "meta.json").write_text(json.dumps(meta))
 
     def sparse(v_items):
         return [{"f": int(f), "v": round(float(x), 5)}

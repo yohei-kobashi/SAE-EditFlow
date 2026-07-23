@@ -22,10 +22,11 @@ CTXDEV=runs/prod_gemma_v4/corruption_seldev_zctx_l12
 OUT=$P/eflm_l12_t4_$ADOPT
 
 # Stage 1 — cache
-if [ ! -f $T4C/meta.json ]; then
+if ! python -c "import json,sys;m=json.load(open('$T4C/meta.json'));sys.exit(0 if 'd_sae' in m else 1)" 2>/dev/null; then
     python scripts/make_t4_cache.py \
         --spec $FS/l12_specctx.json --split runs/tables/eval_split.json \
-        --out $T4C --scale 3.5
+        --out $T4C --scale 3.5 \
+        --meta-from runs/prod_gemma_v4/corruption_zctx_l12/meta.json
 fi
 
 # Stage 2 — fine-tune (bypasses run_ef_editor: its stage-1 hardcodes 10k)
