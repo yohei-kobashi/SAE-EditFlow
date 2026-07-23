@@ -24,8 +24,10 @@ with a Learned Edit-Flow Editor*
 ## 2. 動機の流れ(推奨の段落構成)
 
 ### 段落1 — SAEと言語featureの同定
-SAEは残差ストリームを解釈可能な活性の組に分解する(Cunningham 2023,
-Bricken 2023; Gemma Scope)。LinguaLens(EMNLP 2025)は言語現象のminimal
+SAEは残差ストリームを解釈可能な活性の組に分解する
+(`cunningham2024sparse`=ICLR 2024[arXiv 2023]、
+`bricken2023monosemanticity`; SAEは`lieberum2024gemmascope`)。
+※引用年はaaai2027.bibの出版年に統一(Cunninghamは2024と書く)。LinguaLens(EMNLP 2025)は言語現象のminimal
 pairとFRCで「featureに対応する活性」を同定し、AxBenchは概念検出のAUROC
 で単一latentを選択する。
 
