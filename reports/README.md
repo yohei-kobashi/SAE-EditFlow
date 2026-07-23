@@ -67,7 +67,10 @@ routed・λ-IoU・M0・P-B)は条件付けのためコード/runsに履歴とし
 4. R5の禁止事項: 「介入ベースのSAE評価は初」(SAEBench/RAVEL先行)、
    「因果基準でlatent選択は初」(Beyond Input Activations先行)、
    「言語minimal pairの因果介入評価は初」(CausalGym先行 — 差分は評価器
-   [挙動→テキスト編集]と対象[学習特徴化→SAE latent])。
+   [挙動→テキスト編集]と対象[学習特徴化→SAE latent])、
+   🆕「言語学的feature/文法概念のSAE因果介入は初」(**Brinkmann et al.
+   NAACL 2025先行** — 02軸5-7の5点差分で書く。新規性=学習介入生成器・
+   編集実行の評価器・同定プロトコル検証)。
 5. 単位は「言語現象」、編集は「最小対変換(minimal-pair transformation)」。
 5'. **方向の用語はLinguaLens準拠(2026-07-22確定)**: 足す=enhancement、
    消す=ablation(§3.3逐語 "In the ablation experiment, we set the target
