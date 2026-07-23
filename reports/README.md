@@ -89,7 +89,8 @@ routed・λ-IoU・M0・P-B)は条件付けのためコード/runsに履歴とし
 | **本手法 exact(L12、基準spec)** | ablation **0.128**(random 0.000)/ enhancement 0.148(random 0.054、net 0.094) | 確定(04§9d) |
 | ベースライン(同一同定プール、L12 ablation) | 較正steer 0.086 / AxBench準拠AUROC-r1 0.070 / LinguaLens準拠FRC-r3 0.016 / prompting 0.180(random 0.088、net 0.092) | 確定(04§9b/9d、書き換え枠) |
 | **復唱枠ベースライン(§9n統一後、net)** | L12: LinguaLens準拠clampset **0.014**/0.040(abl/enh)、AxBench準拠axbsteer **0.054**/0.054 — random床全セル≈0、vs 本手法T2+⑦ 0.142/0.140 | 確定(04§9r) |
-| 層別ef(abl/enh true、層別スケール) | L4 0.086/0.172、L12 0.128/0.148、L20 0.036/0.048 — **ef>較正steerは6セル中5**(例外L4 abl) | 確定(04§9d) |
+| 層別ef(abl/enh true、層別スケール) | L4 0.086/0.172、L12 0.128/0.148、L20 0.036/0.048 — **ef>較正steerは6セル中5**(例外L4 abl) | 確定(04§9d、基準spec) |
+| **採用構成T2+⑦の層展開(net)** | L4 0.074/0.112(scale2.5)、**L12 0.142/0.140**(3.5)、L20 0.034/0.010(2.5)— 層プロファイルL12≫L4>L20保存 | 確定(04§9s) |
 | 特異性 | 本手法random≈0.000-0.054 vs prompting random 0.088(誤spec指定でも編集してしまう) | 確定(04§9d) |
 | FIC(復唱枠、gpt-4o) | E_abl ef **0.850/0.937/0.848**(L4/L12/L20、全層で4腕最良); **統合FIC(w=0.5)ef 0.546/0.463/0.124 vs prompting 0.410**、LinguaLens準拠 0.05-0.07、AxBench準拠 0.11-0.17。steer L12 0.569はef超えだが壊れ文19%の割引要(efは2%) | 確定(04§9e/9i/9k) |
 | spec安定性 | mean集約specのsplit-half cos **0.833-0.838**(3層一致)vs LinguaLens top-1特徴のhalf間一致 **36-43%**(top-3でも~50%) | 確定(04§9a、audit§5) |
