@@ -114,6 +114,33 @@ latentをそのまま使う)— 0.695 は選択失敗ではなく「出所latent
   文字通りの適用ではない("extends the spirit rather than the letter")。
   (3) 我々の乖離(FRC-r3 0.016 / AUROC-r1 0.070 vs 学習介入 0.128)はexactでの測定であり、amnesic probingのtask lossとは別の量。
 
+## D.1b — 言語学×SAEのランドスケープ(2026-07-23調査・追加)
+
+LinguaLens以外に「言語学的観点からLLMをSAEで分析する」主要研究。
+Related Workの1段落(または脚注群)として引き、位置づけを固定する。
+bibキーはaaai2027.bib登録済み。
+
+- **Brinkmann et al.(NAACL 2025)** `brinkmann2025grammatical` —
+  最近接。**軸5-7の差分5点で引く**(言語学的SAE因果介入の先行)。
+- **Minegishi et al.(ICLR 2025)** `minegishi2025polysemous` —
+  多義語の意味表現でSAEの単義性を評価。語彙意味論の観点だが
+  **介入なし**(表現評価)— 「検出・表現評価に留まる」群の代表。
+- **Deng et al.(ACL 2025)** `deng2025languagespecific` /
+  **Andrylie et al.(arXiv 2025)** `andrylie2025languageconcepts` —
+  言語固有featureの多言語SAE同定。概念単位は「言語」であり
+  言語学的現象(文法feature)ではない — 周辺。
+- **SASFT(arXiv 2025)** `deng2025sasft` — SAE誘導fine-tuningで
+  コードスイッチ抑制。応用側(検証でなく制御)。
+- **BLiMP(TACL 2020)** `warstadt2020blimp` / **MultiBLiMP 1.0
+  (TACL 2025)** `jumelet2025multiblimp` — 言語学的minimal pairベンチの
+  系譜(SAE不使用・データ側)。LinguaLens-Dataの前提となる伝統として
+  1文で引く(最小対=言語現象を単離する標準手段、という我々の評価設計の
+  正当化にも使える)。
+- 位置づけの一文(推奨): 「言語学的観点のSAE研究は、表現の評価
+  (Minegishi)、多言語共有の実証(Brinkmann/Deng)、応用制御(SASFT)へ
+  広がるが、**同定プロトコルの検証と編集実行を成功基準にした因果検証**は
+  行われていない — そこが本研究」。
+
 ## D.2 — 懐疑的証拠と、それが我々に届かない理由
 
 - AxBenchの否定的結論は **steering軸に閉じている**: "even at SAE scale,
