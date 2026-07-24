@@ -33,16 +33,33 @@ done
 
 python - <<'PY'
 import json, re
-rows = []
+from collections import defaultdict
+CATMAP = json.loads(open("runs/tables/feature_categories_en.json").read())
+rows, crows = [], []
 for K in (1, 2, 4, 8, 16, 32, 64, 128):
     row = {"k": K}
+    crow = {"k": K}
     for suf, d in (("", "abl"), ("_amp", "enh")):
         t = open(f"runs/prod_gemma_v6/ksw_l12_k{K}{suf}/report.md").read()
         tr = float(re.search(r"\| true \| ef \| ([0-9.]+)", t).group(1))
         rd = float(re.search(r"\| random \| ef \| ([0-9.]+)", t).group(1))
         row[f"{d}_true"], row[f"{d}_rand"], row[f"{d}_net"] = tr, rd, tr - rd
-    rows.append(row)
+        agg = defaultdict(lambda: [0, 0, 0])
+        for line in open(f"runs/prod_gemma_v6/ksw_l12_k{K}{suf}/records.jsonl"):
+            r = json.loads(line)
+            c = CATMAP.get(r.get("feature") or "?", "?")
+            tt = r["outputs"].get("true", {}).get("ef", {}).get("text")
+            rr = r["outputs"].get("random", {}).get("ef", {}).get("text")
+            if tt is None or rr is None: continue
+            agg[c][0] += 1
+            agg[c][1] += tt.strip() == r["tgt"].strip()
+            agg[c][2] += rr.strip() == r["tgt"].strip()
+        for c, (n, a, b2) in agg.items():
+            crow[f"{d}_{c}_net"] = (a - b2) / n
+            crow[f"{d}_{c}_n"] = n
+    rows.append(row); crows.append(crow)
 open("runs/tables/ksweep_final.json", "w").write(json.dumps(rows))
+open("runs/tables/ksweep_final_cat.json", "w").write(json.dumps(crows))
 print("| k | abl true | abl rand | abl net | enh true | enh rand | enh net |")
 print("|---|---|---|---|---|---|---|")
 for r in rows:
