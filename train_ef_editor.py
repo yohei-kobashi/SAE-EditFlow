@@ -804,6 +804,10 @@ def main():
                   f"mean={float(b.mean()):.2f} min={float(b.min()):.2f} "
                   f"max={float(b.max()):.2f}")
         loss = ef_loss(model, it_model, hook, built, args, args.device)
+        if not loss.requires_grad:
+            # v3d-cond: a batch whose rows all lack spec conditioning has
+            # no grad path to the trainable interface — skip (rare ~0.2%)
+            continue
         (loss / args.grad_accum_steps).backward()
         if (step + 1) % args.grad_accum_steps == 0:
             torch.nn.utils.clip_grad_norm_(
