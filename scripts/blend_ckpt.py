@@ -31,9 +31,10 @@ def main():
         x, y = sa[k], sb[k]
         out[k] = ((1.0 - args.alpha) * x.float()
                   + args.alpha * y.float()).to(x.dtype)
-    torch.save({"trainable": out,
-                "blend": {"a": args.a, "b": args.b,
-                          "alpha": args.alpha}}, args.out)
+    blob = {k: v for k, v in A.items() if k != "trainable"}
+    blob["trainable"] = out
+    blob["blend"] = {"a": args.a, "b": args.b, "alpha": args.alpha}
+    torch.save(blob, args.out)
     print(f"[blend] alpha={args.alpha}: {args.a} + {args.b} -> {args.out}")
 
 

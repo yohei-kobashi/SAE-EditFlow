@@ -18,7 +18,7 @@ P=runs/prod_gemma_v6
 FS=runs/feature_specs
 SPLIT=runs/tables/eval_split.json
 T2=$P/eflm_l12_v6t2/eflm-final.pt
-BL=$P/v3a_blends
+BL=$P/v3a_blends2
 mkdir -p $BL
 
 EVC=(--frame repeat --feature-spec $FS/l12_specctx.json --fspec-scale 3.5
