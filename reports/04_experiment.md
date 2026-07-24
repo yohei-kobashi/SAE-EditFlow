@@ -1135,6 +1135,15 @@ steer=較正済(従来)、prompting=従来。runs/tables/fic_fs_integrated.md:
   選択で公平)も待機。E_enh機序: copy 53%がPT上限を縛る(試行時の
   MORE率70%は高品質)— 分解表は本節末尾参照。
 
+**v3a第3段(07-24)**: dev相対基準でα=0.3選択(dev net 0.200)→
+eval500: **ablation net 0.194(random 0.002)/ enhancement net 0.172
+(random 0.030)**。copy率enh 0.437(T2の0.535から低下=試行率上昇)。
+- 制約の判断材料: enh random 0.030は (i) T2の0.014の約2倍だが、
+  (ii) **旧チャンピオン+⑦の床0.052より低く**、(iii) prompting 0.088の
+  1/3。「現行水準≤0.02」を厳守するならT2主行+blendは適応行として
+  併記、0.030を許容するならblend主行で合算net+30%。
+- FIC(E_enh)judge実行中(fic_v3a_l12*)— steer 0.347超えの成否待ち。
+
 **E_enh分解(T2+⑦ enh、true 499試行)**: copy 266(SAME=0点)/
 編集233中 MORE 162(70%)・SAME 18・LESS 53 → PT 0.325。
 copy率をsteer並み(~0.35)へ下げられれば E_enh≈0.41>steer 0.347の計算。
