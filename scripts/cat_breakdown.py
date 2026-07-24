@@ -94,9 +94,25 @@ def mean(xs):
 
 
 def main():
-    lines = ["# 4-category breakdown — final protocol (L12)", ""]
-    for label, base in (("main row (zero-shot T2+(7))", "fs_v6t2_l12"),
-                        ("adaptation row (blend a=0.3)", "fs_v3a_final_l12")):
+    import sys
+    layers = [int(x) for x in (sys.argv[1] if len(sys.argv) > 1
+                               else "12").split(",")]
+    lines = ["# 4-category breakdown — final protocol", ""]
+    for L in layers:
+        lines.append(f"# ===== L{L} =====\n")
+        run_layer(L, lines)
+    out = Path("runs/tables/cat_breakdown_final.md")
+    out.write_text("\n".join(lines) + "\n")
+    print("\n".join(lines))
+    print(f"\nwrote {out}")
+
+
+def run_layer(L, lines):
+    for label, base in ((f"Ours-ZS L{L}", f"fs_v6t2_l{L}"),
+                        (f"adaptation (blend) L{L}", f"fs_v3a_final_l{L}")):
+        if not (P / base / "records.jsonl").exists():
+            lines.append(f"(no records for {base})\n")
+            continue
         ex = exact_by_cat(base)
         lines += [f"## exact — {label}", "",
                   "| category | n | abl true | abl rand | abl net | "
@@ -115,8 +131,8 @@ def main():
                 + (f"{e[1]:.3f} | {e[2]:.3f} | **{e[3]:.3f}** |" if e
                    else "— | — | — |"))
         lines.append("")
-    pc = fic_by_cat(["fic_ad_l12", "fic_ad_l12_amp"])
-    lines += ["## FIC — main row (zero-shot T2+(7))", "",
+    pc = fic_by_cat([f"fic_ad_l{L}", f"fic_ad_l{L}_amp"])
+    lines += [f"## FIC — Ours-ZS L{L}", "",
               "| category | features | E_enh | E_abl | integrated FIC |",
               "|---|---|---|---|---|"]
     for c in CATS:
@@ -125,10 +141,7 @@ def main():
                      f"{mean(d.get('ee', [])):.3f} | "
                      f"{mean(d.get('ea', [])):.3f} | "
                      f"**{mean(d.get('fic', [])):.3f}** |")
-    out = Path("runs/tables/cat_breakdown_final.md")
-    out.write_text("\n".join(lines) + "\n")
-    print("\n".join(lines))
-    print(f"\nwrote {out}")
+    lines.append("")
 
 
 if __name__ == "__main__":
