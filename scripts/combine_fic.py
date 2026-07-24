@@ -26,14 +26,17 @@ P = Path("runs/prod_gemma_v6")
 CACHE = "judge_cache_gpt-4o.jsonl"
 
 # arm -> {layer: [cache dirs (sup cell, amp cell)]}
+# 2026-07-24 final protocol: ef = ADOPTED T2+(7) (fic_ad_*), clamp/axbench
+# = repeat-frame dev-selected baselines (fic_bl_*); steer stays the
+# calibrated caches; prompting unchanged. Extra ef variants (T4/T4v2)
+# reported separately in 04 §9q.
 SOURCES = {
-    "ef":        {L: [f"fic_fs_l{L}", f"fic_fs_l{L}_amp"] for L in (4, 12, 20)},
-    "clamp":     {L: [f"fic_fs_l{L}", f"fic_fs_l{L}_amp"] for L in (4, 12, 20)},
+    "ef":        {L: [f"fic_ad_l{L}", f"fic_ad_l{L}_amp"] for L in (4, 12, 20)},
+    "clamp":     {L: [f"fic_bl_l{L}", f"fic_bl_l{L}_amp"] for L in (4, 12, 20)},
     "prompting": {12: ["fic_fs_l12", "fic_fs_l12_amp"]},
     "steer":     {L: [f"fic_fs_steer_l{L}", f"fic_fs_steer_l{L}_amp"]
                   for L in (4, 12, 20)},
-    "axbench":   {L: [f"fic_fs_axb_l{L}", f"fic_fs_axb_l{L}_amp"]
-                  for L in (4, 12, 20)},
+    "axbench":   {L: [f"fic_bl_l{L}", f"fic_bl_l{L}_amp"] for L in (4, 12, 20)},
 }
 W = 0.5
 
