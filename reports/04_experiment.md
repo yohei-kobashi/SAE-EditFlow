@@ -1574,7 +1574,10 @@ L12でOurs-ZSは固定介入の**2.6〜10倍**。
 カバレッジではない — 必ず脚注。統合FICでsteerに及ばない原因は保守性と
 正直に帰属(破壊割引論は不使用)。適応行はE_enh 0.370でsteer超え。
 
-### 10.4 4分類(exact net・FIC、L12)
+### 10.4 4分類(exact net・FIC、3層)
+(詳細表: runs/tables/cat_breakdown_final.md)
+
+**L12**:
 
 | 分類 | n/方向 | ZS abl | ZS enh | 適応 abl | 適応 enh | ZS統合FIC |
 |---|---|---|---|---|---|---|
@@ -1583,9 +1586,34 @@ L12でOurs-ZSは固定介入の**2.6〜10倍**。
 | semantics | 136 | 0.147 | 0.110 | 0.235 | 0.132 | 0.426 |
 | pragmatics | 62 | 0.048 | 0.000 | 0.048 | 0.000 | 0.218 |
 
-ablation=syntax/semantics本拠地、enhancement=morphology圧倒、
-pragmatics=全手法困難。enh random床はmorphologyに全集中
-(ZS 0.067/blend 0.144、他≈0)= prior押し機序の局在(§9w)。
+**L4**:
+
+| 分類 | ZS abl | ZS enh | 適応 abl | 適応 enh | ZS統合FIC |
+|---|---|---|---|---|---|
+| morphology | 0.058 | **0.288** | 0.087 | 0.365 | 0.583 |
+| syntax | **0.117** | 0.036 | 0.142 | 0.086 | 0.482 |
+| semantics | 0.059 | 0.140 | 0.096 | 0.184 | 0.532 |
+| pragmatics | 0.000 | 0.000 | 0.000 | 0.000 | 0.488 |
+
+**L20**:
+
+| 分類 | ZS abl | ZS enh | 適応 abl | 適応 enh | ZS統合FIC |
+|---|---|---|---|---|---|
+| morphology | 0.019 | 0.038 | 0.058 | 0.058 | 0.167 |
+| syntax | **0.066** | 0.000 | 0.051 | 0.010 | 0.133 |
+| semantics | 0.015 | 0.007 | 0.015 | 0.007 | 0.048 |
+| pragmatics | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
+
+- **方向×分類構造は層を跨いで保存**: ablation=syntax/semantics、
+  enhancement=morphology(L4 0.288/L12 0.375)、pragmatics=全層困難
+  (L4はexact全滅だがFIC 0.488 — 顕著性は動くが厳密編集に至らない)。
+- **enh random床のmorphology局在も全層一貫**: L12 ZS 0.067/blend 0.144、
+  L4 ZS 0.106/blend 0.154、**L20はtrue 0.327/random 0.288**(net 0.038)
+  — L20全体のenh床0.060の実体もmorphologyのprior押し。層が深いほど
+  prior押しが強まる(§9sの機序と整合)。
+- L4のFICは4分類とも0.48-0.58と均質に高め(浅層は顕著性を動かし
+  やすい)一方、exactは低い — precision/recallの層依存も§10.3の枠で
+  説明可能。
 
 ### 10.5 介入本数k(featureを担う活性の幅、Ours-ZS)
 
